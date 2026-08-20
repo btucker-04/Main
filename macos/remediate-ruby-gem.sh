@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# remediate-ruby-gem.sh  (v3)
+# remediate-ruby-gem.sh  (v3.1)
 # Generic remediation for a vulnerable Ruby gem on macOS.
 # Platform : macOS (bash 3.2 compatible) | Deploy: Mosyle (runs as root)
 #
@@ -33,6 +33,22 @@
 #   * Default gems (specifications/default/...) are recognised and never deleted;
 #     they ship with Ruby and removing one breaks the interpreter.
 #
+# v3.1 (CSMB-017, 2026-08-20 Tenable group export):
+#   * Default CONFIG is now rexml >= 3.4.2 (plugin 265895 / CVE-2025-58767).
+#     3.3.9 cleared the older ReDoS finding (210049) but 3.4.0 and 3.4.1 are
+#     still DoS-vulnerable. CSMB-017 has TWO Homebrew Cellar copies of
+#     rexml-3.4.0.gemspec (ruby 3.4.1 and ruby 3.4.3 kegs). Both are the
+#     HOMEBREW tree, so one `gem install rexml` into the shared gems dir
+#     satisfies the patched-sibling guard for both, then both Cellar specs
+#     can go. `brew cleanup ruby` afterwards is optional keg hygiene, not
+#     required to clear Tenable (it keys on the .gemspec path).
+#   * Plugin 240854 (webrick 1.7.0 < 1.8.2) on the same host is macOS
+#     SYSTEM Ruby: /Library/Ruby/Gems/2.6.0/specifications/webrick-1.7.0.gemspec.
+#     This script will REPORT it and leave it (SIP-adjacent). Do not deploy a
+#     webrick job expecting the finding to clear -- recast/accept, or migrate
+#     off the built-in Ruby. Alternate CONFIG for a diagnostic-only run:
+#       CFG_GEM="webrick"  CFG_THRESHOLDS="1.8.2"  CFG_PLUGIN="240854"
+#
 # PER-BRANCH THRESHOLDS: gems are commonly fixed independently per minor line.
 # A flat "greater than X" test is wrong and has caused a real bug here -- a
 # net-imap 0.6.3 spec satisfied a flat >= 0.5.14 check while being vulnerable in
@@ -42,19 +58,19 @@
 # ENVIRONMENT:
 #   (Configure via the CONFIG block below, or positional args, or environment.)
 #   GEM=rexml                       (required) gem name
-#   THRESHOLDS="3.3.9"              (required) either a single minimum, or
+#   THRESHOLDS="3.4.2"              (required) either a single minimum, or
 #   THRESHOLDS="0.4:0.4.24;0.5:0.5.14;0.6:0.6.4"
 #                                   per-branch "prefix:minimum" pairs.
 #                                   A spec whose version matches no branch
 #                                   prefix is REPORTED and never deleted.
-#   PLUGIN=210049                   (optional) for the log header only
+#   PLUGIN=265895                   (optional) for the log header only
 #   NO_INSTALL=1                    (optional) clean up only; never install
 #   DRY_RUN=1                       (optional) report only, delete nothing
 #
 # Examples:
-#   GEM=rexml    THRESHOLDS="3.3.9"                                    PLUGIN=210049
+#   GEM=rexml    THRESHOLDS="3.4.2"                                    PLUGIN=265895
 #   GEM=net-imap THRESHOLDS="0.4:0.4.24;0.5:0.5.14;0.6:0.6.4"          PLUGIN=313278
-#   GEM=webrick  THRESHOLDS="1.8.2"                                    PLUGIN=<n>
+#   GEM=webrick  THRESHOLDS="1.8.2"                                    PLUGIN=240854  (system Ruby: report only)
 #
 # HOMEBREW PORTABLE RUBY: Homebrew ships its own Ruby under
 # <prefix>/Library/Homebrew/vendor/portable-ruby/<version>/ to run brew itself,
@@ -88,13 +104,14 @@ export HOME
 # in-script config is the deployable path (same constraint as EC stripping
 # parameters). Precedence: command-line args > environment > these defaults.
 #
-#   rexml    : CFG_GEM="rexml"    CFG_THRESHOLDS="3.3.9"
+#   rexml    : CFG_GEM="rexml"    CFG_THRESHOLDS="3.4.2"                 PLUGIN 265895
 #   net-imap : CFG_GEM="net-imap" CFG_THRESHOLDS="0.4:0.4.24;0.5:0.5.14;0.6:0.6.4"
-#   webrick  : CFG_GEM="webrick"  CFG_THRESHOLDS="1.8.2"
+#   webrick  : CFG_GEM="webrick"  CFG_THRESHOLDS="1.8.2"                  PLUGIN 240854
+#              (CSMB-017 webrick is SYSTEM Ruby -- this job will exit 2)
 # =============================================================================
 CFG_GEM="rexml"
-CFG_THRESHOLDS="3.3.9"
-CFG_PLUGIN="210049"
+CFG_THRESHOLDS="3.4.2"
+CFG_PLUGIN="265895"
 CFG_NO_INSTALL="0"
 CFG_DRY_RUN="0"
 
@@ -113,7 +130,7 @@ log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"; }
 if [ -z "$GEM" ] || [ -z "$THRESHOLDS" ]; then
     log "ERROR: no gem/thresholds configured. Set the CONFIG block at the top of"
     log "       this script (Mosyle passes no environment variables), or pass them"
-    log "       positionally:  ./remediate-ruby-gem.sh rexml \"3.3.9\" 210049"
+    log "       positionally:  ./remediate-ruby-gem.sh rexml \"3.4.2\" 265895"
     exit 1
 fi
 
