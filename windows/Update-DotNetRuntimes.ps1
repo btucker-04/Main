@@ -657,6 +657,10 @@ if ($EolSeen.Count -gt 0) {
     Write-Log '*** SEoL findings only clear by REMOVING the channel. Do NOT remove' -Level WARN
     Write-Log '*** without first checking which apps depend on it -- apps pin to' -Level WARN
     Write-Log '*** their major and will break. Flag this host for migration review.' -Level WARN
+    Write-Log '*** Removal is Remove-DotNetEolChannel.ps1 (plugin 172179), not this' -Level WARN
+    Write-Log '*** script -- EC software-inventory uninstall of a .NET bundle fails' -Level WARN
+    Write-Log '*** under SYSTEM (bare msiexec.exe) and the bundle no-ops while it' -Level WARN
+    Write-Log '*** still has child-MSI dependents. That script handles both.' -Level WARN
 }
 
 # ------------------------------------------------------------------
@@ -1104,6 +1108,7 @@ Write-Log 'All present flavors advanced. Re-run a Nessus scan to confirm.'
 if ($EolSeen.Count -gt 0) {
     Write-Log ('REMINDER: EOL channel(s) still installed on this host: .NET ' + (($EolSeen | Sort-Object) -join ', .NET ')) -Level WARN
     Write-Log 'Patched to final build, but SEoL findings persist until removal/migration.' -Level WARN
+    Write-Log 'To remove the channel: Remove-DotNetEolChannel.ps1 (default major 6).' -Level WARN
 }
 Write-Log '=============================================='
 if ($Reboot) { exit 3010 }
