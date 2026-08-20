@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# remediate-ruby-gem.sh  (v3.1)
+# remediate-ruby-gem.sh  (v3.2)
 # Generic remediation for a vulnerable Ruby gem on macOS.
 # Platform : macOS (bash 3.2 compatible) | Deploy: Mosyle (runs as root)
 #
@@ -49,6 +49,22 @@
 #     off the built-in Ruby. Alternate CONFIG for a diagnostic-only run:
 #       CFG_GEM="webrick"  CFG_THRESHOLDS="1.8.2"  CFG_PLUGIN="240854"
 #
+# v3.2 (jriegel-mac, 2026-08-20 run):
+#   * SYSTEM leftover NON-DEFAULT specs are now removable when a patched
+#     sibling is already loadable in the same /Library/Ruby tree -- including
+#     a default gem. jriegel-mac had
+#     specifications/rexml-3.2.5.gemspec next to
+#     specifications/default/rexml-3.4.2.gemspec. Plugin 210049 keys on the
+#     3.2.5 path; v3.1 left it (blanket SYSTEM skip) and the finding resurfaced.
+#     Default gems are still never deleted. A SYSTEM spec with NO patched
+#     sibling is still reported, not modified.
+#   * Homebrew formula vendored gems (e.g. Cellar/fastlane/*/libexec) are a
+#     distinct tree, not "the only copy of rexml on the machine". v3.1 KEEP'd
+#     fastlane's rexml-3.4.0 because scope was OTHER. v3.2 classifies them as
+#     FORMULA:<name>, brew-upgrades the formula, removes SUPERSEDED kegs, and
+#     leaves the CURRENT keg alone if it still vendors a vulnerable spec
+#     (upstream formula pin -- recast, same as current portable-ruby).
+#
 # PER-BRANCH THRESHOLDS: gems are commonly fixed independently per minor line.
 # A flat "greater than X" test is wrong and has caused a real bug here -- a
 # net-imap 0.6.3 spec satisfied a flat >= 0.5.14 check while being vulnerable in
@@ -83,13 +99,15 @@
 # current portable-ruby is a Homebrew-upstream matter: reported, not touched.
 #
 # Covers the Ruby locations the fleet actually has: macOS system Ruby
-# (/Library/Ruby/Gems -- note this is SIP-adjacent and usually NOT writable, so
-# it is reported rather than modified), Homebrew Ruby (prefix auto-detected for
-# Intel /usr/local vs Apple Silicon /opt/homebrew, including Cellar built-in
-# specs), and per-user rbenv under /Users/*/.rbenv and the Homebrew rbenv root.
+# (/Library/Ruby/Gems -- default gems are never deleted; leftover NON-default
+# specs in the same tree are removed once a patched sibling is present),
+# Homebrew Ruby (prefix auto-detected, including Cellar built-in specs),
+# Homebrew formula libexec trees (fastlane etc.), per-user rbenv under
+# /Users/*/.rbenv, and the Homebrew rbenv root.
 #
 # Exit: 0 = no vulnerable spec remains
-#       2 = something needs a human (system-Ruby spec, unknown branch, or no
+#       2 = something needs a human (unpatched SYSTEM spec with no sibling,
+#           CURRENT formula keg / portable-ruby, unknown branch, or no
 #           usable brew user to install with)
 #       1 = a vulnerable spec remains that should have been fixable
 # =============================================================================
@@ -176,11 +194,28 @@ scope_of() {
         case "$s" in
             "$BREW_PREFIX"/Cellar/ruby/*|"$BREW_PREFIX"/lib/ruby/gems/*|"$BREW_PREFIX"/opt/ruby/*)
                 echo "HOMEBREW"; return ;;
+            "$BREW_PREFIX"/Cellar/*)
+                echo "FORMULA:$(echo "$s" | sed -nE "s|^$BREW_PREFIX/Cellar/([^/]+)/.*|\\1|p")"
+                return ;;
         esac
     fi
     echo "OTHER:$(dirname "$(dirname "$s")")"
 }
 is_default_gem() { case "$1" in */specifications/default/*) return 0 ;; *) return 1 ;; esac; }
+
+formula_keg_of() {
+    echo "$1" | sed -nE "s|^$BREW_PREFIX/Cellar/[^/]+/([^/]+)/.*|\\1|p"
+}
+formula_current_keg() {
+    # $1 = formula name. Homebrew's opt/<formula> symlink points at the live keg.
+    [ -n "$BREW_PREFIX" ] || { echo ""; return; }
+    opt="$BREW_PREFIX/opt/$1"
+    if [ -L "$opt" ]; then
+        basename "$(readlink "$opt")"
+    else
+        echo ""
+    fi
+}
 # Per-branch thresholds present? Then a patched spec must also match the branch.
 THRESH_PER_BRANCH=0
 case "$THRESHOLDS" in *:*) THRESH_PER_BRANCH=1 ;; esac
@@ -223,6 +258,14 @@ run_as_user() {
         HOME="/Users/$BREW_USER" \
         PATH="$BREW_PREFIX/opt/ruby/bin:$BREW_PREFIX/bin:$BREW_PREFIX/sbin:/usr/bin:/bin" \
         NONINTERACTIVE=1 "$@"
+}
+
+run_brew() {
+    sudo -u "$BREW_USER" \
+        HOME="/Users/$BREW_USER" \
+        PATH="$BREW_PREFIX/bin:$BREW_PREFIX/sbin:/usr/bin:/bin:/usr/sbin:/sbin" \
+        NONINTERACTIVE=1 \
+        "$BREW_PREFIX/bin/brew" "$@"
 }
 
 # -----------------------------------------------------------------------
@@ -316,6 +359,38 @@ else
 fi
 
 # -----------------------------------------------------------------------
+# 2b. Homebrew formulae that vendor this gem (fastlane, cocoapods, ...)
+# -----------------------------------------------------------------------
+log ""
+log "[2b] Homebrew formulae with a vendored $GEM..."
+FORMULAE=""
+while IFS= read -r spec; do
+    [ -f "$spec" ] || continue
+    sc=$(scope_of "$spec")
+    case "$sc" in
+        FORMULA:*)
+            f="${sc#FORMULA:}"
+            case " $FORMULAE " in *" $f "*) ;; *) FORMULAE="$FORMULAE $f" ;; esac
+            ;;
+    esac
+done < "$WORK/specs"
+if [ -z "$FORMULAE" ]; then
+    log "  None -- no Cellar/<formula>/libexec (or similar) $GEM specs."
+elif [ "$NO_INSTALL" = "1" ]; then
+    log "  NO_INSTALL=1 -- not running brew upgrade for:$FORMULAE"
+elif [ -z "$BREW_USER" ] || [ -z "$BREW_PREFIX" ]; then
+    log "  Cannot brew upgrade (no Homebrew and/or no non-root user):$FORMULAE"
+elif [ "$DRY_RUN" = "1" ]; then
+    log "  [DRY_RUN] Would brew upgrade + cleanup for:$FORMULAE"
+else
+    for f in $FORMULAE; do
+        log "  brew upgrade $f ..."
+        OUT=$(run_brew upgrade "$f" 2>&1); log "  $OUT"
+        OUT=$(run_brew cleanup "$f" 2>&1); log "  cleanup $f: $OUT"
+    done
+fi
+
+# -----------------------------------------------------------------------
 # 3. Cleanup -- gated per branch on a confirmed patched sibling
 # -----------------------------------------------------------------------
 log ""
@@ -348,11 +423,6 @@ while IFS= read -r spec; do
 
     sc=$(scope_of "$spec")
     case "$sc" in
-        SYSTEM)
-            log "  SYSTEM   $spec ($ver < $need) -- macOS system Ruby."
-            log "           Not modified: OS-managed tree. Recast/accept, or migrate off"
-            log "           the built-in Ruby."
-            KEPT=$((KEPT+1)); continue ;;
         PORTABLE:*)
             prver="${sc#PORTABLE:}"
             if [ "$prver" = "$PORTABLE_CURRENT" ]; then
@@ -368,6 +438,30 @@ while IFS= read -r spec; do
             log "  BREW-OLD Removing superseded portable-ruby tree: $PORTABLE_ROOT/$prver"
             log "           (current is ${PORTABLE_CURRENT:-unknown}; brew keeps only that one)"
             rm -rf "$PORTABLE_ROOT/$prver" && REMOVED=$((REMOVED+1))
+            continue ;;
+        FORMULA:*)
+            formula="${sc#FORMULA:}"
+            keg=$(formula_keg_of "$spec")
+            cur=$(formula_current_keg "$formula")
+            if [ -n "$cur" ] && [ "$keg" = "$cur" ]; then
+                log "  FORMULA  $spec ($ver < $need)"
+                log "           CURRENT Homebrew $formula keg ($keg). The formula vendors this"
+                log "           gem; gem install cannot patch it. brew upgrade already ran."
+                log "           Recast until the formula ships a patched $GEM, or pin off it."
+                KEPT=$((KEPT+1)); continue
+            fi
+            kegroot="$BREW_PREFIX/Cellar/$formula/$keg"
+            if [ -z "$formula" ] || [ -z "$keg" ] || [ "$kegroot" = "$BREW_PREFIX/Cellar/$formula/" ] || [ "$kegroot" = "$BREW_PREFIX/Cellar/$formula" ]; then
+                log "  KEEP     $spec -- could not parse keg path; refusing to rm -rf."
+                KEPT=$((KEPT+1)); continue
+            fi
+            if [ "$DRY_RUN" = "1" ]; then
+                log "  [DRY_RUN] Would remove superseded $formula keg $kegroot"
+                continue
+            fi
+            log "  FORMULA-OLD Removing superseded $formula keg: $kegroot"
+            log "              (current is ${cur:-unknown}; brew keeps only that one)"
+            rm -rf "${kegroot:?}" && REMOVED=$((REMOVED+1))
             continue ;;
     esac
 
@@ -392,6 +486,12 @@ while IFS= read -r spec; do
     done < "$WORK/specs2"
 
     if [ "$patched_here" -eq 0 ]; then
+        if [ "$sc" = "SYSTEM" ]; then
+            log "  SYSTEM   $spec ($ver < $need) -- macOS system Ruby, no patched $GEM"
+            log "           sibling in /Library/Ruby (including default gems). Recast/accept,"
+            log "           or migrate off the built-in Ruby. Default gems are never deleted."
+            KEPT=$((KEPT+1)); continue
+        fi
         if [ "$THRESH_PER_BRANCH" -eq 1 ]; then
             log "  KEEP     $spec ($ver < $need) -- no patched ${mybranch}.x in this Ruby"
             log "           tree ($sc); refusing to remove the only $GEM on this branch."
@@ -406,10 +506,15 @@ while IFS= read -r spec; do
         continue
     fi
     log "  REMOVE   $spec ($ver < $need; patched $patched_what present in $sc)"
-    rm -f "$spec" && REMOVED=$((REMOVED+1))
-    specdir=$(dirname "$spec")
-    gemdir="$(dirname "$specdir")/gems/${GEM}-${ver}"
-    [ -d "$gemdir" ] && rm -rf "$gemdir" && log "           removed payload: $gemdir"
+    if rm -f "$spec"; then
+        REMOVED=$((REMOVED+1))
+        specdir=$(dirname "$spec")
+        gemdir="$(dirname "$specdir")/gems/${GEM}-${ver}"
+        [ -d "$gemdir" ] && rm -rf "$gemdir" && log "           removed payload: $gemdir"
+    else
+        log "           rm failed (permissions?). Leaving it for a human."
+        KEPT=$((KEPT+1))
+    fi
 done < "$WORK/specs2"
 
 # -----------------------------------------------------------------------
@@ -433,6 +538,17 @@ for root in $SEARCH_ROOTS; do
                     *"/portable-ruby/$PORTABLE_CURRENT/"*) echo x >> "$WORK/remain_brewcur" ;;
                 esac
             fi
+            sc=$(scope_of "$spec")
+            case "$sc" in
+                FORMULA:*)
+                    formula="${sc#FORMULA:}"
+                    keg=$(formula_keg_of "$spec")
+                    cur=$(formula_current_keg "$formula")
+                    if [ -n "$cur" ] && [ "$keg" = "$cur" ]; then
+                        echo x >> "$WORK/remain_sys"
+                    fi
+                    ;;
+            esac
         else
             log "  ok                $ver  $spec"
         fi
@@ -452,8 +568,8 @@ fi
 if [ "$REMAIN" -eq 1 ]; then
     if [ "$REMAIN_SYSTEM" -eq 1 ] || [ "$UNKNOWN" -eq 1 ]; then
         log "RESULT: vulnerable specs remain, but only where a human must decide"
-        log "        (macOS system Ruby, the CURRENT Homebrew portable-ruby, or a branch"
-        log "        not covered by THRESHOLDS)."
+        log "        (unpatched macOS system Ruby with no sibling, the CURRENT Homebrew"
+        log "        portable-ruby or formula keg, or a branch not covered by THRESHOLDS)."
         log "===== END (needs a decision) ====="
         exit 2
     fi
