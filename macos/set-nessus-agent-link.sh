@@ -34,6 +34,10 @@ groups_for_host() {
     # An unmatched host returns empty -> the caller refuses to link with no
     # group, because an ungrouped agent never scans and its finding never clears.
     case "$1" in
+        # Exact-host overrides -- checked first, win over any prefix rule
+        # (mirrors the Windows $GroupOverride map). CV-MBPC02 is a MacBook
+        # despite the CV- prefix, which on Windows maps to Windows Servers.
+        CV-MBPC02) echo "MacBook" ;;
         JRIEGEL-MAC*) echo "MacBook" ;;
         CSPRMB*) echo "MacBook" ;;
         CSPRIM*) echo "MacBook" ;;
