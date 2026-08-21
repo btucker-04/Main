@@ -8,17 +8,25 @@
     1. Reads the C2R configuration: product IDs, current version, channel
        (CDNBaseUrl GUID mapped to a friendly name) -- all logged, so the
        fleet logs double as a channel census.
-    2. Triggers OfficeC2RClient.exe /update with forceappshutdown=false:
-       the update stages in the background and finalizes when Office apps
-       are closed by the user. No interruption.
+    2. Triggers OfficeC2RClient.exe /update with forceappshutdown=true:
+       any open Office apps are force-closed so the update can stage and
+       finalize immediately instead of waiting on the user. Pass
+       -ForceAppShutdown:$false to fall back to the old non-disruptive
+       behavior (stage in background, finalize when the user closes Office).
     3. Optionally polls VersionToReport for up to -WaitMinutes to report
        whether the version advanced before exiting (default 0 = fire and
        exit; EC re-run or rescan verifies later).
 
+.PARAMETER ForceAppShutdown
+    When set (default), open Office apps are force-closed so the update
+    finalizes right away. Setting -ForceAppShutdown:$false stages the
+    update in the background and finalizes only when the user closes Office.
+
 .PARAMETER WaitMinutes
     Minutes to poll for the version to advance. 0 (default) = do not wait.
-    Note: with apps open, finalization can wait indefinitely on the user,
-    so a timeout here is NOT a failure -- exit stays 0 with a note.
+    Note: without -ForceAppShutdown and with apps open, finalization can
+    wait indefinitely on the user, so a timeout here is NOT a failure --
+    exit stays 0 with a note.
 
 .NOTES
     Deploy via Endpoint Central (SYSTEM). Logs: C:\Logs\CompoSecure.
@@ -27,7 +35,10 @@
 #>
 
 [CmdletBinding()]
-param([int]$WaitMinutes = 0)
+param(
+    [int]$WaitMinutes = 0,
+    [bool]$ForceAppShutdown = $true
+)
 
 $ErrorActionPreference = 'Stop'
 $LogDir  = 'C:\Logs\CompoSecure'
@@ -78,10 +89,17 @@ Write-Log ('Version  : ' + $curVer)
 Write-Log ('Channel  : ' + $channelName)
 Write-Log ('Platform : ' + $cfg.Platform)
 
+$forceFlag = if ($ForceAppShutdown) { 'true' } else { 'false' }
+$c2rArgs = '/update user displaylevel=false forceappshutdown=' + $forceFlag + ' updatepromptuser=false'
+
 Write-Log ''
-Write-Log 'Triggering C2R update (background; waits for Office apps to close)...'
+if ($ForceAppShutdown) {
+    Write-Log 'Triggering C2R update (forceappshutdown=true; open Office apps will be closed)...'
+} else {
+    Write-Log 'Triggering C2R update (background; waits for Office apps to close)...'
+}
 try {
-    Start-Process -FilePath $c2rExe -ArgumentList '/update user displaylevel=false forceappshutdown=false updatepromptuser=false'
+    Start-Process -FilePath $c2rExe -ArgumentList $c2rArgs
     Write-Log 'Update launched.'
 } catch {
     Write-Log ('Failed to launch OfficeC2RClient: ' + $_) -Level ERROR
@@ -102,8 +120,8 @@ if ($WaitMinutes -gt 0) {
         }
     }
     if (-not $advanced) {
-        Write-Log 'Version has not advanced yet -- update is staged and will finalize' -Level WARN
-        Write-Log 'when Office apps are closed. Not a failure; verify at next rescan.' -Level WARN
+        Write-Log 'Version has not advanced yet -- update is still staging/finalizing.' -Level WARN
+        Write-Log 'Not a failure; verify at next rescan.' -Level WARN
     }
 }
 
