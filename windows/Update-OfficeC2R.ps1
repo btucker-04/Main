@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Universal Office Click-to-Run updater. Channel-agnostic: updates the
+    Universal Office Click-to-Run updater (v2). Channel-agnostic: updates the
     machine to the newest build of ITS OWN channel, so it works where
     EC's channel-specific M365 patches report Not Applicable.
 
@@ -8,6 +8,26 @@
     1. Reads the C2R configuration: product IDs, current version, channel
        (CDNBaseUrl GUID mapped to a friendly name) -- all logged, so the
        fleet logs double as a channel census.
+
+       v2 (from the 2026-08-25 CSLT-107 investigation): checks
+       UpdatesEnabled in the C2R Configuration key BEFORE triggering an
+       update. When this is False, OfficeC2RClient.exe /update launches,
+       sees updates are administratively disabled, and exits WITHOUT
+       UPDATING -- silently, with no error and no indication in this
+       script's own log that nothing happened. This is almost certainly
+       why several hosts kept RESURFACING on the M365 channel-support
+       finding: something (a GPO, a config.xml baked in at original
+       deployment) disabled updates fleet-wide, and each fix only "worked"
+       when someone forced an update through a path that bypasses the
+       flag -- with normal automatic updates staying off in between.
+
+       v2 detects UpdatesEnabled=False and, by default, temporarily sets it
+       to True in the registry, triggers the update, and reports the flag's
+       ORIGINAL state clearly so you know it needs a policy-level fix (this
+       script does not touch Group Policy). -LeaveUpdatesDisabled skips the
+       override and just reports the blocker instead, for a host where
+       disabling updates is a deliberate decision you don't want a script
+       overriding.
     2. Triggers OfficeC2RClient.exe /update with forceappshutdown=true:
        any open Office apps are force-closed so the update can stage and
        finalize immediately instead of waiting on the user. Pass
@@ -22,6 +42,11 @@
     finalizes right away. Setting -ForceAppShutdown:$false stages the
     update in the background and finalizes only when the user closes Office.
 
+.PARAMETER LeaveUpdatesDisabled
+    If UpdatesEnabled is False, do NOT override it -- just report the
+    blocker and exit (2). Use this where disabled updates are a deliberate,
+    known decision for this host.
+
 .PARAMETER WaitMinutes
     Minutes to poll for the version to advance. 0 (default) = do not wait.
     Note: without -ForceAppShutdown and with apps open, finalization can
@@ -30,14 +55,19 @@
 
 .NOTES
     Deploy via Endpoint Central (SYSTEM). Logs: C:\Logs\CompoSecure.
-    Exit codes: 0 = triggered (or already current) / 1 = C2R missing or
-    trigger failed.
+    Exit codes: 0 = triggered (or already current) / 2 = updates
+    administratively disabled and -LeaveUpdatesDisabled given (not
+    attempted) / 1 = C2R missing or trigger failed.
 #>
 
 [CmdletBinding()]
 param(
     [int]$WaitMinutes = 0,
-    [bool]$ForceAppShutdown = $true
+    [bool]$ForceAppShutdown = $true,
+    # If UpdatesEnabled is False, do NOT override it -- just report the
+    # blocker and exit. Use this where disabled updates are a deliberate,
+    # known decision for this host.
+    [switch]$LeaveUpdatesDisabled
 )
 
 $ErrorActionPreference = 'Stop'
@@ -65,7 +95,7 @@ $ChannelMap = @{
 }
 
 Write-Log '=============================================='
-Write-Log ' Office C2R Universal Update'
+Write-Log ' Office C2R Universal Update (v2)'
 Write-Log (' Host : ' + $env:COMPUTERNAME)
 Write-Log '=============================================='
 
@@ -78,6 +108,35 @@ if (-not (Test-Path $c2rKey) -or -not (Test-Path $c2rExe)) {
 }
 
 $cfg = Get-ItemProperty $c2rKey
+
+$updatesEnabledOriginal = $cfg.UpdatesEnabled
+Write-Log ('UpdatesEnabled (as found): ' + $updatesEnabledOriginal)
+$restoreUpdatesEnabled = $false
+if ($updatesEnabledOriginal -eq $false -or ('' + $updatesEnabledOriginal) -eq 'False') {
+    Write-Log 'UpdatesEnabled is FALSE. OfficeC2RClient /update will launch and exit' -Level WARN
+    Write-Log 'WITHOUT UPDATING when this is set -- silently, with no error. This is' -Level WARN
+    Write-Log 'almost certainly why this host keeps resurfacing on channel-support' -Level WARN
+    Write-Log 'findings between manual fixes.' -Level WARN
+    Write-Log 'Likely source: a GPO (Office ADMX "Hide/disable updates"), or a' -Level WARN
+    Write-Log 'config.xml <Updates Enabled="FALSE"/> baked in at original deployment.' -Level WARN
+    Write-Log 'This script does not change Group Policy -- if a GPO is reapplying this' -Level WARN
+    Write-Log 'value, the override below will be reverted at the next policy refresh.' -Level WARN
+    if ($LeaveUpdatesDisabled) {
+        Write-Log 'LeaveUpdatesDisabled set -- not overriding. Reporting only.' -Level WARN
+        Write-Log '=============================================='
+        exit 2
+    }
+    Write-Log 'Temporarily setting UpdatesEnabled=True so this update can proceed...' -Level WARN
+    try {
+        Set-ItemProperty -Path $c2rKey -Name 'UpdatesEnabled' -Value $true -ErrorAction Stop
+        $restoreUpdatesEnabled = $true
+        Write-Log '  Set. (Reminder: find and fix the policy/config source, or this reverts.)' -Level WARN
+    } catch {
+        Write-Log ('  Failed to set UpdatesEnabled: ' + $_) -Level ERROR
+        Write-Log '  Cannot proceed -- the update call would silently no-op.' -Level ERROR
+        exit 1
+    }
+}
 $curVer = [version]$cfg.VersionToReport
 $cdn = '' + $cfg.CDNBaseUrl
 $channelGuid = ($cdn -split '/')[-1].ToLower()
@@ -126,6 +185,11 @@ if ($WaitMinutes -gt 0) {
 }
 
 Write-Log ''
+if ($restoreUpdatesEnabled) {
+    Write-Log '*** UpdatesEnabled was FALSE and was overridden to True for this run. ***' -Level WARN
+    Write-Log '*** Find and fix the policy/config.xml source, or this host will silently' -Level WARN
+    Write-Log '*** stop updating again the next time that policy reapplies. ***' -Level WARN
+}
 Write-Log '=============================================='
 Write-Log ' Done. Channel + version above; rescan to confirm findings clear.'
 Write-Log '=============================================='
