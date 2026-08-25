@@ -29,6 +29,10 @@ macos/superseded/     retained for reference/rollback; prefer the replacement no
 - **Mosyle passes no environment variables.** Scripts that take configuration (e.g. `remediate-ruby-gem.sh`) expose a `CONFIG` block at the top of the file to edit before deploying, with environment-variable overrides supported for local/terminal use.
 - Logs write to `/var/log/composecure/`.
 
+## Script arguments
+
+For a per-script list of the arguments each script accepts (with defaults and a brief description of each), see [`docs/SCRIPT-ARGUMENTS.md`](docs/SCRIPT-ARGUMENTS.md).
+
 ## Cross-cutting lessons (apply across multiple scripts)
 
 - **Tenable often keys findings on file/folder presence, not on what a package manager reports.** Updating a Ruby gem, a .NET runtime, or similar often leaves the *old* artifact on disk in a separate location (a Homebrew Cellar spec, a side-by-side .NET version folder) even after the update succeeds — the finding won't clear until that artifact is actually removed. Scripts here separate "update" from "cleanup" but run both, gated on confirming the update actually landed first.
