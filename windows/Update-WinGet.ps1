@@ -48,6 +48,23 @@
     a host already in that state is called out up front rather than only
     being a surprise at verification (exit 2).
 
+    v3 (from the CSLT-001 pilot run, 2026-08-26): step [4/5]'s "register for
+    the current session" loop was resolving the NEW provisioned package but
+    then never actually using it -- it looped over the OLD, already-
+    registered packages and re-registered each one with ITS OWN (old)
+    manifest, which cannot advance anything under any circumstance. CSLT-001
+    had only ONE registered version before this script ran (not the v2
+    dual-registration case) and still exited 2, which is exactly what that
+    bug predicts. Fixed to resolve and register the NEW provisioned
+    package's own manifest instead. NOTE this still runs as SYSTEM, so it
+    can only affect SYSTEM's own AppX context -- it still cannot push a
+    registration into an ALREADY-logged-on human user's session (that is an
+    AppX/Windows limitation, not something a SYSTEM-context script can work
+    around). Practical effect: expect a reboot (or the user logging off/on)
+    to be the normal second step on any host with an active interactive
+    session, not just the ~23% flagged in v2 -- the true fraction needing
+    that second pass is very likely higher than 23%.
+
     DEPENDENCY NOTE: the App Installer bundle depends on the Microsoft.VCLibs
     and Microsoft.UI.Xaml frameworks. These ship with current Windows 10/11
     builds and the Microsoft Store, so they are normally already present. If
@@ -239,21 +256,43 @@ if ($downloaded) { Remove-Item $InstallerPath -Force -ErrorAction SilentlyContin
 
 # Also register for the currently logged-on interactive user, if any, so an
 # already-signed-in user does not have to log off/on to pick up the change.
+#
+# v2 bug fix (from the CSLT-001 pilot run, 2026-08-26): this loop previously
+# iterated Get-AppxPackage -AllUsers (the OLD, already-registered packages)
+# and called Add-AppxPackage -Register on each one's OWN InstallLocation --
+# i.e. it re-registered the version that was ALREADY there. $pkgFullName (the
+# NEW provisioned package) was resolved but never actually used. That is a
+# guaranteed no-op: it cannot advance anything, on ANY host, regardless of
+# whether a stale multi-version state pre-existed. CSLT-001 had only ONE
+# registered version before this script ran and still exited 2, which is
+# exactly what this bug predicts. Fixed to register the NEW provisioned
+# package's own manifest instead.
 Write-Log ''
 Write-Log '[4/5] Registering for the current session (if applicable)...'
 try {
-    $pkgFullName = (Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -eq 'Microsoft.DesktopAppInstaller' } |
-                    Sort-Object Version -Descending | Select-Object -First 1).PackageName
-    if ($pkgFullName) {
-        Get-AppxPackage -AllUsers -Name 'Microsoft.DesktopAppInstaller' -ErrorAction SilentlyContinue | ForEach-Object {
+    $provPkg = Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -eq 'Microsoft.DesktopAppInstaller' } |
+               Sort-Object Version -Descending | Select-Object -First 1
+    if (-not $provPkg) {
+        Write-Log '  No provisioned Microsoft.DesktopAppInstaller entry found (unexpected after step 3).' -Level WARN
+    } else {
+        $newManifest = Join-Path $env:ProgramFiles ('WindowsApps\' + $provPkg.PackageName + '\AppxManifest.xml')
+        if (-not (Test-Path $newManifest)) {
+            Write-Log ('  New package manifest not found at expected path: ' + $newManifest) -Level WARN
+        } else {
             try {
-                Add-AppxPackage -Register ($_.InstallLocation + '\AppXManifest.xml') -DisableDevelopmentMode -ErrorAction Stop
-            } catch { }
+                Add-AppxPackage -Register $newManifest -DisableDevelopmentMode -ErrorAction Stop
+                Write-Log ('  Registered new package manifest: ' + $newManifest)
+            } catch {
+                Write-Log ('  Could not register the new manifest: ' + $_) -Level WARN
+            }
         }
     }
-    Write-Log '  Attempted. Note: a user already logged on may still need to log off/on'
-    Write-Log '  for their own registration to fully reconcile -- this is standard AppX'
-    Write-Log '  behaviour, not specific to this script.'
+    Write-Log '  Note: this registers for the SYSTEM account''s own context (this script'
+    Write-Log '  always runs as SYSTEM under EC) -- it cannot push a per-user AppX'
+    Write-Log '  registration into an already-logged-on HUMAN user''s session. That user'
+    Write-Log '  may still need to log off/on (or the machine reboot) before their own'
+    Write-Log '  registration reconciles. This is standard AppX behaviour, not specific'
+    Write-Log '  to this script.'
 } catch {
     Write-Log ('  Re-registration step skipped: ' + $_) -Level WARN
 }
