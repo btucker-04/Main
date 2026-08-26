@@ -84,6 +84,41 @@
     profile, not an exception. Plan this as a two-phase rollout: provision
     fleet-wide first, then a follow-up reboot pass, then rescan.
 
+    v5 (from the third CSLT-001 run, 2026-08-26): three consecutive runs each
+    reported a SUCCESSFUL provision and the version never moved off
+    1.29.290.0. The zip-header and size checks in step [2/5] only prove the
+    file is a real archive of plausible size -- they say nothing about which
+    version is inside it. A wrong or stale staged bundle therefore provisions
+    "successfully" forever and is indistinguishable from the logon-
+    reconciliation lag above unless you actually look inside the package. New
+    step [2b] reads AppxMetadata/AppxBundleManifest.xml out of the bundle (it
+    is just a zip) and compares the contained Type="application" package
+    versions against -TargetVersion. Note the bundle's OWN Identity version is
+    NOT the app version -- CSLT-001's provisioned entry read 2026.728.1707.0,
+    a date-style bundle version, against a 1.30.80 target, which is exactly
+    the kind of mismatch that makes this worth checking explicitly. A definite
+    mismatch now fails closed (exit 1) rather than becoming a silent
+    fleet-wide no-op across all 315 hosts; an unparseable manifest fails open
+    with a warning so an unexpected-but-valid bundle shape cannot block
+    remediation. -IgnoreBundleVersionMismatch overrides the hard failure.
+
+    v6 (CSLT-001 root cause CONFIRMED, 2026-08-26): inspecting the staged
+    C:\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle showed it
+    contains only 1.29.290.0 and 1.29.289.0 (x64/x86/arm64) -- i.e. its
+    newest payload is the EXACT version already installed. Every run was a
+    guaranteed no-op and no reboot could ever have helped. (Worth noting the
+    eyeball trap that likely produced it: 1.29.290.0 next to a 1.30.80
+    target looks newer because 290 > 80, but the MINOR component decides --
+    29 < 30 -- so it is older.) Since a stale STAGED file also SHADOWS the
+    aka.ms download path this script would otherwise have used, step [2b] no
+    longer just fails on a stale staged artifact: it fetches the vendor's
+    current build, re-validates it (archive + contained version), and uses
+    that instead. The stale file is left in place and called out, because
+    the real fix is the EC staging package -- otherwise EC re-stages the same
+    stale bundle on every host. If the file was already the aka.ms download
+    and STILL misses the target, that is a target/advisory mismatch and it
+    fails closed rather than guessing.
+
     DEPENDENCY NOTE: the App Installer bundle depends on the Microsoft.VCLibs
     and Microsoft.UI.Xaml frameworks. These ship with current Windows 10/11
     builds and the Microsoft Store, so they are normally already present. If
@@ -101,6 +136,12 @@
 .PARAMETER DryRun
     Report current version and resolved installer without changing anything.
 
+.PARAMETER IgnoreBundleVersionMismatch
+    Provision the staged bundle even when its contained application-package
+    version is below -TargetVersion. Escape hatch only, for a bundle whose
+    manifest this script reads wrongly; normally a mismatch means the wrong
+    artifact is staged and provisioning it can never clear the finding.
+
 .NOTES
     Deploy via Endpoint Central (SYSTEM), Repository mode, arguments as bare
     switches only (no $ or quotes, so EC's argument handling cannot mangle
@@ -117,7 +158,10 @@
 param(
     [string]$TargetVersion = '1.30.80',
     [string]$InstallerPath = '',
-    [switch]$DryRun
+    [switch]$DryRun,
+    # Provision even if the staged bundle's contained app version is below
+    # -TargetVersion. Escape hatch only -- see the .PARAMETER note above.
+    [switch]$IgnoreBundleVersionMismatch
 )
 
 $ErrorActionPreference = 'Stop'
@@ -241,19 +285,201 @@ if (-not (Test-Path $InstallerPath)) {
     exit 1
 }
 
+# Download the vendor's current build. Factored out so step [2b] can fall back
+# to it when a STAGED artifact turns out to be stale (see v6 in the header).
+function Get-CurrentAppInstallerBundle {
+    $url  = 'https://aka.ms/getwinget'
+    $dest = Join-Path $env:TEMP ('Microsoft.DesktopAppInstaller_fresh_' + (Get-Date -Format 'yyyyMMddHHmmss') + '.msixbundle')
+    Write-Log ('  Downloading current build: ' + $url)
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    try {
+        Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing -MaximumRedirection 10
+    } catch {
+        Write-Log ('  Download failed: ' + $_) -Level ERROR
+        Write-Log '  If Zscaler blocks aka.ms/GitHub releases, stage a bundle that actually' -Level ERROR
+        Write-Log '  contains the target version and re-run.' -Level ERROR
+        return $null
+    }
+    return $dest
+}
+
 # Validate: msixbundle is zip-based ("PK" magic), plus a size floor, so a
 # Zscaler/proxy block page can never be handed to Add-AppxProvisionedPackage.
-$item = Get-Item $InstallerPath
-$szMB = [math]::Round($item.Length / 1MB, 1)
-$fs = [System.IO.File]::OpenRead($InstallerPath)
-$b1 = $fs.ReadByte(); $b2 = $fs.ReadByte()
-$fs.Close(); $fs.Dispose()
-$isZip = ($b1 -eq 0x50 -and $b2 -eq 0x4B)   # 'P' 'K'
-Write-Log ('  Installer: ' + $InstallerPath + '  (' + $szMB + ' MB, zip header: ' + $isZip + ')')
-if (-not $isZip -or $item.Length -lt 10MB) {
-    Write-Log '  Not a valid msixbundle (block page?). Aborting.' -Level ERROR
+function Test-InstallerIsArchive {
+    param([string]$Path)
+    $fileItem = Get-Item $Path
+    $sizeMB = [math]::Round($fileItem.Length / 1MB, 1)
+    $stream = [System.IO.File]::OpenRead($Path)
+    $byte1 = $stream.ReadByte(); $byte2 = $stream.ReadByte()
+    $stream.Close(); $stream.Dispose()
+    $zipOk = ($byte1 -eq 0x50 -and $byte2 -eq 0x4B)   # 'P' 'K'
+    Write-Log ('  Installer: ' + $Path + '  (' + $sizeMB + ' MB, zip header: ' + $zipOk + ')')
+    if (-not $zipOk -or $fileItem.Length -lt 10MB) {
+        Write-Log '  Not a valid msixbundle (block page?).' -Level ERROR
+        return $false
+    }
+    return $true
+}
+
+if (-not (Test-InstallerIsArchive -Path $InstallerPath)) {
     if ($downloaded) { Remove-Item $InstallerPath -Force -ErrorAction SilentlyContinue }
+    Write-Log '=============================================='
     exit 1
+}
+
+# --------------------------------------------------------------
+# 2b. Does the bundle actually CONTAIN the target version?
+#
+# The zip-header + size checks above only prove "this is a real archive of
+# plausible size" -- they say nothing about what version is inside. A wrong or
+# stale staged bundle provisions "successfully" and then leaves the version
+# unmoved forever, which is indistinguishable from the per-user logon
+# reconciliation lag unless you look inside. CSLT-001 (2026-08-26) ran three
+# times, each reporting a successful provision, and never moved off 1.29.290.0.
+#
+# NOTE the bundle's OWN Identity version is NOT the app version: CSLT-001's
+# provisioned entry read 2026.728.1707.0 (a date-style bundle version) while
+# the target is 1.30.80. The versions that matter are the contained
+# Type="application" packages in AppxMetadata/AppxBundleManifest.xml.
+#
+# Risk posture: a DEFINITE mismatch (manifest parsed, contained version below
+# target) fails closed -- provisioning it can never clear the finding, and
+# doing it on 315 hosts would be a silent fleet-wide no-op. A manifest we
+# cannot parse fails OPEN with a warning, so an unexpected-but-valid bundle
+# shape does not block remediation fleet-wide.
+function Get-BundleManifestInfo {
+    param([string]$BundlePath)
+    if (-not ('System.IO.Compression.ZipFile' -as [type])) {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+    }
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($BundlePath)
+    try {
+        $isBundle = $true
+        $entry = $zip.Entries | Where-Object { $_.Name -eq 'AppxBundleManifest.xml' } | Select-Object -First 1
+        if (-not $entry) {
+            $entry = $zip.Entries | Where-Object { $_.Name -eq 'AppxManifest.xml' } | Select-Object -First 1
+            $isBundle = $false
+        }
+        if (-not $entry) { return $null }
+        $reader = New-Object System.IO.StreamReader($entry.Open())
+        try { $xmlText = $reader.ReadToEnd() } finally { $reader.Dispose() }
+    } finally {
+        $zip.Dispose()
+    }
+    $xml = [xml]$xmlText
+    if ($isBundle) {
+        return [pscustomobject]@{
+            IdentityName  = '' + $xml.Bundle.Identity.Name
+            BundleVersion = '' + $xml.Bundle.Identity.Version
+            AppVersions   = @(@($xml.Bundle.Packages.Package |
+                              Where-Object { $_.Type -eq 'application' }) |
+                              ForEach-Object { '' + $_.Version } | Sort-Object -Unique)
+        }
+    }
+    return [pscustomobject]@{
+        IdentityName  = '' + $xml.Package.Identity.Name
+        BundleVersion = '' + $xml.Package.Identity.Version
+        AppVersions   = @('' + $xml.Package.Identity.Version)
+    }
+}
+
+$bundleInfo = $null
+try {
+    $bundleInfo = Get-BundleManifestInfo -BundlePath $InstallerPath
+} catch {
+    Write-Log ('  Could not inspect the bundle manifest: ' + $_) -Level WARN
+}
+
+if (-not $bundleInfo) {
+    Write-Log '  Could not read a package manifest from this file. Continuing anyway' -Level WARN
+    Write-Log '  (not blocking remediation on a diagnostic read), but the version it' -Level WARN
+    Write-Log '  actually contains is therefore unverified.' -Level WARN
+} else {
+    Write-Log ('  Bundle identity : ' + $bundleInfo.IdentityName)
+    Write-Log ('  Bundle version  : ' + $bundleInfo.BundleVersion + '   (the BUNDLE''s own version, not the app version)')
+    Write-Log ('  Contained app version(s): ' + (($bundleInfo.AppVersions) -join ', '))
+
+    if ($bundleInfo.IdentityName -and $bundleInfo.IdentityName -ne 'Microsoft.DesktopAppInstaller') {
+        Write-Log ('  WARNING: identity is not Microsoft.DesktopAppInstaller. Wrong artifact staged?') -Level WARN
+    }
+
+    $bestInBundle = $null
+    foreach ($v in $bundleInfo.AppVersions) {
+        $parsed = $null
+        try { $parsed = [version]$v } catch { }
+        if ($parsed -and (-not $bestInBundle -or $parsed -gt $bestInBundle)) { $bestInBundle = $parsed }
+    }
+
+    if (-not $bestInBundle) {
+        Write-Log '  No parseable application-package version in the manifest; cannot verify' -Level WARN
+        Write-Log '  the bundle contents. Continuing.' -Level WARN
+    } elseif ($bestInBundle -lt $targetVerObj) {
+        Write-Log ('  This bundle contains ' + $bestInBundle + ', which is BELOW the target ' + $TargetVersion + '.') -Level WARN
+        Write-Log '  Provisioning it can never clear plugin 334617 -- it would report success' -Level WARN
+        Write-Log '  and leave the version unmoved, which looks exactly like the per-user' -Level WARN
+        Write-Log '  logon-reconciliation lag but is not.' -Level WARN
+
+        if ($IgnoreBundleVersionMismatch) {
+            Write-Log '  -IgnoreBundleVersionMismatch set: provisioning it anyway (not recommended).' -Level WARN
+        } elseif ($downloaded) {
+            # Already the vendor's current build and it STILL does not meet the
+            # target -- that is a different problem (advisory/target mismatch, or
+            # the CDN is serving something unexpected). Nothing left to try.
+            Write-Log '  This was already downloaded from aka.ms, so there is no better source' -Level ERROR
+            Write-Log '  to fall back to. Verify -TargetVersion against the advisory.' -Level ERROR
+            Remove-Item $InstallerPath -Force -ErrorAction SilentlyContinue
+            Write-Log '=============================================='
+            exit 1
+        } else {
+            # The STAGED artifact is stale. Do not just fail: the staged file is
+            # actively shadowing the download path this script would otherwise
+            # have used, so fetch the vendor's current build and use that
+            # instead. CSLT-001 (2026-08-26) staged a bundle whose newest
+            # contained version was 1.29.290.0 -- the exact version already
+            # installed -- so all three runs were guaranteed no-ops.
+            Write-Log '  The STAGED file is stale and is shadowing the download path. Fetching' -Level WARN
+            Write-Log '  the current build from Microsoft instead of failing.' -Level WARN
+            $fresh = Get-CurrentAppInstallerBundle
+            if (-not $fresh) {
+                Write-Log '  Could not obtain a current build. Replace the staged bundle with one' -Level ERROR
+                Write-Log ('  containing ' + $TargetVersion + '+ and re-run.') -Level ERROR
+                Write-Log '=============================================='
+                exit 1
+            }
+            if (-not (Test-InstallerIsArchive -Path $fresh)) {
+                Remove-Item $fresh -Force -ErrorAction SilentlyContinue
+                Write-Log '=============================================='
+                exit 1
+            }
+            $freshInfo = $null
+            try { $freshInfo = Get-BundleManifestInfo -BundlePath $fresh } catch {
+                Write-Log ('  Could not inspect the downloaded bundle: ' + $_) -Level WARN
+            }
+            $freshBest = $null
+            if ($freshInfo) {
+                Write-Log ('  Downloaded bundle contains: ' + (($freshInfo.AppVersions) -join ', '))
+                foreach ($v in $freshInfo.AppVersions) {
+                    $parsed = $null
+                    try { $parsed = [version]$v } catch { }
+                    if ($parsed -and (-not $freshBest -or $parsed -gt $freshBest)) { $freshBest = $parsed }
+                }
+            }
+            if ($freshBest -and $freshBest -lt $targetVerObj) {
+                Write-Log ('  The current build only contains ' + $freshBest + ', still below ' + $TargetVersion + '.') -Level ERROR
+                Write-Log '  Verify -TargetVersion against the advisory; nothing to install.' -Level ERROR
+                Remove-Item $fresh -Force -ErrorAction SilentlyContinue
+                Write-Log '=============================================='
+                exit 1
+            }
+            Write-Log ('  Using the downloaded bundle instead of the stale staged file.')
+            Write-Log ('  NOTE: the stale file is still at ' + $InstallerPath + ' and will') -Level WARN
+            Write-Log '  shadow this path again next run -- fix the EC staging package.' -Level WARN
+            $InstallerPath = $fresh
+            $downloaded = $true
+        }
+    } else {
+        Write-Log ('  Bundle contains ' + $bestInBundle + ' >= target ' + $TargetVersion + '. Proceeding.')
+    }
 }
 
 # ==============================================================
