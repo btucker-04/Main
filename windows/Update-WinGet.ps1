@@ -84,6 +84,24 @@
     profile, not an exception. Plan this as a two-phase rollout: provision
     fleet-wide first, then a follow-up reboot pass, then rescan.
 
+    v5 (from the third CSLT-001 run, 2026-08-26): three consecutive runs each
+    reported a SUCCESSFUL provision and the version never moved off
+    1.29.290.0. The zip-header and size checks in step [2/5] only prove the
+    file is a real archive of plausible size -- they say nothing about which
+    version is inside it. A wrong or stale staged bundle therefore provisions
+    "successfully" forever and is indistinguishable from the logon-
+    reconciliation lag above unless you actually look inside the package. New
+    step [2b] reads AppxMetadata/AppxBundleManifest.xml out of the bundle (it
+    is just a zip) and compares the contained Type="application" package
+    versions against -TargetVersion. Note the bundle's OWN Identity version is
+    NOT the app version -- CSLT-001's provisioned entry read 2026.728.1707.0,
+    a date-style bundle version, against a 1.30.80 target, which is exactly
+    the kind of mismatch that makes this worth checking explicitly. A definite
+    mismatch now fails closed (exit 1) rather than becoming a silent
+    fleet-wide no-op across all 315 hosts; an unparseable manifest fails open
+    with a warning so an unexpected-but-valid bundle shape cannot block
+    remediation. -IgnoreBundleVersionMismatch overrides the hard failure.
+
     DEPENDENCY NOTE: the App Installer bundle depends on the Microsoft.VCLibs
     and Microsoft.UI.Xaml frameworks. These ship with current Windows 10/11
     builds and the Microsoft Store, so they are normally already present. If
@@ -101,6 +119,12 @@
 .PARAMETER DryRun
     Report current version and resolved installer without changing anything.
 
+.PARAMETER IgnoreBundleVersionMismatch
+    Provision the staged bundle even when its contained application-package
+    version is below -TargetVersion. Escape hatch only, for a bundle whose
+    manifest this script reads wrongly; normally a mismatch means the wrong
+    artifact is staged and provisioning it can never clear the finding.
+
 .NOTES
     Deploy via Endpoint Central (SYSTEM), Repository mode, arguments as bare
     switches only (no $ or quotes, so EC's argument handling cannot mangle
@@ -117,7 +141,10 @@
 param(
     [string]$TargetVersion = '1.30.80',
     [string]$InstallerPath = '',
-    [switch]$DryRun
+    [switch]$DryRun,
+    # Provision even if the staged bundle's contained app version is below
+    # -TargetVersion. Escape hatch only -- see the .PARAMETER note above.
+    [switch]$IgnoreBundleVersionMismatch
 )
 
 $ErrorActionPreference = 'Stop'
@@ -254,6 +281,110 @@ if (-not $isZip -or $item.Length -lt 10MB) {
     Write-Log '  Not a valid msixbundle (block page?). Aborting.' -Level ERROR
     if ($downloaded) { Remove-Item $InstallerPath -Force -ErrorAction SilentlyContinue }
     exit 1
+}
+
+# --------------------------------------------------------------
+# 2b. Does the bundle actually CONTAIN the target version?
+#
+# The zip-header + size checks above only prove "this is a real archive of
+# plausible size" -- they say nothing about what version is inside. A wrong or
+# stale staged bundle provisions "successfully" and then leaves the version
+# unmoved forever, which is indistinguishable from the per-user logon
+# reconciliation lag unless you look inside. CSLT-001 (2026-08-26) ran three
+# times, each reporting a successful provision, and never moved off 1.29.290.0.
+#
+# NOTE the bundle's OWN Identity version is NOT the app version: CSLT-001's
+# provisioned entry read 2026.728.1707.0 (a date-style bundle version) while
+# the target is 1.30.80. The versions that matter are the contained
+# Type="application" packages in AppxMetadata/AppxBundleManifest.xml.
+#
+# Risk posture: a DEFINITE mismatch (manifest parsed, contained version below
+# target) fails closed -- provisioning it can never clear the finding, and
+# doing it on 315 hosts would be a silent fleet-wide no-op. A manifest we
+# cannot parse fails OPEN with a warning, so an unexpected-but-valid bundle
+# shape does not block remediation fleet-wide.
+function Get-BundleManifestInfo {
+    param([string]$BundlePath)
+    if (-not ('System.IO.Compression.ZipFile' -as [type])) {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+    }
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($BundlePath)
+    try {
+        $isBundle = $true
+        $entry = $zip.Entries | Where-Object { $_.Name -eq 'AppxBundleManifest.xml' } | Select-Object -First 1
+        if (-not $entry) {
+            $entry = $zip.Entries | Where-Object { $_.Name -eq 'AppxManifest.xml' } | Select-Object -First 1
+            $isBundle = $false
+        }
+        if (-not $entry) { return $null }
+        $reader = New-Object System.IO.StreamReader($entry.Open())
+        try { $xmlText = $reader.ReadToEnd() } finally { $reader.Dispose() }
+    } finally {
+        $zip.Dispose()
+    }
+    $xml = [xml]$xmlText
+    if ($isBundle) {
+        return [pscustomobject]@{
+            IdentityName  = '' + $xml.Bundle.Identity.Name
+            BundleVersion = '' + $xml.Bundle.Identity.Version
+            AppVersions   = @(@($xml.Bundle.Packages.Package |
+                              Where-Object { $_.Type -eq 'application' }) |
+                              ForEach-Object { '' + $_.Version } | Sort-Object -Unique)
+        }
+    }
+    return [pscustomobject]@{
+        IdentityName  = '' + $xml.Package.Identity.Name
+        BundleVersion = '' + $xml.Package.Identity.Version
+        AppVersions   = @('' + $xml.Package.Identity.Version)
+    }
+}
+
+$bundleInfo = $null
+try {
+    $bundleInfo = Get-BundleManifestInfo -BundlePath $InstallerPath
+} catch {
+    Write-Log ('  Could not inspect the bundle manifest: ' + $_) -Level WARN
+}
+
+if (-not $bundleInfo) {
+    Write-Log '  Could not read a package manifest from this file. Continuing anyway' -Level WARN
+    Write-Log '  (not blocking remediation on a diagnostic read), but the version it' -Level WARN
+    Write-Log '  actually contains is therefore unverified.' -Level WARN
+} else {
+    Write-Log ('  Bundle identity : ' + $bundleInfo.IdentityName)
+    Write-Log ('  Bundle version  : ' + $bundleInfo.BundleVersion + '   (the BUNDLE''s own version, not the app version)')
+    Write-Log ('  Contained app version(s): ' + (($bundleInfo.AppVersions) -join ', '))
+
+    if ($bundleInfo.IdentityName -and $bundleInfo.IdentityName -ne 'Microsoft.DesktopAppInstaller') {
+        Write-Log ('  WARNING: identity is not Microsoft.DesktopAppInstaller. Wrong artifact staged?') -Level WARN
+    }
+
+    $bestInBundle = $null
+    foreach ($v in $bundleInfo.AppVersions) {
+        $parsed = $null
+        try { $parsed = [version]$v } catch { }
+        if ($parsed -and (-not $bestInBundle -or $parsed -gt $bestInBundle)) { $bestInBundle = $parsed }
+    }
+
+    if (-not $bestInBundle) {
+        Write-Log '  No parseable application-package version in the manifest; cannot verify' -Level WARN
+        Write-Log '  the bundle contents. Continuing.' -Level WARN
+    } elseif ($bestInBundle -lt $targetVerObj) {
+        Write-Log ('  This bundle contains ' + $bestInBundle + ', which is BELOW the target ' + $TargetVersion + '.') -Level ERROR
+        Write-Log '  Provisioning it can never clear plugin 334617 -- it would report success' -Level ERROR
+        Write-Log '  and leave the version unmoved, which looks exactly like the per-user' -Level ERROR
+        Write-Log '  logon-reconciliation lag but is not. Replace the staged bundle with a' -Level ERROR
+        Write-Log ('  build containing ' + $TargetVersion + '+ (https://aka.ms/getwinget) and re-run.') -Level ERROR
+        if ($IgnoreBundleVersionMismatch) {
+            Write-Log '  -IgnoreBundleVersionMismatch set: continuing anyway (not recommended).' -Level WARN
+        } else {
+            if ($downloaded) { Remove-Item $InstallerPath -Force -ErrorAction SilentlyContinue }
+            Write-Log '=============================================='
+            exit 1
+        }
+    } else {
+        Write-Log ('  Bundle contains ' + $bestInBundle + ' >= target ' + $TargetVersion + '. Proceeding.')
+    }
 }
 
 # ==============================================================
