@@ -65,6 +65,25 @@
     session, not just the ~23% flagged in v2 -- the true fraction needing
     that second pass is very likely higher than 23%.
 
+    v4 (from the CSLT-001 re-run after v3, 2026-08-26): the v3 fix could not
+    actually register anything for THIS app, because App Installer ships as
+    an .msixbundle and Get-AppxProvisionedPackage's entry for it is the
+    BUNDLE's own PackageFullName (architecture 'neutral', resource id '~' --
+    e.g. 'Microsoft.DesktopAppInstaller_2026.728.1707.0_neutral_~_...'),
+    not a concrete per-architecture Main package (same '_~_' pattern already
+    documented in Remove-3DViewer.ps1). There is no
+    WindowsApps\<that name>\AppxManifest.xml to register: the concrete
+    package only materializes when a user's OWN registration reconciles
+    against the provisioned list, at THEIR next logon. Step [4/5] now
+    detects this and reports it precisely instead of a generic "manifest not
+    found". PRACTICAL UPSHOT FOR THIS SPECIFIC PLUGIN: because App Installer
+    is always bundle-packaged, there is NO SYSTEM-context registration path
+    at all for an already-logged-on user -- exit 2 (reboot/logoff required)
+    should be treated as the EXPECTED, standard first-pass outcome for any
+    host with a logged-on (or previously logged-on, not-yet-rebooted) user
+    profile, not an exception. Plan this as a two-phase rollout: provision
+    fleet-wide first, then a follow-up reboot pass, then rescan.
+
     DEPENDENCY NOTE: the App Installer bundle depends on the Microsoft.VCLibs
     and Microsoft.UI.Xaml frameworks. These ship with current Windows 10/11
     builds and the Microsoft Store, so they are normally already present. If
@@ -88,6 +107,10 @@
     them). Logs: C:\Logs\CompoSecure\WinGetUpdate_<timestamp>.log
     EC exit code config: success codes 0,3010 (2 = needs a reboot/logon cycle
     to confirm, not a failure; 1 = genuine failure).
+    Plan on TWO passes fleet-wide (see v4 above): this run provisions the
+    fix; a reboot pass afterward is what actually clears the finding on any
+    host that has a logged-on (or not-yet-rebooted) user profile, which is
+    expected to be a large majority of the fleet for this specific plugin.
 #>
 
 [CmdletBinding()]
@@ -274,6 +297,23 @@ try {
                Sort-Object Version -Descending | Select-Object -First 1
     if (-not $provPkg) {
         Write-Log '  No provisioned Microsoft.DesktopAppInstaller entry found (unexpected after step 3).' -Level WARN
+    } elseif ($provPkg.PackageName -like '*_~_*') {
+        # Confirmed on CSLT-001, 2026-08-26: PackageName was
+        # 'Microsoft.DesktopAppInstaller_2026.728.1707.0_neutral_~_8wekyb3d8bbwe'.
+        # The '_~_' segment (architecture=neutral, resource id=~) is the BUNDLE's
+        # own PackageFullName, not a concrete per-architecture Main package --
+        # the same pattern already documented in Remove-3DViewer.ps1. There is no
+        # WindowsApps\<that name>\AppxManifest.xml to register: App Installer
+        # ships as an .msixbundle, DISM provisions the bundle itself, and the
+        # concrete architecture-specific package only gets materialized when a
+        # user's OWN registration reconciles against the provisioned list -- at
+        # THEIR next logon. No SYSTEM-context action can force that early for an
+        # already-logged-on user.
+        Write-Log ('  Provisioned entry is the BUNDLE registration (' + $provPkg.PackageName + '),') -Level WARN
+        Write-Log '  not a concrete per-architecture package -- there is nothing on disk yet' -Level WARN
+        Write-Log '  for this script to register from SYSTEM context. Expect exit 2 below;' -Level WARN
+        Write-Log '  that is a Windows/AppX platform limit for bundle-packaged apps like this' -Level WARN
+        Write-Log '  one, not a failure of this step.' -Level WARN
     } else {
         $newManifest = Join-Path $env:ProgramFiles ('WindowsApps\' + $provPkg.PackageName + '\AppxManifest.xml')
         if (-not (Test-Path $newManifest)) {
