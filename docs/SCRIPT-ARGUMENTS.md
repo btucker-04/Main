@@ -198,6 +198,15 @@ Read-only: classifies where each .NET version exists (live / cache-only / orphan
 ## Get-VisualStudioInstallerLogs.ps1
 Read-only: dumps the tail of recent Visual Studio installer logs. **No arguments.**
 
+## Get-AppxBundleContents.ps1
+Read-only: reports which version(s) an `.msixbundle`/`.msix` actually contains, so a staged installer can be verified before or after provisioning. Note the bundle's own Identity version is *not* the app version.
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `-BundlePath` | string | `''` | Path to the `.msixbundle`/`.msix` to inspect. If empty, searches beside the script then `C:\` for `Microsoft.DesktopAppInstaller*.msixbundle`. |
+| `-TargetVersion` | string | `1.30.80` | Version the contained application packages are judged against (the fix for plugin 334617 / CVE-2026-68821). |
+| `-ExpectedName` | string | `Microsoft.DesktopAppInstaller` | Package Identity name to sanity-check, so a completely wrong artifact is called out. |
+
 ## windows/superseded/Repair-NessusAgentOrphanInstall.ps1
 Superseded by `NessusAgent_CleanReinstall.ps1`. Retained for reference.
 
