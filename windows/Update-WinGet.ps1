@@ -39,6 +39,15 @@
     a rescan, a reboot (which forces a logon cycle) is the next step -- not a
     re-run of this script.
 
+    v2 (from the 2026-08-26 Tenable group export, plugin 334617, 315 hosts):
+    72 of those 315 hosts (~23%) ALREADY had two simultaneous
+    Microsoft.DesktopAppInstaller versions registered under different users
+    before this script ever ran -- direct evidence of the known limitation
+    above occurring at scale, not a rare edge case. Step [1/5] now inventories
+    every distinct registered version and which user/state holds each one, so
+    a host already in that state is called out up front rather than only
+    being a surprise at verification (exit 2).
+
     DEPENDENCY NOTE: the App Installer bundle depends on the Microsoft.VCLibs
     and Microsoft.UI.Xaml frameworks. These ship with current Windows 10/11
     builds and the Microsoft Store, so they are normally already present. If
@@ -109,6 +118,29 @@ if (-not $pkg) {
     exit 1
 }
 Write-Log ('  Installed: ' + $pkg.Version + '  (' + $pkg.PackageFullName + ')')
+
+# Diagnostic: multiple simultaneously-registered versions is direct evidence
+# of the KNOWN LIMITATION above (per-user AppX registration lag) already
+# being in effect on this host -- seen on ~23% of the fleet in the 334617
+# export. Surfacing it here means exit 2 later is an expected confirmation,
+# not a surprise.
+$allPkgs = Get-AppxPackage -AllUsers -Name 'Microsoft.DesktopAppInstaller' -ErrorAction SilentlyContinue
+$distinctVersions = @($allPkgs | Select-Object -ExpandProperty Version -Unique)
+if ($distinctVersions.Count -gt 1) {
+    Write-Log ('  NOTE: ' + $distinctVersions.Count + ' distinct versions are already simultaneously') -Level WARN
+    Write-Log '  registered on this host (per-user AppX registrations at different' -Level WARN
+    Write-Log '  versions). Expect this host to need a reboot/logon cycle after this run' -Level WARN
+    Write-Log '  before Tenable stops flagging the older registration(s) too.' -Level WARN
+    foreach ($pv in ($allPkgs | Sort-Object Version)) {
+        $users = @($pv.PackageUserInformation | ForEach-Object {
+            $u = $_.UserSecurityId.Username
+            if ([string]::IsNullOrWhiteSpace($u)) { $u = '(orphaned SID)' }
+            $u + ':' + $_.InstallState
+        })
+        $userList = if ($users.Count -gt 0) { $users -join ', ' } else { '(none enumerated)' }
+        Write-Log ('    ' + $pv.Version + '  users: ' + $userList)
+    }
+}
 
 $curVer = $null
 try { $curVer = [version]$pkg.Version } catch { }
