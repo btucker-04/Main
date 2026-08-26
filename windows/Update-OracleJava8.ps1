@@ -1,6 +1,7 @@
 <#
 .SYNOPSIS
-    Updates Oracle Java SE 8 JRE to 8u491+ (Nessus Plugin 309197,
+    Updates Oracle Java SE 8 JRE to 8u503+ (Nessus Plugins 338352 /
+    August 2026 CSPU and 329223 / July 2026 CPU; supersedes 309197 /
     April 2026 CPU) on a machine where an older 8uXXX JRE is installed.
 
 .DESCRIPTION
@@ -8,10 +9,10 @@
     csprpc-98 is a PRODUCTION SHOPFLOOR machine (Shopfloor VLAN, 'Pierce'
     asset, 10.3.91.x production subnet, CSPR prefix). Java is almost
     certainly present to support a line application. This update is
-    within-train (8u481 -> 8u491: security fixes, same APIs) and low risk,
+    within-train (e.g. 8u491 -> 8u503: security fixes, same APIs) and low risk,
     but:
       - Confirm ownership/change-approval with Marvin / OT first.
-      - Confirm the Pierce/production app tolerates 8u491.
+      - Confirm the Pierce/production app tolerates 8u503.
       - Run during a maintenance window; the script refuses to proceed if
         Java is actively running unless -ForceCloseJava is given.
 
@@ -25,7 +26,7 @@
     disk, not just ARP. WEB_JAVA=0 disables the browser plugin (hardening).
 
 .PARAMETER InstallerPath
-    Full path to jre-8u491(or later)-windows-x64.exe. Defaults to the first
+    Full path to jre-8u503(or later)-windows-x64.exe. Defaults to the first
     jre-8u*-windows-x64.exe found beside this script.
 
 .PARAMETER ForceCloseJava
@@ -61,18 +62,24 @@ function Write-Log {
     Add-Content -Path $LogFile -Value $line -ErrorAction SilentlyContinue
 }
 
-# 8u491 expressed as the file-version Oracle reports (8.0.4910.x). We compare
-# on the update number (491) parsed from the jre1.8.0_XXX folder / ARP name.
-$TargetUpdate = 491
+# The update number (503) parsed from the jre1.8.0_XXX folder / ARP name.
+#
+# KEEP THIS CURRENT: the "already at or above target" check EXITS 0, so a
+# stale value makes this script silently do nothing on a host that is
+# genuinely vulnerable. Observed on CSLT-136 (2026-08-26): 8u491 installed
+# with plugins 329223 (needs 8u501) and 338352 (needs 8u503) both open, while
+# this value still read 491 -- 491 >= 491, so the run would have reported
+# "nothing to do" and changed nothing.
+$TargetUpdate = 503
 $JavaRoot     = 'C:\Program Files\Java'
 
 Write-Log '=============================================='
-Write-Log ' Oracle JRE 8 Update -- Plugin 309197'
+Write-Log ' Oracle JRE 8 Update -- Plugins 338352 / 329223'
 Write-Log (' Host   : ' + $env:COMPUTERNAME)
 Write-Log (' DryRun : ' + $DryRun)
 Write-Log '=============================================='
 Write-Log 'SCOPE: production shopfloor (Pierce). Ensure Marvin/OT approval and'
-Write-Log 'that the line application tolerates 8u491 before proceeding.'
+Write-Log 'that the line application tolerates 8u503 before proceeding.'
 
 # ==============================================================
 # 1. Inventory installed Oracle JRE 8
@@ -123,7 +130,7 @@ if ([string]::IsNullOrWhiteSpace($InstallerPath)) {
     }
 }
 if ([string]::IsNullOrWhiteSpace($InstallerPath) -or -not (Test-Path $InstallerPath)) {
-    Write-Log '  Installer not found. Stage jre-8u491-windows-x64.exe beside this' -Level ERROR
+    Write-Log '  Installer not found. Stage jre-8u503-windows-x64.exe beside this' -Level ERROR
     Write-Log '  script or in C:\, or pass -InstallerPath. (Oracle JRE 8 is not downloadable' -Level ERROR
     Write-Log '  without an account, so this script will not fetch it.)' -Level ERROR
     exit 1
@@ -219,6 +226,6 @@ if ($stillOld.Count -gt 0) {
 }
 
 Write-Log '  Updated JRE present and no vulnerable 8u folders remain.'
-Write-Log '  Re-run a Nessus scan to confirm plugin 309197 clears.'
+Write-Log '  Re-run a Nessus scan to confirm plugins 338352 and 329223 clear.'
 Write-Log '=============================================='
 exit 0

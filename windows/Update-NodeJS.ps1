@@ -1,14 +1,15 @@
 <#
 .SYNOPSIS
     Updates Node.js to the fixed release of ITS OWN major line
-    (Nessus Plugin 322793 -- June 18 2026 security releases):
-        22.x -> 22.23.0   24.x -> 24.17.0   26.x -> 26.3.1
+    (Nessus Plugin 330668 -- July 29 2026 security releases; supersedes
+    322793 / June 18 2026):
+        22.x -> 22.23.2   24.x -> 24.18.1   26.x -> 26.5.1
 
 .DESCRIPTION
     Targets the MSI install flagged by Tenable (C:\Program Files\nodejs\).
 
     Stays on the installed major line by design -- a developer on 22.x is
-    moved to 22.23.0, NOT jumped to 26.x, because a major bump can break
+    moved to 22.23.2, NOT jumped to 26.x, because a major bump can break
     their projects. Override with -TargetVersion for a deliberate jump.
 
     Installer sourcing (in order):
@@ -22,7 +23,7 @@
     developer's dev server / build, unless -ForceCloseNode is passed.
 
 .PARAMETER TargetVersion
-    Explicit version to install (e.g. '22.23.0'). Default: resolved from the
+    Explicit version to install (e.g. '22.23.2'). Default: resolved from the
     installed major line using the advisory's fixed-version map.
 
 .PARAMETER InstallerPath
@@ -61,15 +62,20 @@ function Write-Log {
     Add-Content -Path $LogFile -Value $line -ErrorAction SilentlyContinue
 }
 
-# Fixed versions per major line, from the June 18 2026 advisory.
+# Fixed versions per major line, from the July 29 2026 advisory (plugin
+# 330668). KEEP THIS MAP CURRENT: the "already at or above target" check
+# EXITS 0, so a stale entry makes this script silently do nothing on a host
+# that is genuinely vulnerable. Observed on CSLT-136 (2026-08-26): Node
+# 24.17.0 installed against a 24.18.1 requirement, while this map still read
+# 24.17.0 -- the run would have reported "already current" and changed nothing.
 $FixedFor = @{
-    '22' = '22.23.0'
-    '24' = '24.17.0'
-    '26' = '26.3.1'
+    '22' = '22.23.2'
+    '24' = '24.18.1'
+    '26' = '26.5.1'
 }
 
 Write-Log '=============================================='
-Write-Log ' Node.js Update -- Plugin 322793'
+Write-Log ' Node.js Update -- Plugin 330668 (supersedes 322793)'
 Write-Log (' Host   : ' + $env:COMPUTERNAME)
 Write-Log (' DryRun : ' + $DryRun)
 Write-Log '=============================================='
@@ -257,7 +263,7 @@ if ($newVer -lt $targetVerObj) {
 }
 
 Write-Log ('  SUCCESS: Node.js ' + $curVer + ' -> ' + $newVer)
-Write-Log '  Re-run a Nessus scan to confirm plugin 322793 clears.'
+Write-Log '  Re-run a Nessus scan to confirm plugin 330668 clears.'
 Write-Log '=============================================='
 if ($rebootNeeded) { exit 3010 }
 exit 0
