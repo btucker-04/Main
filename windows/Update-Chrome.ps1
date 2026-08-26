@@ -1,7 +1,8 @@
 <#
 .SYNOPSIS
     Remediation: Google Chrome Multiple Vulnerabilities
-    Nessus Plugin IDs : 317483 (< 148.0.7778.216), 319297 (< 149.0.7827.53)
+    Nessus Plugin IDs : 317483 (< 148.0.7778.216), 319297 (< 149.0.7827.53),
+                        339531 (< 152.0.7977.64)
     Affected Asset    : csprpc-64 (10.3.20.81) -- and any others with stale Chrome
 
 .DESCRIPTION
@@ -13,6 +14,14 @@
     Deploy via Endpoint Central (runs as SYSTEM).
     All strings use concatenation (no interpolation) to survive the EC editor.
 
+    KEEP -MinVersion CURRENT. It is not just a post-install assertion: the
+    "already at or above target" check near the top EXITS 0 when the installed
+    version meets it, so a stale threshold makes this script silently do
+    nothing on a host that is genuinely vulnerable. Observed on CSLT-136
+    (2026-08-26): Chrome 151.0.7922.174 installed, plugin 339531 wanting
+    152.0.7977.64, while this script's default still read 149.0.7827.53 --
+    151 >= 149, so the run would have exited 0 having changed nothing.
+
 .NOTES
     Exit codes: 0 = success, 3010 = success + reboot recommended, 1 = failure
 #>
@@ -20,9 +29,10 @@
 [CmdletBinding()]
 param(
     [switch]$DryRun,
-    # Minimum acceptable version -- the higher of the two plugin thresholds.
-    # The permalink always serves >= this, but we verify anyway.
-    [string]$MinVersion = '149.0.7827.53'
+    # Minimum acceptable version -- the HIGHEST current plugin threshold.
+    # The permalink always serves >= this, but we verify anyway. See the
+    # "KEEP -MinVersion CURRENT" note above before leaving this stale.
+    [string]$MinVersion = '152.0.7977.64'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -57,7 +67,7 @@ function Get-ChromeVersion {
 }
 
 Write-Log '=============================================='
-Write-Log ' Chrome Update -- Plugins 317483 / 319297'
+Write-Log ' Chrome Update -- Plugins 317483 / 319297 / 339531'
 Write-Log (' Host       : ' + $env:COMPUTERNAME)
 Write-Log (' Date       : ' + (Get-Date))
 Write-Log (' MinVersion : ' + $MinVersion)
@@ -195,7 +205,7 @@ if ([version]$after.Version -ge [version]$MinVersion) {
 # Cleanup
 Remove-Item $MsiPath -Force -ErrorAction SilentlyContinue
 Write-Log ''
-Write-Log ' Re-run a Nessus scan to confirm plugins 317483 and 319297 clear.'
+Write-Log ' Re-run a Nessus scan to confirm plugins 317483, 319297 and 339531 clear.'
 Write-Log '=============================================='
 
 if ($rebootNeeded) { exit 3010 }
