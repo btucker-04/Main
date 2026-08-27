@@ -198,6 +198,16 @@ Read-only: classifies where each .NET version exists (live / cache-only / orphan
 ## Get-VisualStudioInstallerLogs.ps1
 Read-only: dumps the tail of recent Visual Studio installer logs. **No arguments.**
 
+## Update-ClaudeCode.ps1
+Remediates per-user Claude Code installs (plugin 322792 / CVE-2026-54316). Because Claude Code lives under the user's own profile, SYSTEM cannot update it directly; the default mode stages the update into that user's `RunOnce` so it runs as them at next logon.
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `-TargetVersion` | string | `2.1.163` | Minimum acceptable version (the fix for CVE-2026-54316). |
+| `-RemoveClaudeCode` | switch | off | Remove the per-user install(s) outright instead of staging an update. Immediate and verifiable, but destructive to that user's tool. |
+| `-NotifyUser` | switch | off | Also send a console message to any logged-on user so the next-logon update isn't a surprise. |
+| `-DryRun` | switch | off | Report every install found and the intended action without changing anything. |
+
 ## Get-AppxBundleContents.ps1
 Read-only: reports which version(s) an `.msixbundle`/`.msix` actually contains, so a staged installer can be verified before or after provisioning. Note the bundle's own Identity version is *not* the app version.
 
@@ -263,6 +273,15 @@ Generic vulnerable-gem remediator. Accepts, in precedence order, **positional ar
 | — | `DRY_RUN` | `CFG_DRY_RUN="0"` | Set `1` to report only, delete nothing. |
 
 Example (terminal): `./remediate-ruby-gem.sh net-imap "0.4:0.4.24;0.5:0.5.14;0.6:0.6.4" 313278`
+
+## update-claude-code.sh
+Updates per-user Claude Code installs under `/Users/*/.local/bin/claude` (plugin 322792 / CVE-2026-54316). Runs `claude update` as each owning user via `sudo -u`, which works even when that user is not logged in. Reads **environment variables**, with an in-script `CONFIG` block for Mosyle.
+
+| Environment variable | CONFIG default | Description |
+|----------------------|----------------|-------------|
+| `TARGET_VERSION` | `CFG_TARGET_VERSION="2.1.163"` | Minimum acceptable version. |
+| `ONLY_USER` | `CFG_ONLY_USER=""` | Restrict to a single account; empty means every user with an install. |
+| `DRY_RUN` | `CFG_DRY_RUN="0"` | Set `1` to report only and change nothing. |
 
 ## update-golang.sh
 Updates Go (official tree + Homebrew; per-user managers report-only). Reads **environment variables**, with an in-script `CONFIG` block for Mosyle.
