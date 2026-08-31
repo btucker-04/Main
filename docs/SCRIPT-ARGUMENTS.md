@@ -217,6 +217,17 @@ Read-only: reports which version(s) an `.msixbundle`/`.msix` actually contains, 
 | `-TargetVersion` | string | `1.30.80` | Version the contained application packages are judged against (the fix for plugin 334617 / CVE-2026-68821). |
 | `-ExpectedName` | string | `Microsoft.DesktopAppInstaller` | Package Identity name to sanity-check, so a completely wrong artifact is called out. |
 
+## Repair-ZscalerAgent.ps1
+Diagnoses and applies bounded remediation (start/restart the critical services only) for a Zscaler Client Connector that has stopped checking in. Emits exactly one machine-parseable line to stdout for fleet aggregation, plus a full evidence log per run.
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `-Format` | string (`Kv`/`Csv`/`Json`) | `Kv` | Output shape for the single result line. |
+| `-IncludeHeader` | switch | off | Emit a CSV header row before the data row (ignored for Kv/Json). Leave off for fleet runs — add the header once at the collector. |
+| `-ServiceWaitSeconds` | int | `45` | Seconds to wait for a service to reach `Running` after a start/restart. |
+| `-CheckInStaleMinutes` | int | `60` | Minutes of ZCC log inactivity after which check-in is treated as STALE. |
+| `-TextFieldMaxLength` | int | `160` | Truncation ceiling for free-text fields, so one chatty host cannot blow up a fleet report row. |
+
 ## windows/superseded/Repair-NessusAgentOrphanInstall.ps1
 Superseded by `NessusAgent_CleanReinstall.ps1`. Retained for reference.
 
@@ -319,6 +330,14 @@ Updates Node.js across Homebrew / official pkg (per-user managers report-only). 
 
 ## update-powershell.sh
 Updates PowerShell to the fixed version. **No arguments** (self-escalates via `sudo`; target is the in-script constant `FIXED_VERSION`).
+
+## repair-zscaler-agent.sh
+Diagnoses and applies bounded remediation (`launchctl kickstart -k` on an already-loaded, non-running/stale daemon only) for a Zscaler Client Connector that has stopped checking in. Emits one machine-parseable line in the same schema as `Repair-ZscalerAgent.ps1`, plus a full evidence log per run under `/var/log/composecure`. Reads **environment variables**, with an in-script `CONFIG` block for Mosyle.
+
+| Environment variable | CONFIG default | Description |
+|----------------------|----------------|-------------|
+| `CHECKIN_STALE_MINUTES` | `CFG_CHECKIN_STALE_MINUTES="60"` | Minutes of log inactivity after which check-in is treated as STALE. |
+| `DRY_RUN` | `CFG_DRY_RUN="0"` | Set `1` to report only; kickstart nothing. |
 
 ## macos/superseded/*
 Retained for reference/rollback; prefer the replacements noted in each header (the Ruby-gem scripts are superseded by `remediate-ruby-gem.sh`; `update-photoshop.sh` by `update-adobe-rum.sh`).
