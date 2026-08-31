@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Remediation: Microsoft .NET Core security updates (v3.1)
+    Remediation: Microsoft .NET Core security updates (v3.2)
     Nessus Plugin IDs : 302122, 307353 (+ 314679, 320854, 326863 -- same fix)
 
 .DESCRIPTION
@@ -13,6 +13,31 @@
          cleanup removed it (or anything else went sideways), reinstalls
          and re-verifies. Exits 1 if the machine does not end in a
          strictly better state than it started.
+
+    v3.2 (from the SAME-DAY CSPC-004 re-run, 2026-08-31, still plugin 326863):
+    the v3.1 orphaned-group removal reported "the ARP entry survived an
+    exit-0 uninstall" -- unconditionally -- for an uninstall that actually
+    exited 1612 (ERROR_INSTALL_SOURCE_ABSENT: the bundle's own cached
+    uninstall payload is gone, not a bundle skipping uninstall for a live
+    dependent). There was no SDK or hosting bundle in that arch/major to
+    blame either, and the message pointed at a "dependency diagnostics"
+    section that this removal path never populates in the first place.
+      * Invoke-ArpEntryRemoval now diagnoses by the ACTUAL exit code (a table
+        of known msiexec/bundle codes: 1605/1612/1618/1619/1620) instead of
+        assuming exit-0-plus-dependents every time, and runs the WiX
+        dependency-holder lookup INLINE for the failing version so the log
+        either names a real holder or honestly says none exists.
+      * -RemoveOrphanedRegistrations callers (both the whole-major Phase 1d
+        path and the exact-group Phase 2 path) now pass -AllowHardRemoval:
+        if no dependency holder is found for a confirmed-zero-payload entry,
+        the ARP registry key is stripped directly rather than leaving dead
+        metadata behind that a broken uninstaller can never clear.
+      * Phase 1d's own inline removal (a duplicate of the Phase 2 helper) is
+        gone; it now calls the shared function. That inline block was also
+        checking $arpPaths before the variable was ever assigned (it was
+        previously defined right before Phase 2, after Phase 1d already ran),
+        so its verification silently reported success no matter what
+        happened. $arpPaths is now assigned once, up front, before Phase 0.
 
     v3.1 (from the CSPC-004 run, 2026-08-31, plugin 326863): Phase 2 grouped
     ARP entries by (flavor prefix, major, arch) and kept whichever had the
@@ -514,11 +539,27 @@ function Get-FlavorKeyForArpPrefix {
     return $null
 }
 
-# Uninstall one ARP runtime entry and verify it, exactly as Phase 2 did
-# inline before v3.1 factored it out for reuse by the orphaned-group path too.
-# Returns $true if the entry is confirmed gone afterward.
+# Known non-zero uninstaller/msiexec exit codes worth naming explicitly,
+# because "the ARP entry survived" has more than one root cause and the
+# wrong one sends the operator looking for a holder that does not exist.
+$script:KnownUninstallErrors = @{
+    1605 = 'ERROR_UNKNOWN_PRODUCT -- Windows Installer has no record of this product code'
+    1612 = 'ERROR_INSTALL_SOURCE_ABSENT -- the bundle cannot find its own cached uninstall payload (Package Cache entry for this exact version is gone; the ARP registration outlived it)'
+    1618 = 'ERROR_INSTALL_ALREADY_RUNNING -- another install/uninstall was in progress'
+    1619 = 'ERROR_INSTALL_PACKAGE_OPEN_FAILED -- the install package could not be opened'
+    1620 = 'ERROR_INSTALL_PACKAGE_INVALID -- the install package is invalid'
+}
+
+# Uninstall one ARP runtime entry and verify it. v3.2: diagnoses failures by
+# ACTUAL exit code instead of always blaming "exit-0 dependents" -- CSPC-004
+# (2026-08-31) got exit 1612 (ERROR_INSTALL_SOURCE_ABSENT, a genuine failure,
+# not a silent no-op) and the log still printed the exit-0/dependents theory
+# verbatim, then pointed at a "dependency diagnostics" section that Phase 2's
+# orphaned-group path never populates. Now the holder lookup runs inline,
+# right here, for whatever version actually failed, so the log either shows
+# the real holder or honestly says none exists.
 function Invoke-ArpEntryRemoval {
-    param($Entry)
+    param($Entry, [string]$Version, [switch]$AllowHardRemoval)
     if ($DryRun) { Write-Log '    [DRYRUN] Would uninstall.'; return $false }
     try {
         if ($Entry.QuietUninstallString) {
@@ -532,22 +573,65 @@ function Invoke-ArpEntryRemoval {
             Write-Log '    No usable uninstall string.' -Level WARN
             return $false
         }
-        Write-Log ('    Uninstall exit: ' + $u.ExitCode)
-        if ($u.ExitCode -eq 3010) { $script:Reboot = $true }
+        $exitCode = $u.ExitCode
+        Write-Log ('    Uninstall exit: ' + $exitCode)
+        if ($exitCode -eq 3010) { $script:Reboot = $true }
         # v2.7: exit 0 is NOT proof of removal. A WiX bundle with registered
         # dependents skips its uninstall and reports success.
         Start-Sleep -Seconds 1
         $stillThere = Get-ItemProperty -Path $arpPaths -ErrorAction SilentlyContinue |
                       Where-Object { $_.PSChildName -eq $Entry.PSChildName }
-        if ($stillThere) {
+        if (-not $stillThere) { return $true }
+
+        $holders = @()
+        if ($Version) { $holders = Test-VersionHeldByDependency -Version $Version }
+
+        if ($exitCode -eq 0) {
             Write-Log '    NOT ACTUALLY REMOVED -- the ARP entry survived an exit-0 uninstall.' -Level WARN
-            Write-Log '    A bundle with registered dependents skips uninstall and returns' -Level WARN
-            Write-Log '    success. See the dependency diagnostics below for the holder; the' -Level WARN
-            Write-Log '    holder must be dealt with first. Re-running this script will not help.' -Level WARN
-            $script:UninstallNoOp = $true
-            return $false
+            if ($holders.Count -gt 0) {
+                Write-Log '    A bundle with registered dependents skips uninstall and returns' -Level WARN
+                Write-Log '    success. Holder(s):' -Level WARN
+                foreach ($h in $holders) { Write-Log ('      ' + $h) -Level WARN }
+            } else {
+                Write-Log '    No WiX dependency holder found for this version either -- the' -Level WARN
+                Write-Log '    exit-0 no-op has an unidentified cause. Inspect the ARP entry by hand.' -Level WARN
+            }
+        } else {
+            Write-Log ('    UNINSTALL FAILED -- exit ' + $exitCode + ' is a genuine error, not a silent no-op.') -Level WARN
+            if ($script:KnownUninstallErrors.ContainsKey($exitCode)) {
+                Write-Log ('    ' + $script:KnownUninstallErrors[$exitCode] + '.') -Level WARN
+            }
+            if ($holders.Count -gt 0) {
+                Write-Log '    WiX dependency holder(s) also found (deal with these too):' -Level WARN
+                foreach ($h in $holders) { Write-Log ('      ' + $h) -Level WARN }
+            } else {
+                Write-Log '    No WiX dependency holder found -- the "registered dependents" theory' -Level WARN
+                Write-Log '    does not apply here.' -Level WARN
+            }
         }
-        return $true
+
+        if ($AllowHardRemoval -and $holders.Count -eq 0) {
+            Write-Log '    -RemoveOrphanedRegistrations, no dependency holder, and no on-disk' -Level WARN
+            Write-Log '    payload anywhere for this flavor/arch/major: stripping the ARP entry' -Level WARN
+            Write-Log '    directly (registry-only; there is nothing left for it to reference).' -Level WARN
+            try {
+                Remove-Item -Path $Entry.PSPath -Recurse -Force -ErrorAction Stop
+                Start-Sleep -Seconds 1
+                $stillThere2 = Get-ItemProperty -Path $arpPaths -ErrorAction SilentlyContinue |
+                               Where-Object { $_.PSChildName -eq $Entry.PSChildName }
+                if (-not $stillThere2) {
+                    Write-Log '    Hard removal succeeded -- orphaned entry cleared.'
+                    return $true
+                }
+                Write-Log '    Hard removal did not stick either. Leaving it; escalate manually.' -Level ERROR
+            } catch {
+                Write-Log ('    Hard removal failed: ' + $_) -Level ERROR
+            }
+        }
+
+        Write-Log '    Re-running this script will not help until the above is resolved.' -Level WARN
+        $script:UninstallNoOp = $true
+        return $false
     } catch {
         Write-Log ('    Uninstall error: ' + $_) -Level WARN
         Write-Log '    If folders persist after exit 0: MSI reference counting --' -Level WARN
@@ -575,7 +659,7 @@ $EolWarnDays     = 180
 $EolSoonSeen     = @()
 
 Write-Log '=============================================='
-Write-Log ' .NET Runtime Update (v3.0) -- 302122/307353/314679/320854'
+Write-Log ' .NET Runtime Update (v3.2) -- 302122/307353/314679/320854/326863'
 Write-Log (' Host   : ' + $env:COMPUTERNAME)
 # Echo EVERY switch, so a log proves which arguments actually arrived. Endpoint
 # Central has a history in this environment of altering argument strings, and a
@@ -596,6 +680,18 @@ $roots = @(
     @{ Arch = 'x86'; Exe = 'C:\Program Files (x86)\dotnet\dotnet.exe' }
 )
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+# v3.2: hoisted above Phase 1d. It previously was not assigned until right
+# before Phase 2, so Phase 1d's own removal-verification (`Get-ItemProperty
+# -Path $arpPaths`) ran against $null and silently reported every hard
+# removal as successful regardless of what actually happened. Never observed
+# in a log because Phase 1d has had zero whole-major orphans to remove so
+# far, but it was live and would have masked a real failure the first time
+# one occurred.
+$arpPaths = @(
+    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+    'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+)
 
 # ------------------------------------------------------------------
 # Phase 0: record the starting state
@@ -914,33 +1010,13 @@ if ($OrphanMajors.Count -eq 0) {
         foreach ($e in $arpMajors[[int]$m]) {
             if ($DryRun) { Write-Log ('  [DRYRUN] Would remove ' + $e.DisplayName); continue }
             Write-Log ('  Removing orphaned registration: ' + $e.DisplayName)
-            $rc = $null
-            try {
-                if ($e.QuietUninstallString) {
-                    $cmd = $e.QuietUninstallString
-                    $exeQ = ($cmd -split '"')[1]
-                    $argsQ = ($cmd.Substring($cmd.IndexOf($exeQ) + $exeQ.Length + 1)).Trim()
-                    $u = Start-Process $exeQ -ArgumentList $argsQ -Wait -PassThru -NoNewWindow
-                    $rc = $u.ExitCode
-                } elseif ($e.PSChildName -match '^\{[0-9A-Fa-f-]+\}$') {
-                    $rc = Invoke-Msi ('/x ' + $e.PSChildName + ' /qn /norestart')
-                } else {
-                    Write-Log '    No usable uninstall string; leaving it.' -Level WARN
-                    continue
-                }
-            } catch {
-                Write-Log ('    Uninstall error: ' + $_) -Level WARN
-                continue
-            }
-            Write-Log ('    Exit: ' + $rc)
-            if ($rc -eq 3010) { $Reboot = $true }
-            Start-Sleep -Seconds 1
-            $chk = Get-ItemProperty -Path $arpPaths -ErrorAction SilentlyContinue |
-                   Where-Object { $_.PSChildName -eq $e.PSChildName }
-            if ($chk) {
-                Write-Log '    NOT ACTUALLY REMOVED -- entry survived an exit-0 uninstall (dependents).' -Level WARN
-                $script:UninstallNoOp = $true
-            }
+            $verStr = $null
+            if ($e.DisplayName -match '(\d+\.\d+\.\d+)') { $verStr = $matches[1] }
+            # v3.2: reuse Invoke-ArpEntryRemoval instead of a duplicate inline
+            # block -- this was also the block relying on $arpPaths before it
+            # was assigned (see hoist above) and hardcoding the "exit-0
+            # dependents" theory regardless of the actual exit code.
+            Invoke-ArpEntryRemoval -Entry $e -Version $verStr -AllowHardRemoval | Out-Null
         }
     }
 }
@@ -948,10 +1024,6 @@ if ($OrphanMajors.Count -eq 0) {
 Write-Log ''
 Write-Log '=== Phase 2: removing superseded versions (by DisplayName version) ==='
 
-$arpPaths = @(
-    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
-    'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
-)
 $dotnetArp = Get-ItemProperty -Path $arpPaths -ErrorAction SilentlyContinue | Where-Object {
     $_.DisplayName -match '^Microsoft (\.NET|ASP\.NET Core|Windows Desktop) Runtime'
 }
@@ -1004,7 +1076,7 @@ foreach ($key in $groups.Keys) {
                 continue
             }
             Write-Log ('    Removing orphan: ' + $e.DisplayName + '  [' + $e.DisplayVersion + ']') -Level WARN
-            Invoke-ArpEntryRemoval -Entry $e | Out-Null
+            Invoke-ArpEntryRemoval -Entry $e -Version $it.NameVer.ToString() -AllowHardRemoval | Out-Null
         }
         if (-not $RemoveOrphanedRegistrations) {
             Write-Log '    Re-run with -RemoveOrphanedRegistrations to remove these.' -Level WARN
@@ -1020,7 +1092,11 @@ foreach ($key in $groups.Keys) {
             continue
         }
         Write-Log ('  Removing: ' + $e.DisplayName + '  [' + $e.DisplayVersion + ']') -Level WARN
-        Invoke-ArpEntryRemoval -Entry $e | Out-Null
+        # Not -AllowHardRemoval here: this group DOES have on-disk payload for
+        # the current version, so an older sibling entry surviving uninstall
+        # is plausibly a real SDK/hosting-bundle dependency reference, not
+        # dead metadata -- forcing a registry-only removal could hide that.
+        Invoke-ArpEntryRemoval -Entry $e -Version $it.NameVer.ToString() | Out-Null
     }
 }
 
