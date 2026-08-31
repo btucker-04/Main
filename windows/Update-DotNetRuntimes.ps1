@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
-    Remediation: Microsoft .NET Core security updates (v3.0)
-    Nessus Plugin IDs : 302122, 307353 (+ 314679, 320854 -- same fix)
+    Remediation: Microsoft .NET Core security updates (v3.1)
+    Nessus Plugin IDs : 302122, 307353 (+ 314679, 320854, 326863 -- same fix)
 
 .DESCRIPTION
     For each .NET major channel ALREADY PRESENT on the machine (per arch):
@@ -13,6 +13,24 @@
          cleanup removed it (or anything else went sideways), reinstalls
          and re-verifies. Exits 1 if the machine does not end in a
          strictly better state than it started.
+
+    v3.1 (from the CSPC-004 run, 2026-08-31, plugin 326863): Phase 2 grouped
+    ARP entries by (flavor prefix, major, arch) and kept whichever had the
+    HIGHEST version registered IN THAT GROUP, with no check for whether the
+    group had any on-disk payload backing it at all. x86 Windows Desktop
+    Runtime never had an 8.x folder on this host (only 10.0.11 was ever
+    installed for that flavor/arch) -- but ARP still carried 8.0.26/8.0.27
+    registrations, and 8.0.27 was mechanically "the newest registered", so
+    it was kept. Tenable's plugin 326863 reads DisplayVersion straight from
+    that ARP entry, so "keep the max" cleared nothing; the same pattern held
+    for x86 .NET Runtime 8.0.26-29. Phase 1d's existing ARP-only-major check
+    could not catch this: it only fires when a MAJOR has zero payload
+    ACROSS EVERY flavor/arch, and major 8 was genuinely installed elsewhere
+    on this host (x64). Phase 2 now checks each group's EXACT
+    (flavor, arch, major) against the disk inventory; a group with none
+    logs as an ORPHANED GROUP and every entry in it becomes a removal
+    candidate (gated by -RemoveOrphanedRegistrations, the same flag as the
+    whole-major case, since both are "ARP claims a version nothing backs").
 
     v2 fixes (from the 2026-07-14 cspc-100 run):
       * Cleanup now keys on the version IN THE DISPLAYNAME, not
@@ -199,9 +217,14 @@ param(
     # global.json scan; NOT enabled by default because it is a build-environment
     # change on someone's development machine.
     [switch]$RemoveSupersededSdks,
-    # Uninstall ARP registrations for majors with NO runtime payload on disk.
-    # Inventory hygiene: these do not produce Tenable version findings (which key
-    # on folders) but they do make EC and EoL reports claim the runtime is present.
+    # Uninstall ARP registrations that have NO runtime payload backing them --
+    # covers two distinct cases: a whole MAJOR with zero payload across every
+    # flavor/arch (Phase 1d; inventory hygiene, since most Tenable checks key
+    # on folders, not ARP), and a specific (flavor, arch, major) with zero
+    # payload even though the major exists elsewhere on the host (Phase 2,
+    # v3.1). The second case DOES clear a real version finding: plugin 326863
+    # reads DisplayVersion straight from ARP, so an orphaned entry left in
+    # place (even the "newest" one in its group) keeps the finding open.
     [switch]$RemoveOrphanedRegistrations
 )
 
@@ -474,6 +497,63 @@ function Install-HostingBundle {
     if ($p.ExitCode -eq 3010) { $script:Reboot = $true; return $true }
     if ($p.ExitCode -ne 0) { Write-Log '    Hosting bundle install failed.' -Level ERROR; return $false }
     return $true
+}
+
+# Map an ARP DisplayName prefix (e.g. "Microsoft .NET Runtime", "Microsoft
+# Windows Desktop Runtime") to the internal flavor key used in $before/$after
+# (e.g. "Microsoft.NETCore.App"), so Phase 2 can check whether a group's
+# (flavor, arch, major) has ANY on-disk payload at all -- finer-grained than
+# Phase 1d's whole-major ARP-only check, which misses a flavor+arch that has
+# zero payload for a major while a DIFFERENT flavor/arch of that same major
+# is genuinely installed (see v3.1 notes above).
+function Get-FlavorKeyForArpPrefix {
+    param([string]$Prefix)
+    if ($Prefix -match 'ASP\.NET Core')   { return 'Microsoft.AspNetCore.App' }
+    if ($Prefix -match 'Windows Desktop') { return 'Microsoft.WindowsDesktop.App' }
+    if ($Prefix -match '\.NET Runtime')   { return 'Microsoft.NETCore.App' }
+    return $null
+}
+
+# Uninstall one ARP runtime entry and verify it, exactly as Phase 2 did
+# inline before v3.1 factored it out for reuse by the orphaned-group path too.
+# Returns $true if the entry is confirmed gone afterward.
+function Invoke-ArpEntryRemoval {
+    param($Entry)
+    if ($DryRun) { Write-Log '    [DRYRUN] Would uninstall.'; return $false }
+    try {
+        if ($Entry.QuietUninstallString) {
+            $cmd   = $Entry.QuietUninstallString
+            $exeQ  = ($cmd -split '"')[1]
+            $argsQ = ($cmd.Substring($cmd.IndexOf($exeQ) + $exeQ.Length + 1)).Trim()
+            $u = Start-Process $exeQ -ArgumentList $argsQ -Wait -PassThru
+        } elseif ($Entry.PSChildName -match '^\{[0-9A-Fa-f-]+\}$') {
+            $u = Start-Process msiexec.exe -ArgumentList ('/x ' + $Entry.PSChildName + ' /qn /norestart') -Wait -PassThru
+        } else {
+            Write-Log '    No usable uninstall string.' -Level WARN
+            return $false
+        }
+        Write-Log ('    Uninstall exit: ' + $u.ExitCode)
+        if ($u.ExitCode -eq 3010) { $script:Reboot = $true }
+        # v2.7: exit 0 is NOT proof of removal. A WiX bundle with registered
+        # dependents skips its uninstall and reports success.
+        Start-Sleep -Seconds 1
+        $stillThere = Get-ItemProperty -Path $arpPaths -ErrorAction SilentlyContinue |
+                      Where-Object { $_.PSChildName -eq $Entry.PSChildName }
+        if ($stillThere) {
+            Write-Log '    NOT ACTUALLY REMOVED -- the ARP entry survived an exit-0 uninstall.' -Level WARN
+            Write-Log '    A bundle with registered dependents skips uninstall and returns' -Level WARN
+            Write-Log '    success. See the dependency diagnostics below for the holder; the' -Level WARN
+            Write-Log '    holder must be dealt with first. Re-running this script will not help.' -Level WARN
+            $script:UninstallNoOp = $true
+            return $false
+        }
+        return $true
+    } catch {
+        Write-Log ('    Uninstall error: ' + $_) -Level WARN
+        Write-Log '    If folders persist after exit 0: MSI reference counting --' -Level WARN
+        Write-Log '    see HKLM:\SOFTWARE\Classes\Installer\Dependencies.' -Level WARN
+        return $false
+    }
 }
 
 $Reboot = $false
@@ -891,6 +971,47 @@ foreach ($e in $dotnetArp) {
 
 foreach ($key in $groups.Keys) {
     $items  = $groups[$key]
+    $parts  = $key -split '\|'
+    $prefix = $parts[0]; $groupMajor = [int]$parts[1]; $groupArch = $parts[2]
+
+    # v3.1: does THIS EXACT (flavor, arch, major) have any on-disk payload at
+    # all? Phase 1d's ARP-only check only catches a MAJOR with zero payload
+    # ACROSS EVERY flavor/arch -- it never fires when a different flavor/arch
+    # of the same major is genuinely installed elsewhere (e.g. x64 8.0.30
+    # exists, so major 8 is never flagged, even though x86 WindowsDesktop/
+    # NETCore never had an 8.x folder at all). CSPC-004 (2026-08-31, plugin
+    # 326863): x86 Windows Desktop Runtime 8.0.27 and .NET Runtime 8.0.26-29
+    # were ALL orphaned this way, and 8.0.27/8.0.29 were being marked "Keep"
+    # simply for being the highest DisplayName version REGISTERED, with
+    # nothing on disk backing any of them -- Tenable reads DisplayVersion
+    # from ARP directly, so "keep the max ARP entry" cleared nothing.
+    $flavorKey = Get-FlavorKeyForArpPrefix -Prefix $prefix
+    $beforeKey = $groupArch + '|' + $flavorKey
+    $hasPayloadForMajor = $false
+    if ($flavorKey -and $before.ContainsKey($beforeKey)) {
+        $hasPayloadForMajor = [bool]($before[$beforeKey] | Where-Object { $_.Major -eq $groupMajor })
+    }
+
+    if (-not $hasPayloadForMajor) {
+        Write-Log ('  ORPHANED GROUP: ' + $prefix + ' [' + $groupMajor + '.x ' + $groupArch + '] -- no on-disk') -Level WARN
+        Write-Log ('  payload for this flavor/arch/major at all. None of the entries below are' ) -Level WARN
+        Write-Log ('  backing anything; "keep the highest registered version" would keep a' ) -Level WARN
+        Write-Log ('  dead ARP entry, which is exactly what left plugin 326863 open on CSPC-004.') -Level WARN
+        foreach ($it in $items) {
+            $e = $it.Entry
+            if (-not $RemoveOrphanedRegistrations) {
+                Write-Log ('    ORPHAN (not removed): ' + $e.DisplayName + '  [' + $e.DisplayVersion + ']') -Level WARN
+                continue
+            }
+            Write-Log ('    Removing orphan: ' + $e.DisplayName + '  [' + $e.DisplayVersion + ']') -Level WARN
+            Invoke-ArpEntryRemoval -Entry $e | Out-Null
+        }
+        if (-not $RemoveOrphanedRegistrations) {
+            Write-Log '    Re-run with -RemoveOrphanedRegistrations to remove these.' -Level WARN
+        }
+        continue
+    }
+
     $maxVer = ($items | ForEach-Object { $_.NameVer } | Sort-Object -Descending)[0]
     foreach ($it in $items) {
         $e = $it.Entry
@@ -899,38 +1020,7 @@ foreach ($key in $groups.Keys) {
             continue
         }
         Write-Log ('  Removing: ' + $e.DisplayName + '  [' + $e.DisplayVersion + ']') -Level WARN
-        if ($DryRun) { Write-Log '    [DRYRUN] Would uninstall.'; continue }
-        try {
-            if ($e.QuietUninstallString) {
-                $cmd   = $e.QuietUninstallString
-                $exeQ  = ($cmd -split '"')[1]
-                $argsQ = ($cmd.Substring($cmd.IndexOf($exeQ) + $exeQ.Length + 1)).Trim()
-                $u = Start-Process $exeQ -ArgumentList $argsQ -Wait -PassThru
-            } elseif ($e.PSChildName -match '^\{[0-9A-Fa-f-]+\}$') {
-                $u = Start-Process msiexec.exe -ArgumentList ('/x ' + $e.PSChildName + ' /qn /norestart') -Wait -PassThru
-            } else {
-                Write-Log '    No usable uninstall string.' -Level WARN
-                continue
-            }
-            Write-Log ('    Uninstall exit: ' + $u.ExitCode)
-            if ($u.ExitCode -eq 3010) { $Reboot = $true }
-            # v2.7: exit 0 is NOT proof of removal. A WiX bundle with registered
-            # dependents skips its uninstall and reports success.
-            Start-Sleep -Seconds 1
-            $stillThere = Get-ItemProperty -Path $arpPaths -ErrorAction SilentlyContinue |
-                          Where-Object { $_.PSChildName -eq $e.PSChildName }
-            if ($stillThere) {
-                Write-Log '    NOT ACTUALLY REMOVED -- the ARP entry survived an exit-0 uninstall.' -Level WARN
-                Write-Log '    A bundle with registered dependents skips uninstall and returns' -Level WARN
-                Write-Log '    success. See the dependency diagnostics below for the holder; the' -Level WARN
-                Write-Log '    holder must be dealt with first. Re-running this script will not help.' -Level WARN
-                $script:UninstallNoOp = $true
-            }
-        } catch {
-            Write-Log ('    Uninstall error: ' + $_) -Level WARN
-            Write-Log '    If folders persist after exit 0: MSI reference counting --' -Level WARN
-            Write-Log '    see HKLM:\SOFTWARE\Classes\Installer\Dependencies.' -Level WARN
-        }
+        Invoke-ArpEntryRemoval -Entry $e | Out-Null
     }
 }
 
