@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Remediation: Microsoft .NET Core security updates (v3.2)
+    Remediation: Microsoft .NET Core security updates (v3.3)
     Nessus Plugin IDs : 302122, 307353 (+ 314679, 320854, 326863 -- same fix)
 
 .DESCRIPTION
@@ -13,6 +13,27 @@
          cleanup removed it (or anything else went sideways), reinstalls
          and re-verifies. Exits 1 if the machine does not end in a
          strictly better state than it started.
+
+    v3.3 (from the CSPC-004 run, 2026-09-01, still plugin 326863): the v3.2
+    holder diagnostics did their job and named the actual blocker --
+    'Microsoft .NET SDK 8.0.420 (x86)' -- holding a WiX reference on BOTH the
+    8.0.26 x86 Windows Desktop Runtime and the orphaned 8.0.26 x86 .NET
+    Runtime entry. But 8.0.420 (x86) was the ONLY x86 SDK on the host, so
+    Phase 1c's existing "keep the newest, remove the rest" grouping never
+    even considered it: a group of one is trivially "the newest in its
+    group," however stale. -RemoveSupersededSdks removes DUPLICATE SDKs; it
+    never installed a newer one to replace a lone stale one.
+      * New Install-Sdk (same aka.ms permalink family as Install-Runtime:
+        https://aka.ms/dotnet/<major>.0/dotnet-sdk-win-<arch>.exe) installs
+        the current SDK patch for every (major, arch) with an SDK present.
+        This just adds a newer sibling to the group; the EXISTING
+        supersede-and-remove logic (global.json pin guard included) then
+        sees two entries and finishes the job unchanged.
+      * Gated on -RemoveSupersededSdks, not a new switch: that flag already
+        means "manage SDKs on this build machine, confirmed with the
+        owner." Not run by default -- an SDK bundle is ~150-250 MB per arch,
+        versus ~10-55 MB for a runtime patch, and should not download
+        unprompted on every pass the way Phase 1's runtime installs do.
 
     v3.2 (from the SAME-DAY CSPC-004 re-run, 2026-08-31, still plugin 326863):
     the v3.1 orphaned-group removal reported "the ARP entry survived an
@@ -240,7 +261,11 @@ param(
     # Remove superseded .NET SDKs within a major, keeping the newest. This is what
     # releases the dependency refs that block runtime pruning. Guarded by a
     # global.json scan; NOT enabled by default because it is a build-environment
-    # change on someone's development machine.
+    # change on someone's development machine. v3.3: also installs the current
+    # SDK patch for every (major, arch) present BEFORE the dedup check, so a
+    # LONE stale SDK (no duplicate to compare against) is no longer invisible
+    # to this cleanup -- a single old SDK still pins whatever frameworks it
+    # shipped with (CSPC-004, 2026-09-01).
     [switch]$RemoveSupersededSdks,
     # Uninstall ARP registrations that have NO runtime payload backing them --
     # covers two distinct cases: a whole MAJOR with zero payload across every
@@ -352,6 +377,70 @@ function Install-Runtime {
 }
 
 
+
+function Install-Sdk {
+    # Downloads + installs the current SDK patch for one major/arch. Same
+    # aka.ms permalink family as Install-Runtime (confirmed pattern:
+    # https://aka.ms/dotnet/<major>.0/dotnet-sdk-win-<arch>.exe).
+    #
+    # v3.3: added because a LONE stale SDK per (major, arch) was invisible to
+    # Phase 1c's existing dedup logic, which only flags a version as
+    # superseded when TWO OR MORE share a group. CSPC-004 (2026-09-01) had
+    # exactly one x86 SDK (8.0.420) holding a WiX reference on the 8.0.26 x86
+    # frameworks -- confirmed by name in the v3.2 holder diagnostics -- and
+    # nothing in Phase 1c ever attempted to install the current x86 patch
+    # (8.0.424) that would let the existing supersede-and-remove logic below
+    # actually fire. Installing here just adds a second, newer entry to the
+    # group; the removal path is unchanged and still respects the global.json
+    # pin guard and -RemoveSupersededSdks gating.
+    param([string]$Major, [string]$Arch)
+    $url  = 'https://aka.ms/dotnet/' + $Major + '.0/dotnet-sdk-win-' + $Arch + '.exe'
+    $dest = Join-Path $TempDir ('dotnet-sdk-win-' + $Arch + '-' + $Major + '.exe')
+    Write-Log ('  [SDK ' + $Major + '.0 ' + $Arch + '] ' + $url)
+    if ($DryRun) { Write-Log '    [DRYRUN] Would download + install.'; return $true }
+    $downloaded = $false
+    foreach ($attempt in 1..3) {
+        try {
+            Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing -TimeoutSec 300
+            $downloaded = $true
+            break
+        } catch {
+            Write-Log ('    Download attempt ' + $attempt + ' of 3 failed: ' + $_) -Level WARN
+            Remove-Item $dest -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 10
+        }
+    }
+    if (-not $downloaded) {
+        Write-Log '    Download failed after 3 attempts. If Zscaler is throttling large' -Level ERROR
+        Write-Log '    transfers, stage the installer locally and run it manually.' -Level ERROR
+        return $false
+    }
+    $item = Get-Item $dest
+    $szMB = [math]::Round($item.Length / 1MB, 1)
+    $fs = [System.IO.File]::OpenRead($dest)
+    $b1 = $fs.ReadByte(); $b2 = $fs.ReadByte()
+    $fs.Close(); $fs.Dispose()
+    $isMZ = ($b1 -eq 0x4D -and $b2 -eq 0x5A)
+    Write-Log ('    Downloaded ' + $szMB + ' MB, MZ header: ' + $isMZ)
+    # SDK bundles run ~150-250 MB; a much smaller file here is a block page,
+    # same MZ-header + size-floor sanity check as Install-Runtime (v2).
+    if (-not $isMZ -or $item.Length -lt 50MB) {
+        Write-Log '    Not a valid installer (block page?). Skipping.' -Level ERROR
+        Remove-Item $dest -Force -ErrorAction SilentlyContinue
+        return $false
+    }
+    $bundleLog = Join-Path $LogDir ('dotnet_sdk_bundle_' + $Major + '_' + $Arch + '.log')
+    $p = Start-Process $dest -ArgumentList ('/install /quiet /norestart /log "' + $bundleLog + '"') -Wait -PassThru
+    Write-Log ('    Installer exit: ' + $p.ExitCode)
+    Remove-Item $dest -Force -ErrorAction SilentlyContinue
+    if ($p.ExitCode -eq 3010) { $script:Reboot = $true; return $true }
+    if ($p.ExitCode -ne 0) {
+        Write-Log '    SDK install failed.' -Level ERROR
+        Write-Log ('    Bundle log: ' + $bundleLog) -Level ERROR
+        return $false
+    }
+    return $true
+}
 
 function Get-DotNetSdks {
     $paths = @(
@@ -659,7 +748,7 @@ $EolWarnDays     = 180
 $EolSoonSeen     = @()
 
 Write-Log '=============================================='
-Write-Log ' .NET Runtime Update (v3.2) -- 302122/307353/314679/320854/326863'
+Write-Log ' .NET Runtime Update (v3.3) -- 302122/307353/314679/320854/326863'
 Write-Log (' Host   : ' + $env:COMPUTERNAME)
 # Echo EVERY switch, so a log proves which arguments actually arrived. Endpoint
 # Central has a history in this environment of altering argument strings, and a
@@ -909,6 +998,30 @@ if (-not $sdkEntries) {
     foreach ($s in ($sdkEntries | Sort-Object Major, Version)) {
         Write-Log ('  Installed: ' + $s.Name)
     }
+
+    # v3.3: a LONE SDK per (major, arch) is invisible to the dedup logic
+    # below -- it is trivially "the newest in its group" even if it is
+    # months out of patch, and it still pins whatever frameworks it shipped
+    # with. Gated on -RemoveSupersededSdks (same switch, since it already
+    # means "manage SDKs on this build machine, confirmed with the owner")
+    # rather than a new switch: this downloads a ~150-250 MB bundle per
+    # arch, which should not happen on every run by default the way the
+    # much smaller runtime patches do in Phase 1.
+    if ($RemoveSupersededSdks -and -not $DryRun) {
+        Write-Log ''
+        Write-Log '  Installing the current SDK patch for every (major, arch) present, so a'
+        Write-Log '  lone stale SDK gets a newer sibling and the supersede logic below can'
+        Write-Log '  actually see and remove it.'
+        $doneMA = @()
+        foreach ($s in $sdkEntries) {
+            $ma = ('' + $s.Major + '|' + $s.Arch)
+            if ($doneMA -contains $ma) { continue }
+            $doneMA += $ma
+            if (-not (Install-Sdk -Major $s.Major -Arch $s.Arch)) { $Failed = $true }
+        }
+        $sdkEntries = Get-DotNetSdkEntries
+    }
+
     # group by major + arch; anything below the newest in its group is superseded
     $groups = @{}
     foreach ($s in $sdkEntries) {
