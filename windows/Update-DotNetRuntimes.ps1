@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Remediation: Microsoft .NET Core security updates (v3.3)
+    Remediation: Microsoft .NET Core security updates (v3.4)
     Nessus Plugin IDs : 302122, 307353 (+ 314679, 320854, 326863 -- same fix)
 
 .DESCRIPTION
@@ -13,6 +13,39 @@
          cleanup removed it (or anything else went sideways), reinstalls
          and re-verifies. Exits 1 if the machine does not end in a
          strictly better state than it started.
+
+    v3.4 (from the CSLT-020 run, 2026-09-02): two fixes, one correcting a
+    long-standing assumption this script had documented since v3.0.
+
+    CORRECTION: every previous version claimed "Tenable keys on FOLDER
+    presence, so an orphaned ARP-only registration is inventory hygiene, not
+    a finding-clearing action." CSLT-020's Tenable export proves this false
+    for at least one plugin family: NINE separate "Security Update for
+    Microsoft .NET Core" findings (187859, 190535, 181277, 208286, 178193,
+    179502, 209021, 183025, 193142 -- July 2023 through October 2024
+    advisories) were ALL open on a host whose real runtimes were already
+    fully current (8.0.30 x86, 9.0.19 x64). Every one of them reported
+    Installed version 6.0.18.32522 at Path C:\Program Files\dotnet\ -- the
+    exact DisplayVersion of an orphaned 'Microsoft Windows Desktop Runtime -
+    6.0.18 (x64)' ARP entry with NO on-disk payload anywhere. Each finding's
+    own description says outright: "Nessus has ... relied only on the
+    application's self-reported version number" -- i.e. the ARP
+    DisplayVersion, read directly, independent of any folder on disk.
+    Removing a dead orphaned entry is therefore NOT purely cosmetic; for
+    this plugin family it is required to clear the finding at all, no
+    matter how current the real runtime is.
+
+    BUG FIX (the reason the CSLT-020 orphan removal actually failed):
+      * Removing that exact entry failed with 'The system cannot find the
+        file specified' -- its QuietUninstallString pointed at a cached
+        Package Cache bootstrapper .exe that no longer existed (consistent
+        with zero on-disk payload: its own installer copy was gone too).
+        Start-Process THROWING is a different code path than a bad exit
+        code, so it landed in the generic catch block, which never reached
+        the -AllowHardRemoval fallback added in v3.2 -- that fallback only
+        ran after a successful (non-throwing) uninstall attempt. The catch
+        block now runs the same holder-check + hard-removal logic, factored
+        into a shared Invoke-ArpHardRemoval so both paths use it.
 
     v3.3 (from the CSPC-004 run, 2026-09-01, still plugin 326863): the v3.2
     holder diagnostics did their job and named the actual blocker --
@@ -121,9 +154,11 @@
         named even with no payload.
       * -RemoveOrphanedRegistrations (opt-in) uninstalls ARP entries for majors
         with no payload on disk. Removal is verified, since a bundle with
-        dependents reports success without doing anything. Note Tenable keys on
-        FOLDER presence, so this is about inventory accuracy and EoL reporting
-        rather than clearing a version finding.
+        dependents reports success without doing anything. Originally assumed
+        Tenable keys on FOLDER presence, making this inventory hygiene rather
+        than a finding-clearing action -- CORRECTED in v3.4 below: at least
+        the "Security Update for Microsoft .NET Core" plugin family reads the
+        ARP DisplayVersion directly, so this DOES clear real findings.
 
     v2.9: -RemoveSupersededSdks clears the ACTUAL blocker to pruning runtimes.
     On CSPC-004 the runtime cleanup was not failing -- it was correctly refusing,
@@ -269,12 +304,15 @@ param(
     [switch]$RemoveSupersededSdks,
     # Uninstall ARP registrations that have NO runtime payload backing them --
     # covers two distinct cases: a whole MAJOR with zero payload across every
-    # flavor/arch (Phase 1d; inventory hygiene, since most Tenable checks key
-    # on folders, not ARP), and a specific (flavor, arch, major) with zero
+    # flavor/arch (Phase 1d), and a specific (flavor, arch, major) with zero
     # payload even though the major exists elsewhere on the host (Phase 2,
-    # v3.1). The second case DOES clear a real version finding: plugin 326863
-    # reads DisplayVersion straight from ARP, so an orphaned entry left in
-    # place (even the "newest" one in its group) keeps the finding open.
+    # v3.1). BOTH cases can clear a real version finding, not just tidy
+    # inventory: plugin 326863 (v3.1, Phase 2 case) and the "Security Update
+    # for Microsoft .NET Core" plugin family (v3.4, CSLT-020, Phase 1d case
+    # -- 9 findings on one dead ARP-only .NET 6 entry) both read DisplayVersion
+    # straight from ARP, so an orphaned entry left in place (even the
+    # "newest" one in its group) keeps the finding open regardless of what
+    # the real, current runtime looks like.
     [switch]$RemoveOrphanedRegistrations
 )
 
@@ -647,6 +685,38 @@ $script:KnownUninstallErrors = @{
 # orphaned-group path never populates. Now the holder lookup runs inline,
 # right here, for whatever version actually failed, so the log either shows
 # the real holder or honestly says none exists.
+# Shared by both failure paths in Invoke-ArpEntryRemoval below: a normal
+# uninstall that ran but left the entry in place, AND (v3.4) an uninstall
+# command that could not even be LAUNCHED. CSLT-020 (2026-09-02): the
+# orphaned entry's QuietUninstallString pointed at a cached bootstrapper
+# .exe that no longer existed on disk -- Start-Process itself threw "The
+# system cannot find the file specified" before any exit code existed to
+# diagnose. Unsurprising for an entry with zero on-disk PAYLOAD anywhere:
+# its own cached installer copy (Package Cache) was gone too. That failure
+# used to hit the generic catch block and stop there, never reaching the
+# hard-removal fallback at all, regardless of -AllowHardRemoval.
+function Invoke-ArpHardRemoval {
+    param($Entry)
+    Write-Log '    -RemoveOrphanedRegistrations, no dependency holder, and no on-disk' -Level WARN
+    Write-Log '    payload anywhere for this flavor/arch/major: stripping the ARP entry' -Level WARN
+    Write-Log '    directly (registry-only; there is nothing left for it to reference).' -Level WARN
+    try {
+        Remove-Item -Path $Entry.PSPath -Recurse -Force -ErrorAction Stop
+        Start-Sleep -Seconds 1
+        $stillThere = Get-ItemProperty -Path $arpPaths -ErrorAction SilentlyContinue |
+                      Where-Object { $_.PSChildName -eq $Entry.PSChildName }
+        if (-not $stillThere) {
+            Write-Log '    Hard removal succeeded -- orphaned entry cleared.'
+            return $true
+        }
+        Write-Log '    Hard removal did not stick either. Leaving it; escalate manually.' -Level ERROR
+        return $false
+    } catch {
+        Write-Log ('    Hard removal failed: ' + $_) -Level ERROR
+        return $false
+    }
+}
+
 function Invoke-ArpEntryRemoval {
     param($Entry, [string]$Version, [switch]$AllowHardRemoval)
     if ($DryRun) { Write-Log '    [DRYRUN] Would uninstall.'; return $false }
@@ -700,31 +770,40 @@ function Invoke-ArpEntryRemoval {
         }
 
         if ($AllowHardRemoval -and $holders.Count -eq 0) {
-            Write-Log '    -RemoveOrphanedRegistrations, no dependency holder, and no on-disk' -Level WARN
-            Write-Log '    payload anywhere for this flavor/arch/major: stripping the ARP entry' -Level WARN
-            Write-Log '    directly (registry-only; there is nothing left for it to reference).' -Level WARN
-            try {
-                Remove-Item -Path $Entry.PSPath -Recurse -Force -ErrorAction Stop
-                Start-Sleep -Seconds 1
-                $stillThere2 = Get-ItemProperty -Path $arpPaths -ErrorAction SilentlyContinue |
-                               Where-Object { $_.PSChildName -eq $Entry.PSChildName }
-                if (-not $stillThere2) {
-                    Write-Log '    Hard removal succeeded -- orphaned entry cleared.'
-                    return $true
-                }
-                Write-Log '    Hard removal did not stick either. Leaving it; escalate manually.' -Level ERROR
-            } catch {
-                Write-Log ('    Hard removal failed: ' + $_) -Level ERROR
-            }
+            if (Invoke-ArpHardRemoval -Entry $Entry) { return $true }
         }
 
         Write-Log '    Re-running this script will not help until the above is resolved.' -Level WARN
         $script:UninstallNoOp = $true
         return $false
     } catch {
+        # v3.4: this used to be a dead end regardless of -AllowHardRemoval --
+        # the exception means the uninstall command never even ran, so there
+        # is no exit code and $stillThere was never checked. The entry is
+        # necessarily still present (nothing removed it), so the same
+        # holder-check + hard-removal path applies.
         Write-Log ('    Uninstall error: ' + $_) -Level WARN
-        Write-Log '    If folders persist after exit 0: MSI reference counting --' -Level WARN
-        Write-Log '    see HKLM:\SOFTWARE\Classes\Installer\Dependencies.' -Level WARN
+        if ($_.ToString() -match 'cannot find the file specified|CannotFindPath') {
+            Write-Log '    The uninstall command itself does not exist on disk (its cached' -Level WARN
+            Write-Log '    Package Cache copy is gone) -- this cannot be run through Windows' -Level WARN
+            Write-Log '    Installer at all; the "registered dependents" theory does not apply.' -Level WARN
+        } else {
+            Write-Log '    If folders persist after exit 0: MSI reference counting --' -Level WARN
+            Write-Log '    see HKLM:\SOFTWARE\Classes\Installer\Dependencies.' -Level WARN
+        }
+
+        $holders = @()
+        if ($Version) { $holders = Test-VersionHeldByDependency -Version $Version }
+        if ($holders.Count -gt 0) {
+            Write-Log '    WiX dependency holder(s) found (deal with these too):' -Level WARN
+            foreach ($h in $holders) { Write-Log ('      ' + $h) -Level WARN }
+        }
+
+        if ($AllowHardRemoval -and $holders.Count -eq 0) {
+            if (Invoke-ArpHardRemoval -Entry $Entry) { return $true }
+        }
+
+        $script:UninstallNoOp = $true
         return $false
     }
 }
@@ -748,7 +827,7 @@ $EolWarnDays     = 180
 $EolSoonSeen     = @()
 
 Write-Log '=============================================='
-Write-Log ' .NET Runtime Update (v3.3) -- 302122/307353/314679/320854/326863'
+Write-Log ' .NET Runtime Update (v3.4) -- 302122/307353/314679/320854/326863/+.NETCore-family'
 Write-Log (' Host   : ' + $env:COMPUTERNAME)
 # Echo EVERY switch, so a log proves which arguments actually arrived. Endpoint
 # Central has a history in this environment of altering argument strings, and a
@@ -849,9 +928,11 @@ if ($arpMajors.Keys.Count -gt 0) {
     }
     if ($OrphanMajors.Count -gt 0) {
         Write-Log '    ARP-only majors are invisible to dotnet --list-runtimes, so they were' -Level WARN
-        Write-Log '    previously skipped entirely by this script. Tenable keys on FOLDER' -Level WARN
-        Write-Log '    presence so they produce no version finding, but EC inventory and EoL' -Level WARN
-        Write-Log '    reports will still claim the runtime is installed.' -Level WARN
+        Write-Log '    previously skipped entirely by this script. At least the "Security' -Level WARN
+        Write-Log '    Update for Microsoft .NET Core" Tenable plugin family reads the ARP' -Level WARN
+        Write-Log '    DisplayVersion directly (CSLT-020, 2026-09-02: 9 open findings all' -Level WARN
+        Write-Log '    pointed at one dead 6.0.18 orphan) -- leaving this in place can keep' -Level WARN
+        Write-Log '    real findings open no matter how current the actual runtime is.' -Level WARN
         if (-not $RemoveOrphanedRegistrations) {
             Write-Log '    Re-run with -RemoveOrphanedRegistrations to uninstall them.' -Level WARN
         }
