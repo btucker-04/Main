@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Nessus Agent link repair (v3). Checks the agent's actual state and only
+    Nessus Agent link repair (v4). Checks the agent's actual state and only
     fixes what is broken -- healthy linked agents are left untouched.
 
 .DESCRIPTION
@@ -8,9 +8,42 @@
       Agent installed?
         NO  -> install agent via Tenable bootstrap script (-type agent --
                the v1 script said 'scanner', which installs the wrong product)
+               -> bootstrap failed to produce nessuscli.exe? fall back to a
+                  staged MSI (see v4 below)
         YES -> ensure service is running (either service name)
                -> already linked to the right host? exit 0, touch nothing
                -> not linked / wrong host? link (unlink first only if needed)
+
+    v4 (from the CSLT-168 run, 2026-08-28): the bootstrap install has no
+    fallback -- if ms-install-script.ps1 fails for ANY reason (download
+    blocked, block page instead of the script, or the embedded msiexec
+    itself failing) the script just aborted. CSLT-168's bootstrap
+    downloaded fine but its own msiexec died with 1603, and the only
+    remedy at the time was to run NessusAgent_CleanReinstall.ps1 (a
+    separate, more destructive script) with a staged MSI.
+      * This script now falls back to a staged MSI install when the
+        bootstrap route does not produce nessuscli.exe, for ANY reason
+        (download failure, block page, or a failed install inside the
+        bootstrap). No new switch needed -- Endpoint Central's per-script
+        Repository option is not "install software," it is "run a script,"
+        and per the repo-wide EC-argument convention (README.md) a MSI path
+        should not be passed as a script argument anyway (quoted paths get
+        mangled). Stage the MSI as this Custom Script configuration's
+        Dependency File instead: EC extracts Dependency Files into the SAME
+        folder the script itself runs from, which PowerShell exposes as
+        $PSScriptRoot, so no path needs to be configured by hand.
+      * Get-StagedNessusMsi (same search + arch-matching logic already
+        proven in NessusAgent_CleanReinstall.ps1) checks $PSScriptRoot
+        first, then C:\ as a manual-staging fallback, and prefers a
+        filename matching this host's architecture (x64/win32/arm64).
+      * Invoke-Msi (ported from NessusAgent_CleanReinstall.ps1) runs
+        msiexec by FULL PATH with -NoNewWindow -- a bare 'msiexec.exe'
+        goes through ShellExecute and fails under EC's SYSTEM context --
+        and retries 1618/1601 (installer busy) with backoff instead of
+        treating them as fatal.
+      * -MsiPath still accepts an explicit override for local/manual
+        testing; auto-discovery via $PSScriptRoot is what a normal EC
+        deployment relies on.
 
     v3 (from the 2026-08-07 CSLT-171 / CSLT-243 runs):
       * GROUP RESOLUTION. v2 linked with no group unless -LinkGroups was passed
@@ -41,8 +74,20 @@
     Unlink and relink even if the agent reports healthy. Use only when an
     agent is misbehaving despite showing linked.
 
+.PARAMETER MsiPath
+    Explicit path to a staged Nessus Agent MSI, used only if the Tenable
+    bootstrap install fails. If omitted (the normal EC deployment case),
+    the script searches $PSScriptRoot (where EC extracts this Custom
+    Script configuration's Dependency Files) then C:\ for
+    NessusAgent-*.msi, preferring a filename matching this host's
+    architecture. Do not pass a quoted path as an EC script argument --
+    see README.md on EC argument mangling; stage the MSI as a Dependency
+    File instead and leave this empty.
+
 .NOTES
-    Deploy via Endpoint Central (SYSTEM). Exit: 0 ok / 1 failure.
+    Deploy via Endpoint Central (SYSTEM). Exit: 0 ok / 3010 ok, reboot
+    recommended (configure EC's "Specify exit code(s)" as 0,3010) / 1
+    failure / 2 linked but needs human attention (no group / FIPS warning).
     Zscaler: 'empty response from controller' on link = SSL inspection of
     sensor.cloud.tenable.com; add a bypass and re-run.
 #>
@@ -52,12 +97,16 @@ param(
     [string]$LinkKey    = '4f858e2b28a33a5927c7805eab8b8533ecb35c983417b392c5b570b5a6a96fba',
     [string]$LinkHost   = 'sensor.cloud.tenable.com',
     [string]$LinkGroups = '',
-    [switch]$ForceRelink
+    [switch]$ForceRelink,
+    # Manual override only. Leave empty for a normal EC deployment -- see
+    # .PARAMETER MsiPath above.
+    [string]$MsiPath    = ''
 )
 
 $ErrorActionPreference = 'Stop'
-$NoGroup     = $false
-$FipsWarning = $false
+$NoGroup      = $false
+$FipsWarning  = $false
+$RebootNeeded = $false
 $LogDir  = 'C:\Logs\CompoSecure'
 $LogFile = Join-Path $LogDir ('NessusAgentRepair_' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '.log')
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
@@ -162,7 +211,73 @@ function Test-FipsFailure {
     return ($Text -match 'FIPS module .*Integrity.*FAIL' -or $Text -match 'Module_Integrity HMAC test\s+FAIL')
 }
 
-Write-Log '=== Nessus Agent Repair (v3) ==='
+function Get-StagedNessusMsi {
+    # Same search + architecture-matching logic as NessusAgent_CleanReinstall.ps1's
+    # MSI resolution. $PSScriptRoot -- not $MyInvocation.MyCommand.Path, which
+    # inside a function refers to the function's own invocation, not the
+    # script's -- is where Endpoint Central extracts this Custom Script
+    # configuration's Dependency Files before running the script.
+    $osArch = $env:PROCESSOR_ARCHITEW6432
+    if ([string]::IsNullOrWhiteSpace($osArch)) { $osArch = $env:PROCESSOR_ARCHITECTURE }
+    $archToken = switch ($osArch) {
+        'ARM64'  { 'arm64' }
+        'AMD64'  { 'x64' }
+        'x86'    { 'win32' }
+        default  { '' }
+    }
+    Write-Log ('  OS architecture : ' + $osArch + '  (expecting MSI token: ' + $archToken + ')')
+
+    $searchDirs = @()
+    if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) { $searchDirs += $PSScriptRoot }
+    $searchDirs += 'C:\'
+
+    $candidates = @()
+    foreach ($dir in $searchDirs) {
+        foreach ($f in (Get-ChildItem -Path $dir -Filter 'NessusAgent-*.msi' -File -ErrorAction SilentlyContinue)) {
+            $candidates += $f
+            Write-Log ('  Found staged MSI : ' + $f.FullName + '  (' + [math]::Round($f.Length/1MB,1) + ' MB)')
+        }
+    }
+    if ($candidates.Count -eq 0) { return $null }
+
+    $archMatch = @($candidates | Where-Object { $archToken -and ($_.Name -like ('*' + $archToken + '*')) })
+    if ($archMatch.Count -gt 0) {
+        $pick = ($archMatch | Sort-Object Name -Descending | Select-Object -First 1)
+        Write-Log ('  Architecture match: ' + $pick.Name)
+        return $pick.FullName
+    }
+    $pick = ($candidates | Sort-Object Name -Descending | Select-Object -First 1)
+    Write-Log ('  WARNING: no staged MSI matches architecture ' + $archToken + '.') -Level WARN
+    Write-Log ('  Falling back to ' + $pick.Name + ' -- verify this is correct for this host.') -Level WARN
+    return $pick.FullName
+}
+
+function Invoke-Msi {
+    # Full path + -NoNewWindow: a bare 'msiexec.exe' goes through ShellExecute
+    # and fails under EC's SYSTEM context ("No application is associated with
+    # the specified file for this operation") -- same fix already applied in
+    # NessusAgent_CleanReinstall.ps1. 1618/1601 are transient installer-busy
+    # codes, retried with backoff rather than treated as fatal.
+    param([string]$Arguments, [int]$Retries = 4)
+    $msiexec = Join-Path $env:SystemRoot 'System32\msiexec.exe'
+    if (-not (Test-Path $msiexec)) { $msiexec = 'msiexec.exe' }
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        $p = Start-Process -FilePath $msiexec -ArgumentList $Arguments -Wait -PassThru -NoNewWindow
+        $code = $p.ExitCode
+        if ($code -ne 1618 -and $code -ne 1601) { return $code }
+        if ($attempt -ge $Retries) {
+            Write-Log ('    Still ' + $code + ' after ' + $attempt + ' attempts.') -Level ERROR
+            return $code
+        }
+        $wait = 30 * $attempt
+        Write-Log ('    ' + $code + ' = installer busy. Waiting ' + $wait + 's, retry ' + $attempt + '/' + $Retries + '...') -Level WARN
+        Start-Sleep -Seconds $wait
+    }
+}
+
+Write-Log '=== Nessus Agent Repair (v4) ==='
 Write-Log ('Host: ' + $env:COMPUTERNAME)
 
 # ------------------------------------------------------------------
@@ -172,29 +287,76 @@ if (-not (Test-Path $Cli)) {
     Write-Log 'Agent not installed. Installing via Tenable bootstrap...' -Level WARN
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     $bootstrap = Join-Path $env:TEMP 'ms-install-script.ps1'
+    $bootstrapOk = $true
     try {
         Invoke-WebRequest -Uri 'https://sensor.cloud.tenable.com/install/agent/installer/ms-install-script.ps1' -OutFile $bootstrap -UseBasicParsing
     } catch {
-        Write-Log ('Bootstrap download failed: ' + $_) -Level ERROR
-        Write-Log 'If Zscaler blocks this, stage the agent MSI and use the CleanReinstall script instead.' -Level ERROR
-        exit 1
+        Write-Log ('Bootstrap download failed: ' + $_) -Level WARN
+        $bootstrapOk = $false
     }
-    # Sanity: should be a PowerShell script, not an HTML block page
-    $head = (Get-Content $bootstrap -TotalCount 5) -join ' '
-    if ($head -match '<html|<!DOCTYPE') {
-        Write-Log 'Downloaded file is an HTML block page, not the install script. Aborting.' -Level ERROR
-        Remove-Item $bootstrap -Force -ErrorAction SilentlyContinue
-        exit 1
+    if ($bootstrapOk) {
+        # Sanity: should be a PowerShell script, not an HTML block page
+        $head = (Get-Content $bootstrap -TotalCount 5) -join ' '
+        if ($head -match '<html|<!DOCTYPE') {
+            Write-Log 'Downloaded bootstrap is an HTML block page, not the install script' -Level WARN
+            Write-Log '(likely Zscaler SSL inspection of sensor.cloud.tenable.com).' -Level WARN
+            Remove-Item $bootstrap -Force -ErrorAction SilentlyContinue
+            $bootstrapOk = $false
+        }
     }
-    try {
-        & $bootstrap -key $LinkKey -type 'agent'
-    } finally {
-        Remove-Item $bootstrap -Force -ErrorAction SilentlyContinue
+    if ($bootstrapOk) {
+        try {
+            & $bootstrap -key $LinkKey -type 'agent'
+        } catch {
+            Write-Log ('Bootstrap script threw: ' + $_) -Level WARN
+        } finally {
+            Remove-Item $bootstrap -Force -ErrorAction SilentlyContinue
+        }
+        Start-Sleep -Seconds 10
     }
-    Start-Sleep -Seconds 10
+
+    # v4: bootstrap failing for ANY reason (blocked download, block page, or
+    # the bootstrap's own embedded msiexec failing -- CSLT-168, 2026-08-28,
+    # exit 1603) used to be a dead end here. Fall back to a staged MSI
+    # instead of aborting.
     if (-not (Test-Path $Cli)) {
-        Write-Log 'Install did not produce nessuscli.exe. Aborting.' -Level ERROR
-        exit 1
+        if ($bootstrapOk) {
+            Write-Log 'Bootstrap ran but did not produce nessuscli.exe.' -Level WARN
+        }
+        Write-Log 'Falling back to a staged MSI install...' -Level WARN
+        $msi = $MsiPath
+        if ([string]::IsNullOrWhiteSpace($msi)) { $msi = Get-StagedNessusMsi }
+        if ([string]::IsNullOrWhiteSpace($msi) -or -not (Test-Path $msi)) {
+            Write-Log 'No staged NessusAgent-*.msi found in this Custom Script''s Dependency' -Level ERROR
+            Write-Log 'Files (extracted beside this script) or in C:\, and no -MsiPath given.' -Level ERROR
+            Write-Log 'Upload the MSI as a Dependency File on this EC configuration and re-run --' -Level ERROR
+            Write-Log 'no script argument needed, it is found automatically. Aborting.' -Level ERROR
+            exit 1
+        }
+        Write-Log ('  Installing staged MSI: ' + $msi)
+        $installLog = Join-Path $LogDir ('msi_install_nessusagent_' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '.log')
+        $code = Invoke-Msi ('/i "' + $msi + '" /qn /norestart /l*v "' + $installLog + '"')
+        Write-Log ('  msiexec exit code: ' + $code)
+        if ($code -eq 3010) {
+            Write-Log '  Install succeeded but reports a reboot is required.' -Level WARN
+            $script:RebootNeeded = $true
+        } elseif ($code -ne 0) {
+            Write-Log ('  MSI install failed. See ' + $installLog) -Level ERROR
+            if ($code -eq 1603) {
+                Write-Log '  1603 is a fatal/rollback error. Search the MSI log for "Error 0x" and' -Level ERROR
+                Write-Log '  "Rolling back". Common causes: a pending reboot, a locked file from a' -Level ERROR
+                Write-Log '  running Nessus process, or a damaged prior install -- try' -Level ERROR
+                Write-Log '  NessusAgent_CleanReinstall.ps1 instead, which tears down stale' -Level ERROR
+                Write-Log '  registrations before installing.' -Level ERROR
+            }
+            exit 1
+        }
+        Start-Sleep -Seconds 5
+        if (-not (Test-Path $Cli)) {
+            Write-Log 'Install did not produce nessuscli.exe via bootstrap OR staged MSI.' -Level ERROR
+            Write-Log 'Aborting.' -Level ERROR
+            exit 1
+        }
     }
     Write-Log 'Agent installed.'
 }
@@ -293,6 +455,7 @@ if (($finalStatus -match 'Linked to:\s*\S') -and ($finalStatus -notmatch 'Linked
         exit 2
     }
     Write-Log 'SUCCESS: agent linked and grouped.'
+    if ($RebootNeeded) { exit 3010 }
     exit 0
 }
 Write-Log 'Agent still not linked after repair attempt.' -Level ERROR
