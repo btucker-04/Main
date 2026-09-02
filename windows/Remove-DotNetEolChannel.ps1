@@ -12,6 +12,15 @@
     .NET 6.0.36 under C:\Program Files\dotnet\, SEoL 2024-11-12. Same host
     also has current 8.0.30 and 10.0.11 -- those are left alone.
 
+    CSMELT-19 (2026-09-02): plugin 172178 (ASP.NET Core SEoL, the sibling
+    plugin for the ASP.NET Core shared framework specifically) RESURFACED
+    on Microsoft.AspNetCore.App 7.0.20 under Program Files (x86)\dotnet --
+    .NET 7 EOL since 2024-05-13, over two years ago. $SharedFlavors already
+    covers Microsoft.AspNetCore.App, so -Major 7 removes it the same way as
+    any other channel; added -DotNet7 as an EC-safe bare-switch alias for
+    it, matching the existing -DotNet9 pattern (a valued -Major parameter
+    is not safe to pass through EC's argument field).
+
     WHY ENDPOINT CENTRAL SOFTWARE-INVENTORY UNINSTALL FAILS HERE:
       * Every .NET 6 ARP UninstallString on CSLT-043 is
         'MsiExec.exe /X{GUID}'. Under EC's SYSTEM context a bare msiexec.exe
@@ -29,10 +38,13 @@
 
     Default target is major 6 (the CSLT-043 SEoL channel). Override locally
     with -Major 9 etc.; do not pass a valued parameter through EC -- use the
-    default, or the -DotNet9 switch.
+    default, or the -DotNet7 / -DotNet9 switches.
 
 .PARAMETER Major
     Channel to remove. Default 6. Local/terminal use only.
+
+.PARAMETER DotNet7
+    Same as -Major 7; a bare switch so it survives EC's argument field.
 
 .PARAMETER DotNet9
     Same as -Major 9; a bare switch so it survives EC's argument field.
@@ -64,6 +76,7 @@
 [CmdletBinding()]
 param(
     [int]$Major = 6,
+    [switch]$DotNet7,
     [switch]$DotNet9,
     [switch]$Force,
     [switch]$RemoveStaleFolders,
@@ -71,6 +84,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+if ($DotNet7) { $Major = 7 }
 if ($DotNet9) { $Major = 9 }
 
 $LogDir  = 'C:\Logs\CompoSecure'
@@ -374,6 +388,7 @@ Write-Log (' Remove-DotNetEolChannel -- plugin 172179 -- .NET ' + $Major + '.x')
 Write-Log (' Host   : ' + $env:COMPUTERNAME)
 Write-Log ' Switches received:'
 Write-Log ('   -Major              : ' + $Major)
+Write-Log ('   -DotNet7            : ' + $DotNet7)
 Write-Log ('   -DotNet9            : ' + $DotNet9)
 Write-Log ('   -Force              : ' + $Force)
 Write-Log ('   -RemoveStaleFolders : ' + $RemoveStaleFolders)
