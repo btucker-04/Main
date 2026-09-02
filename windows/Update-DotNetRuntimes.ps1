@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Remediation: Microsoft .NET Core security updates (v3.4)
+    Remediation: Microsoft .NET Core security updates (v3.5)
     Nessus Plugin IDs : 302122, 307353 (+ 314679, 320854, 326863 -- same fix)
 
 .DESCRIPTION
@@ -13,6 +13,21 @@
          cleanup removed it (or anything else went sideways), reinstalls
          and re-verifies. Exits 1 if the machine does not end in a
          strictly better state than it started.
+
+    v3.5: -InstallSuccessorMajor. For each EOL major found installed, ALSO
+    installs the mapped successor major ($EolSuccessorMajor; currently only
+    9 -> 10) for every flavor/arch that has the EOL major -- PURELY
+    ADDITIVE, opt-in, never touches or removes the EOL major itself. This
+    does NOT clear the SEoL finding and does NOT retarget any app: .NET's
+    default roll-forward policy does not cross major versions, so an app
+    targeting net9.0 will fail outright ("Framework ... version 9.0.0 ...
+    not found") the moment .NET 9 is actually removed, unless that specific
+    app is recompiled against net10.0 or its runtimeconfig.json explicitly
+    sets "rollForward": "LatestMajor" -- neither of which this script can
+    see or decide on the app's behalf. What it buys is pre-staging the
+    runtime an app owner needs the moment they DO retarget, so migration
+    does not require a second EC deployment round. Removing the EOL channel
+    is still Remove-DotNetEolChannel.ps1, once nothing depends on it.
 
     v3.4 (from the CSLT-020 run, 2026-09-02): two fixes, one correcting a
     long-standing assumption this script had documented since v3.0.
@@ -313,7 +328,21 @@ param(
     # straight from ARP, so an orphaned entry left in place (even the
     # "newest" one in its group) keeps the finding open regardless of what
     # the real, current runtime looks like.
-    [switch]$RemoveOrphanedRegistrations
+    [switch]$RemoveOrphanedRegistrations,
+    # For every EOL major found installed, ALSO install the successor major
+    # (currently only 9 -> 10) for each flavor/arch that has the EOL major --
+    # PURELY ADDITIVE, never touches or removes the EOL major's files or ARP
+    # registrations. This does NOT retarget any app and does NOT clear the
+    # SEoL finding by itself: .NET's default roll-forward policy does not
+    # cross major versions, so an app targeting net9.0 still requires .NET 9
+    # to be present and keeps running on it until it is explicitly
+    # recompiled against net10.0 or its runtimeconfig.json sets
+    # "rollForward": "LatestMajor". What this buys is pre-staging the
+    # runtime the app owner needs the moment they retarget, so migration
+    # does not need a second EC deployment round. Removing the EOL channel
+    # once nothing depends on it is still Remove-DotNetEolChannel.ps1, a
+    # separate human decision.
+    [switch]$InstallSuccessorMajor
 )
 
 $ErrorActionPreference = 'Stop'
@@ -826,8 +855,15 @@ $EolDates        = @{ 8 = '2026-11-10'; 10 = '2028-11-14' }
 $EolWarnDays     = 180
 $EolSoonSeen     = @()
 
+# -InstallSuccessorMajor mapping: EOL major -> the next major to stage
+# alongside it. Microsoft alternates yearly LTS (even)/STS (odd) releases,
+# so an EOL'd STS major's natural migration target is the next LTS. Add an
+# entry here (not a "+1" formula) so a mapping is a deliberate, reviewed
+# decision rather than an assumption baked into the math.
+$EolSuccessorMajor = @{ 9 = 10 }
+
 Write-Log '=============================================='
-Write-Log ' .NET Runtime Update (v3.4) -- 302122/307353/314679/320854/326863/+.NETCore-family'
+Write-Log ' .NET Runtime Update (v3.5) -- 302122/307353/314679/320854/326863/+.NETCore-family'
 Write-Log (' Host   : ' + $env:COMPUTERNAME)
 # Echo EVERY switch, so a log proves which arguments actually arrived. Endpoint
 # Central has a history in this environment of altering argument strings, and a
@@ -838,6 +874,7 @@ Write-Log ('   -RemoveStaleFolders          : ' + $RemoveStaleFolders)
 Write-Log ('   -AbortOnPendingReboot        : ' + $AbortOnPendingReboot)
 Write-Log ('   -RemoveSupersededSdks        : ' + $RemoveSupersededSdks)
 Write-Log ('   -RemoveOrphanedRegistrations : ' + $RemoveOrphanedRegistrations)
+Write-Log ('   -InstallSuccessorMajor       : ' + $InstallSuccessorMajor)
 if ($MyInvocation.Line) {
     Write-Log (' Invoked as: ' + $MyInvocation.Line.Trim())
 }
@@ -1020,6 +1057,50 @@ foreach ($key in $before.Keys) {
     $majors = $before[$key] | ForEach-Object { $_.Major } | Sort-Object -Unique
     foreach ($major in $majors) {
         if (-not (Install-Runtime -Flavor $flavor -Major $major -Arch $arch)) { $Failed = $true }
+    }
+}
+
+# ------------------------------------------------------------------
+# Phase 1a: EOL successor major (opt-in, PURELY ADDITIVE)
+# ------------------------------------------------------------------
+# Installs the mapped successor major (see $EolSuccessorMajor) for every
+# flavor/arch that has an EOL major installed. Never touches, patches
+# differently, or removes the EOL major itself -- this only ever adds a
+# runtime that was not there before. It does NOT retarget any app: .NET's
+# default roll-forward policy does not cross major versions, so an app
+# targeting net9.0 keeps requiring .NET 9 until it is recompiled against
+# net10.0 or its runtimeconfig.json sets "rollForward": "LatestMajor". The
+# point is to pre-stage the runtime an app owner needs the moment they
+# retarget, so migration does not need a second EC deployment round.
+Write-Log ''
+Write-Log '=== Phase 1a: EOL successor major (opt-in, additive only) ==='
+if ($EolSeen.Count -eq 0) {
+    Write-Log '  No EOL majors present -- nothing to do.'
+} elseif (-not $InstallSuccessorMajor) {
+    Write-Log ('  EOL major(s) present (.NET ' + (($EolSeen | Sort-Object) -join ', .NET ') + ') -- not') -Level WARN
+    Write-Log '  installing a successor (pass -InstallSuccessorMajor). This only adds a' -Level WARN
+    Write-Log '  runtime side by side; it never removes or retargets anything on its own.' -Level WARN
+} else {
+    foreach ($eolMajor in ($EolSeen | Sort-Object)) {
+        if (-not $EolSuccessorMajor.ContainsKey([int]$eolMajor)) {
+            Write-Log ('  .NET ' + $eolMajor + ' has no configured successor in $EolSuccessorMajor -- skipping.') -Level WARN
+            continue
+        }
+        $successor = $EolSuccessorMajor[[int]$eolMajor]
+        Write-Log ('  .NET ' + $eolMajor + ' -> staging .NET ' + $successor + ' alongside it (NOT removing .NET ' + $eolMajor + '):')
+        foreach ($key in $before.Keys) {
+            $arch        = ($key -split '\|')[0]
+            $flavor      = ($key -split '\|')[1]
+            $hasEolMajor = [bool]($before[$key] | Where-Object { $_.Major -eq $eolMajor })
+            if (-not $hasEolMajor) { continue }
+            if (-not (Install-Runtime -Flavor $flavor -Major $successor -Arch $arch)) { $Failed = $true }
+        }
+        Write-Log ('  .NET ' + $successor + ' is now present alongside .NET ' + $eolMajor + '. Apps still') -Level WARN
+        Write-Log ('  targeting net' + $eolMajor + '.0 are UNAFFECTED and keep running on .NET ' + $eolMajor + ' --') -Level WARN
+        Write-Log '  retargeting (recompile against the new TFM, or set "rollForward":' -Level WARN
+        Write-Log '  "LatestMajor" in the app runtimeconfig.json) is a decision for the app' -Level WARN
+        Write-Log '  owner, not something this script does. Once nothing depends on the old' -Level WARN
+        Write-Log ('  major, remove it with Remove-DotNetEolChannel.ps1 to clear the SEoL finding.') -Level WARN
     }
 }
 

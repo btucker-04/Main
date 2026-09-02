@@ -82,7 +82,8 @@ Patches every installed .NET runtime channel to its latest build and prunes supe
 | `-RemoveStaleFolders` | switch | off | Delete superseded version folders that survive uninstall with no Installer dependency references (guarded by an in-use test). |
 | `-AbortOnPendingReboot` | switch | off | Exit 3010 immediately when a reboot is pending, instead of running installs that may roll back. |
 | `-RemoveSupersededSdks` | switch | off | Remove superseded .NET SDKs within a major (keeps the newest). Guarded by a `global.json` pin scan. Build-environment change. |
-| `-RemoveOrphanedRegistrations` | switch | off | Uninstall ARP registrations with no runtime payload backing them — a whole major with zero payload anywhere (inventory hygiene), or a specific flavor/arch/major with zero payload even though that major exists elsewhere on the host (this second case clears a real version finding; Tenable plugin 326863 reads the ARP `DisplayVersion` directly). |
+| `-RemoveOrphanedRegistrations` | switch | off | Uninstall ARP registrations with no runtime payload backing them — a whole major with zero payload anywhere, or a specific flavor/arch/major with zero payload even though that major exists elsewhere on the host. Both cases can clear a real version finding, not just tidy inventory: plugin 326863 and the "Security Update for Microsoft .NET Core" plugin family both read the ARP `DisplayVersion` directly. |
+| `-InstallSuccessorMajor` | switch | off | For each EOL major found installed, also install the mapped successor major (`$EolSuccessorMajor`; currently only 9 → 10) alongside it — purely additive, never removes or retargets anything. Does not clear the SEoL finding by itself; apps must still be recompiled or opt into `"rollForward": "LatestMajor"` before they use the new major. |
 
 ## Update-NodeJS.ps1
 Updates the Program Files Node.js MSI install, staying on its major line.
