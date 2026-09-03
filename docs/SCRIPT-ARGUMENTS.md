@@ -340,6 +340,14 @@ Diagnoses and applies bounded remediation (`launchctl kickstart -k` on an alread
 | `CHECKIN_STALE_MINUTES` | `CFG_CHECKIN_STALE_MINUTES="60"` | Minutes of log inactivity after which check-in is treated as STALE. |
 | `DRY_RUN` | `CFG_DRY_RUN="0"` | Set `1` to report only; kickstart nothing. |
 
+## update-office-macos.sh
+Updates App Store-installed Microsoft Office (Word/Excel/PowerPoint/Outlook/OneNote) via `mas`, quitting and updating only apps the App Store itself currently reports as outdated — no hardcoded target version. Takes **command-line flags** (Mosyle-compatible; no environment variables or `CONFIG` block).
+
+| Flag | Description |
+|------|-------------|
+| `--dry-run` | Report which apps `mas outdated` currently flags; change nothing beyond ensuring `mas` itself is installed (a detection dependency, not an Office change). |
+| `--accurate` | Pass `--accurate` through to `mas outdated`/`mas upgrade` for a slower, more precise check (may prompt for App Store sign-in). |
+
 ## macos/superseded/*
 Retained for reference/rollback; prefer the replacements noted in each header (the Ruby-gem scripts are superseded by `remediate-ruby-gem.sh`; `update-photoshop.sh` by `update-adobe-rum.sh`).
 
