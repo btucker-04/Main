@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Remediation: Microsoft .NET Core security updates (v3.5)
+    Remediation: Microsoft .NET Core security updates (v3.6)
     Nessus Plugin IDs : 302122, 307353 (+ 314679, 320854, 326863 -- same fix)
 
 .DESCRIPTION
@@ -13,6 +13,31 @@
          cleanup removed it (or anything else went sideways), reinstalls
          and re-verifies. Exits 1 if the machine does not end in a
          strictly better state than it started.
+
+    v3.6 (from the CSLT-020 run, 2026-09-02): v3.5's -InstallSuccessorMajor
+    was SELF-DEFEATING and destructive. Phase 1a installed .NET 10, and
+    Phase 2 then removed it again in the same run -- including hard-stripping
+    the registry keys via the v3.4 fallback when the MSI uninstall no-op'd.
+    Net effect: ~6 minutes of downloads, then the host ended exactly where it
+    started, and Phase 3 still reported "All present flavors advanced".
+      * ROOT CAUSE. Phase 2's ORPHANED GROUP check asks "does this
+        (flavor, arch, major) have any payload on disk" -- but it read
+        $before, the Phase-0 snapshot, while reading ARP entries FRESH.
+        A brand-new major is by definition absent from $before, so .NET 10's
+        just-written registrations looked like ARP entries backed by nothing.
+        That comparison was only ever safe because every phase before v3.5
+        installed newer PATCHES of majors already present at Phase 0;
+        -InstallSuccessorMajor broke that invariant deliberately. Phase 2 now
+        re-inventories the disk ($diskNow) at its own start and compares
+        against that, so fresh ARP is matched against fresh disk.
+      * WHY NOTHING CAUGHT IT. Phase 3 builds its checklist from $before too,
+        so the successor major was never verified at all -- the run destroyed
+        .NET 10 and still exited 0. Phase 3 now separately verifies every
+        (flavor/arch, major) that Phase 1a reports having installed, and
+        fails the run if one is missing from disk at the end.
+      * Phase 1d is NOT affected: its orphan list is computed at Phase 0 from
+        ARP entries that existed then, so it cannot flag a major whose
+        registrations were written later in the run.
 
     v3.5: -InstallSuccessorMajor. For each EOL major found installed, ALSO
     installs the mapped successor major ($EolSuccessorMajor; currently only
@@ -840,6 +865,9 @@ function Invoke-ArpEntryRemoval {
 $Reboot = $false
 $Failed = $false
 $UninstallNoOp = $false
+# (arch|flavor, major) pairs successfully installed by Phase 1a, so Phase 3
+# can verify they are still on disk at the end of the run (v3.6).
+$SuccessorInstalled = @()
 
 # EOL status by major, as of July 2026. Update when channels change:
 #   8  = LTS, supported until Nov 2026
@@ -863,7 +891,7 @@ $EolSoonSeen     = @()
 $EolSuccessorMajor = @{ 9 = 10 }
 
 Write-Log '=============================================='
-Write-Log ' .NET Runtime Update (v3.5) -- 302122/307353/314679/320854/326863/+.NETCore-family'
+Write-Log ' .NET Runtime Update (v3.6) -- 302122/307353/314679/320854/326863/+.NETCore-family'
 Write-Log (' Host   : ' + $env:COMPUTERNAME)
 # Echo EVERY switch, so a log proves which arguments actually arrived. Endpoint
 # Central has a history in this environment of altering argument strings, and a
@@ -1093,7 +1121,16 @@ if ($EolSeen.Count -eq 0) {
             $flavor      = ($key -split '\|')[1]
             $hasEolMajor = [bool]($before[$key] | Where-Object { $_.Major -eq $eolMajor })
             if (-not $hasEolMajor) { continue }
-            if (-not (Install-Runtime -Flavor $flavor -Major $successor -Arch $arch)) { $Failed = $true }
+            if (Install-Runtime -Flavor $flavor -Major $successor -Arch $arch) {
+                # v3.6: recorded so Phase 3 can prove it SURVIVED the run.
+                # Phase 3's own checklist is built from $before, which can
+                # never contain a major Phase 1a just added, so without this
+                # a successor major that gets removed later in the same run
+                # passes verification silently (CSLT-020).
+                $SuccessorInstalled += @{ Key = $key; Major = $successor }
+            } else {
+                $Failed = $true
+            }
         }
         Write-Log ('  .NET ' + $successor + ' is now present alongside .NET ' + $eolMajor + '. Apps still') -Level WARN
         Write-Log ('  targeting net' + $eolMajor + '.0 are UNAFFECTED and keep running on .NET ' + $eolMajor + ' --') -Level WARN
@@ -1299,6 +1336,13 @@ if ($OrphanMajors.Count -eq 0) {
 Write-Log ''
 Write-Log '=== Phase 2: removing superseded versions (by DisplayName version) ==='
 
+# v3.6: re-inventory the disk HERE. Phase 2 reads ARP fresh (below), so it has
+# to compare against an equally fresh view of what is on disk -- anything
+# installed by Phase 1/1a is invisible to the Phase-0 $before map, and an ARP
+# entry whose payload "does not exist" only because the snapshot predates its
+# install is not an orphan. See the ORPHANED GROUP check below (CSLT-020).
+$diskNow = Get-InstalledMap $roots
+
 $dotnetArp = Get-ItemProperty -Path $arpPaths -ErrorAction SilentlyContinue | Where-Object {
     $_.DisplayName -match '^Microsoft (\.NET|ASP\.NET Core|Windows Desktop) Runtime'
 }
@@ -1332,11 +1376,23 @@ foreach ($key in $groups.Keys) {
     # simply for being the highest DisplayName version REGISTERED, with
     # nothing on disk backing any of them -- Tenable reads DisplayVersion
     # from ARP directly, so "keep the max ARP entry" cleared nothing.
+    # v3.6: this check asks "is there payload on disk", so it must read the
+    # disk as it is NOW ($diskNow, re-inventoried at the top of Phase 2), not
+    # the Phase-0 snapshot ($before). CSLT-020 (2026-09-02) is what this cost:
+    # Phase 1a installed .NET 10, and Phase 2 -- comparing freshly-read ARP
+    # entries against a disk map captured BEFORE that install -- found no
+    # major-10 payload in $before, declared the brand-new registrations an
+    # ORPHANED GROUP, and removed them (hard-stripping the registry keys via
+    # the v3.4 fallback when the MSI uninstall no-op'd). The run installed
+    # .NET 10 and destroyed it ~3 minutes later, ending exactly where it
+    # started. The $before comparison was only ever safe because every
+    # earlier phase installed newer PATCHES of majors already in $before;
+    # -InstallSuccessorMajor (v3.5) broke that invariant by design.
     $flavorKey = Get-FlavorKeyForArpPrefix -Prefix $prefix
-    $beforeKey = $groupArch + '|' + $flavorKey
+    $diskKey   = $groupArch + '|' + $flavorKey
     $hasPayloadForMajor = $false
-    if ($flavorKey -and $before.ContainsKey($beforeKey)) {
-        $hasPayloadForMajor = [bool]($before[$beforeKey] | Where-Object { $_.Major -eq $groupMajor })
+    if ($flavorKey -and $diskNow.ContainsKey($diskKey)) {
+        $hasPayloadForMajor = [bool]($diskNow[$diskKey] | Where-Object { $_.Major -eq $groupMajor })
     }
 
     if (-not $hasPayloadForMajor) {
@@ -1392,6 +1448,26 @@ if (-not $DryRun) {
     foreach ($key in $before.Keys) {
         foreach ($m in ($before[$key] | ForEach-Object { $_.Major } | Sort-Object -Unique)) {
             $checkList += @{ Key = $key; Major = $m }
+        }
+    }
+
+    # v3.6: verify Phase 1a's successor-major installs SURVIVED this run. The
+    # checklist above is built from $before, so a major that Phase 1a added
+    # can never appear in it -- which is exactly how CSLT-020 (2026-09-02)
+    # reported "All present flavors advanced" in the same run that installed
+    # .NET 10 and then deleted it again in Phase 2. Checked separately
+    # because the criterion differs: for these there is no "starting max" to
+    # regress against, the requirement is simply that the major is present.
+    foreach ($si in $SuccessorInstalled) {
+        $sLabel = $si.Key + ' [' + $si.Major + '.x successor]'
+        $sNow   = @($after[$si.Key] | Where-Object { $_.Major -eq $si.Major })
+        if ($sNow.Count -gt 0) {
+            Write-Log ('  OK      ' + $sLabel + ' : staged at ' + (($sNow | Sort-Object -Descending)[0]) + '.')
+        } else {
+            Write-Log ('  FAILED  ' + $sLabel + ' : installed by Phase 1a but NOT on disk now --') -Level ERROR
+            Write-Log '          something removed it later in this same run. Check the Phase 2 log' -Level ERROR
+            Write-Log '          above for an ORPHANED GROUP entry naming this major.' -Level ERROR
+            $Failed = $true
         }
     }
     foreach ($item in $checkList) {
