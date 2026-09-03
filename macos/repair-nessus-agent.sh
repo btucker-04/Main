@@ -24,8 +24,20 @@
 # scan policy, no plugins, no results -- Tenable would keep reporting the old
 # state forever -- so that condition exits 2 rather than claiming success.
 #
+# v2 (from the CSPRMB-28 run, 2026-09-03): the link was rejected with an HTTP
+# 409 -- "another agent in container ... with different token already exists" --
+# and v1 fell straight through to the generic "still not linked" error and
+# exit 1. That is honest but not actionable: 409 is a duplicate host-identity
+# conflict on the controller, so re-running is guaranteed to fail identically
+# (that host had been dead 110 days, since 2026-05-16, by every timestamp in
+# its own status output -- last successful connection, last connect, last
+# scanned, and the 202605160907 plugin set all agree). Step 5b now names the
+# cause, states plainly that re-running will not help, and can reset this
+# host's Tenable identity under RESET_TENABLE_TAG=1.
+#
 # Exit: 0 = healthy (already, or repaired and grouped)
-#       2 = linked but no group, or link succeeded without a confirmed connection
+#       2 = linked but no group, link succeeded without a confirmed connection,
+#           or a 409 duplicate identity needing a human decision
 #       1 = agent missing / daemon dead / link failed
 # =============================================================================
 
@@ -37,8 +49,15 @@ LINK_KEY="${LINK_KEY:-4f858e2b28a33a5927c7805eab8b8533ecb35c983417b392c5b570b5a6
 LINK_HOST="${LINK_HOST:-sensor.cloud.tenable.com}"
 LINK_GROUPS_OVERRIDE="${LINK_GROUPS:-}"
 FORCE_RELINK="${FORCE_RELINK:-0}"
+# Opt-in: on a 409 duplicate-identity rejection, delete this host's Tenable tag
+# so the agent regenerates one and links as a NEW agent. Off by default -- it
+# leaves a stale record in the console holding a license seat (see step 5b).
+RESET_TENABLE_TAG="${RESET_TENABLE_TAG:-0}"
 
 CLI="/Library/NessusAgent/run/sbin/nessuscli"
+# Tenable's host-identity file on macOS. /etc is a symlink to /private/etc, so
+# this is the same file the Tenable docs refer to as /etc/tenable_tag.
+TENABLE_TAG="/private/etc/tenable_tag"
 LOG_DIR="/var/log/composecure"
 LOG_FILE="$LOG_DIR/nessus_agent_repair.log"
 mkdir -p "$LOG_DIR"
@@ -84,10 +103,11 @@ log "nessuscli: $CLI"
 # -----------------------------------------------------------------------
 # 2. Daemon running? (discover the label rather than hardcoding it)
 # -----------------------------------------------------------------------
+# Resolved unconditionally: both the bootstrap-if-not-loaded path below and the
+# 409 tag-reset path (step 5b) need it to start the daemon back up.
+PLIST=$(find /Library/LaunchDaemons -maxdepth 1 -iname '*nessus*.plist' 2>/dev/null | head -1 || true)
 DAEMON_LABEL=$(launchctl list 2>/dev/null | awk '{print $3}' | grep -i nessus | head -1 || true)
 if [ -z "$DAEMON_LABEL" ]; then
-    # not loaded -- look for the plist so we can bootstrap it
-    PLIST=$(find /Library/LaunchDaemons -maxdepth 1 -iname '*nessus*.plist' 2>/dev/null | head -1 || true)
     if [ -n "$PLIST" ]; then
         LABEL_FROM_PLIST=$(/usr/libexec/PlistBuddy -c "Print :Label" "$PLIST" 2>/dev/null || true)
         log "Agent daemon not loaded. Bootstrapping ${LABEL_FROM_PLIST:-$PLIST}..."
@@ -181,12 +201,16 @@ if ! echo "$STATUS" | grep -q "Linked to: *None"; then
     done
 fi
 
+do_link() {
+    if [ -n "$GROUPS_CSV" ]; then
+        "$CLI" agent link --key="$LINK_KEY" --host="$LINK_HOST" --port=443 --groups="$GROUPS_CSV" 2>&1 || true
+    else
+        "$CLI" agent link --key="$LINK_KEY" --host="$LINK_HOST" --port=443 2>&1 || true
+    fi
+}
+
 log "Linking to $LINK_HOST..."
-if [ -n "$GROUPS_CSV" ]; then
-    LINK_OUT=$("$CLI" agent link --key="$LINK_KEY" --host="$LINK_HOST" --port=443 --groups="$GROUPS_CSV" 2>&1 || true)
-else
-    LINK_OUT=$("$CLI" agent link --key="$LINK_KEY" --host="$LINK_HOST" --port=443 2>&1 || true)
-fi
+LINK_OUT=$(do_link)
 echo "$LINK_OUT" | while IFS= read -r line; do
     [ -n "$line" ] && log "  $line"
 done
@@ -196,6 +220,98 @@ if echo "$LINK_OUT" | grep -qi "empty response"; then
     log "       Check Zscaler SSL inspection of $LINK_HOST. Note other Macs on this"
     log "       network do connect, so suspect this host before the network."
     exit 1
+fi
+
+# -----------------------------------------------------------------------
+# 5b. HTTP 409 -- duplicate host identity (CSPRMB-28, 2026-09-03)
+# -----------------------------------------------------------------------
+# "[409] Agent with uuid agentUuid=... attempt to link, but another agent in
+# container containerUuid=... with different token already exists."
+#
+# This is NOT transient and NOT a network problem -- re-running the script as-is
+# will fail identically forever. Tenable identifies the host by the value in
+# /private/etc/tenable_tag; the controller already holds a record for that
+# identity bound to a DIFFERENT token, so this agent cannot prove ownership of
+# it. Per Tenable's macOS install docs, that happens when a machine is cloned or
+# re-imaged, or when the agent is reinstalled/restored without unlinking first:
+# the tag survives, the token does not.
+#
+# The remedy is to give this host a fresh identity (delete the tag so the agent
+# regenerates one) and link again. That is gated behind RESET_TENABLE_TAG=1
+# because it has a console-side consequence this script cannot clean up: the
+# host links as a NEW agent and the stale record stays in Tenable, holding a
+# license seat until a human deletes it (Sensors > Agents).
+if echo "$LINK_OUT" | grep -qE '\[409\]' || echo "$LINK_OUT" | grep -qi 'with different token already exists'; then
+    log ""
+    log "LINK REJECTED 409 -- duplicate host identity, not a transient failure."
+    log "       Tenable already has an agent registered for this host's identity"
+    log "       (/private/etc/tenable_tag) under a different token, so this agent"
+    log "       cannot claim it. Usual cause: the Mac was cloned/re-imaged, or the"
+    log "       agent was reinstalled or restored without unlinking first."
+    if [ -f "$TENABLE_TAG" ]; then
+        log "       Current tag: $(head -1 "$TENABLE_TAG" 2>/dev/null || echo '<unreadable>')"
+    else
+        log "       Note: $TENABLE_TAG does not exist, so the collision is on the"
+        log "       agent UUID instead -- 'nessuscli prepare-image' resets both."
+    fi
+
+    if [ "$RESET_TENABLE_TAG" != "1" ]; then
+        log ""
+        log "       Re-running WILL NOT help. Pick one:"
+        log "         a) Delete the stale agent record in Tenable (Sensors > Agents),"
+        log "            then re-run this script; or"
+        log "         b) re-run with RESET_TENABLE_TAG=1 to give this host a new"
+        log "            identity here and link as a new agent -- then delete the"
+        log "            stale record in Tenable, or it keeps a license seat."
+        log "       Exiting 2: a human has to choose."
+        log "=== END (409 duplicate identity) ==="
+        exit 2
+    fi
+
+    log ""
+    log "RESET_TENABLE_TAG=1 -- resetting this host's Tenable identity and retrying."
+    log "  Stopping $DAEMON_LABEL first; a running agent can rewrite the tag."
+    launchctl bootout "system/$DAEMON_LABEL" 2>/dev/null || launchctl unload -w "$PLIST" 2>/dev/null || true
+    sleep 3
+    if pgrep -x nessusd >/dev/null 2>&1; then
+        log "  nessusd still running -- terminating it."
+        pkill -x nessusd 2>/dev/null || true
+        sleep 2
+    fi
+
+    if [ -f "$TENABLE_TAG" ]; then
+        log "  Removing $TENABLE_TAG"
+        rm -f "$TENABLE_TAG"
+    fi
+
+    if [ -n "$PLIST" ]; then
+        log "  Starting the daemon again..."
+        launchctl bootstrap system "$PLIST" 2>/dev/null || launchctl load -w "$PLIST" 2>/dev/null || true
+    else
+        log "  WARNING: no LaunchDaemon plist found to start the agent back up."
+    fi
+    sleep 8
+    if pgrep -x nessusd >/dev/null 2>&1; then
+        log "  nessusd: running"
+    else
+        log "ERROR: nessusd did not come back after the tag reset. The host now has"
+        log "       no running agent -- investigate before re-running."
+        exit 1
+    fi
+
+    log "  Retrying link with the new identity..."
+    LINK_OUT=$(do_link)
+    echo "$LINK_OUT" | while IFS= read -r line; do
+        [ -n "$line" ] && log "  $line"
+    done
+    if echo "$LINK_OUT" | grep -qE '\[409\]' || echo "$LINK_OUT" | grep -qi 'with different token already exists'; then
+        log "ERROR: still 409 after resetting the tag. The duplicate is held on the"
+        log "       controller side -- delete the stale agent record in Tenable"
+        log "       (Sensors > Agents) and re-run."
+        exit 1
+    fi
+    log "  REMINDER: this host is now a NEW agent record. Delete the OLD one in"
+    log "  Tenable (Sensors > Agents) or it keeps consuming a license seat."
 fi
 
 # -----------------------------------------------------------------------

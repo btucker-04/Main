@@ -260,6 +260,7 @@ Checks agent state and fixes only what is broken. Reads **environment variables*
 | `LINK_HOST` | `sensor.cloud.tenable.com` | Tenable manager host. |
 | `LINK_GROUPS` | `''` | Override group resolution with an explicit group set. If empty, resolved from the prefix map. |
 | `FORCE_RELINK` | `0` | Set `1` to unlink and relink even if the agent reports healthy. |
+| `RESET_TENABLE_TAG` | `0` | Set `1` to recover from an HTTP 409 duplicate-identity link rejection by deleting `/private/etc/tenable_tag` (agent regenerates one) and retrying the link. Off by default: the host then links as a **new** agent and the stale record stays in Tenable holding a license seat until a human deletes it (Sensors > Agents). Without this, a 409 exits 2 with the diagnosis. |
 
 ## update-adobe-rum.sh
 Generic Adobe updater via Remote Update Manager. Reads **environment variables**.
