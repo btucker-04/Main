@@ -20,6 +20,7 @@ macos/superseded/     retained for reference/rollback; prefer the replacement no
 - Script arguments are bare switches (e.g. `-RemoveOrphanedRegistrations`), which pass through EC's argument field without alteration.
 - **Success exit codes should be configured as `0,3010`** in EC's "Specify exit code(s)" field. `3010` means the operation succeeded and a reboot is required — it is not a failure. Exit `2` is deliberately excluded from success in most scripts here; it means a human needs to make a decision (an SDK or hosting bundle pinning a framework, a host needing a reboot before proceeding, an agent linked with no scan group, etc.), and having those surface as "failed" in EC is the correct, intentional signal.
 - Logs write to `C:\Logs\CompoSecure\`.
+- Installer payloads (`NessusAgent-*.msi`, etc.) belong in that Custom Script's **Dependency Files**, not copied onto each host and not passed as `-MsiPath` (quoted paths get mangled). EC extracts Dependency Files into the same folder the script runs from (`$PSScriptRoot`).
 - Native executables (`msiexec.exe`, etc.) are invoked by full path with `-NoNewWindow` rather than as a bare filename — `Start-Process -FilePath 'msiexec.exe'` resolves through ShellExecute and fails under EC's SYSTEM context with "No application is associated with the specified file."
 
 **macOS (Mosyle)**

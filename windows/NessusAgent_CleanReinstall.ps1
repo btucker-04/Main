@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Clean teardown + reinstall of a broken Nessus Agent install (v4.1).
+    Clean teardown + reinstall of a broken Nessus Agent install (v4.2).
     Handles every broken state catalogued so far: dual product codes,
     orphaned Installer-DB registrations (1612), orphaned processes
     holding DB locks, and stale ARP entries.
@@ -44,11 +44,19 @@
       * A final install failure states explicitly that the agent is ABSENT, so
         the host's state is never ambiguous.
 
+    v4.2: MSI auto-discovery uses $PSScriptRoot (where Endpoint Central
+    extracts this Custom Script configuration's Dependency Files) instead
+    of $MyInvocation.MyCommand.Path. Stage NessusAgent-*.msi as a Dependency
+    File -- do not copy it onto each host, and do not pass -MsiPath through
+    EC (quoted paths get mangled). C:\ remains a manual-staging fallback.
+
 .PARAMETER MsiPath
-    Path to the Nessus Agent MSI. If omitted, the script searches (in order)
-    the script's own directory then C:\ for NessusAgent-*.msi, preferring the
-    file whose architecture matches this machine (arm64 / x64 / win32) and
-    then the highest version by filename.
+    Path to the Nessus Agent MSI. If omitted (the normal EC deployment
+    case), the script searches $PSScriptRoot then C:\ for
+    NessusAgent-*.msi, preferring a filename matching this host's
+    architecture (arm64 / x64 / win32) and then the highest version by
+    filename. Do not pass a quoted path as an EC script argument; upload
+    the MSI as a Dependency File and leave this empty.
 
     v3.2: the C:\ fallback used to be a HARDCODED filename
     (C:\NessusAgent-11.2.0-x64.msi), so a staged MSI of any other version or
@@ -71,7 +79,9 @@
 
 .NOTES
     Deploy via Endpoint Central (SYSTEM). EC-safe concatenated strings.
-    Exit codes: 0 = success / 3010 = success, reboot recommended / 1 = failure
+    Upload NessusAgent-*.msi as a Dependency File on this Custom Script.
+    Configure EC "Specify exit code(s)" as 0,3010 (3010 is success + reboot).
+    Exit codes: 0 = success / 3010 = success, reboot recommended / 1 = failure / 2 = human attention
     Zscaler note: if relink fails with 'empty response from controller',
     check SSL inspection on sensor.cloud.tenable.com.
 #>
@@ -215,6 +225,48 @@ function Get-OtherInstallerProcesses {
     return $out
 }
 
+function Get-StagedNessusMsi {
+    # $PSScriptRoot -- not $MyInvocation.MyCommand.Path, which inside a
+    # function refers to the function's own invocation, not the script's --
+    # is where Endpoint Central extracts this Custom Script configuration's
+    # Dependency Files before running the script. Same search + architecture
+    # matching as Repair-NessusAgent.ps1.
+    $osArch = $env:PROCESSOR_ARCHITEW6432
+    if ([string]::IsNullOrWhiteSpace($osArch)) { $osArch = $env:PROCESSOR_ARCHITECTURE }
+    $archToken = switch ($osArch) {
+        'ARM64'  { 'arm64' }
+        'AMD64'  { 'x64' }
+        'x86'    { 'win32' }
+        default  { '' }
+    }
+    Write-Log ('  OS architecture : ' + $osArch + '  (expecting MSI token: ' + $archToken + ')')
+
+    $searchDirs = @()
+    if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) { $searchDirs += $PSScriptRoot }
+    $searchDirs += 'C:\'
+    Write-Log ('  Searching for NessusAgent-*.msi in: ' + ($searchDirs -join ', '))
+
+    $candidates = @()
+    foreach ($dir in $searchDirs) {
+        foreach ($f in (Get-ChildItem -Path $dir -Filter 'NessusAgent-*.msi' -File -ErrorAction SilentlyContinue)) {
+            $candidates += $f
+            Write-Log ('  Found staged MSI : ' + $f.FullName + '  (' + [math]::Round($f.Length/1MB,1) + ' MB)')
+        }
+    }
+    if ($candidates.Count -eq 0) { return $null }
+
+    $archMatch = @($candidates | Where-Object { $archToken -and ($_.Name -like ('*' + $archToken + '*')) })
+    if ($archMatch.Count -gt 0) {
+        $pick = ($archMatch | Sort-Object Name -Descending | Select-Object -First 1)
+        Write-Log ('  Architecture match: ' + $pick.Name)
+        return $pick.FullName
+    }
+    $pick = ($candidates | Sort-Object Name -Descending | Select-Object -First 1)
+    Write-Log ('  WARNING: no staged MSI matches architecture ' + $archToken + '.') -Level WARN
+    Write-Log ('  Falling back to ' + $pick.Name + ' -- verify this is correct for this host.') -Level WARN
+    return $pick.FullName
+}
+
 function Invoke-Msi {
     # Full path + -NoNewWindow: a bare filename goes through ShellExecute and
     # fails under EC's SYSTEM context. 1618/1601 are transient contention
@@ -260,7 +312,7 @@ $RebootNeeded = $false
 $NoGroup      = $false
 
 Write-Log '=============================================='
-Write-Log ' Nessus Agent Clean Reinstall (v4.1)'
+Write-Log ' Nessus Agent Clean Reinstall (v4.2)'
 Write-Log (' Host   : ' + $env:COMPUTERNAME)
 Write-Log (' DryRun : ' + $DryRun)
 Write-Log (' Relink : ' + ((-not $NoLink) -and ($LinkKey -ne '')))
@@ -272,47 +324,12 @@ Write-Log '=============================================='
 Write-Log ''
 Write-Log '[0/6] Resolving target MSI...'
 if ([string]::IsNullOrWhiteSpace($MsiPath)) {
-    # OS architecture (PROCESSOR_ARCHITEW6432 is set when PS itself is emulated)
-    $osArch = $env:PROCESSOR_ARCHITEW6432
-    if ([string]::IsNullOrWhiteSpace($osArch)) { $osArch = $env:PROCESSOR_ARCHITECTURE }
-    switch ($osArch) {
-        'ARM64' { $archToken = 'arm64' }
-        'AMD64' { $archToken = 'x64' }
-        'x86'   { $archToken = 'win32' }
-        default { $archToken = '' }
-    }
-    Write-Log ('  OS architecture : ' + $osArch + '  (expecting MSI token: ' + $archToken + ')')
-
-    $searchDirs = @()
-    $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-    if (-not [string]::IsNullOrWhiteSpace($scriptDir)) { $searchDirs += $scriptDir }
-    $searchDirs += 'C:\'
-
-    $candidates = @()
-    foreach ($dir in $searchDirs) {
-        $found = Get-ChildItem -Path $dir -Filter 'NessusAgent-*.msi' -File -ErrorAction SilentlyContinue
-        foreach ($f in $found) {
-            $candidates += $f
-            Write-Log ('  Found staged MSI : ' + $f.FullName + '  (' + [math]::Round($f.Length/1MB,1) + ' MB)')
-        }
-    }
-
-    if ($candidates.Count -gt 0) {
-        $archMatch = @($candidates | Where-Object { $archToken -and ($_.Name -like ('*' + $archToken + '*')) })
-        if ($archMatch.Count -gt 0) {
-            $pick = ($archMatch | Sort-Object Name -Descending | Select-Object -First 1)
-            Write-Log ('  Architecture match: ' + $pick.Name)
-        } else {
-            $pick = ($candidates | Sort-Object Name -Descending | Select-Object -First 1)
-            Write-Log ('  WARNING: no MSI matching architecture ' + $archToken + '.') -Level WARN
-            Write-Log ('  Falling back to ' + $pick.Name + ' -- verify this is correct for this host.') -Level WARN
-        }
-        $MsiPath = $pick.FullName
-    }
+    $MsiPath = Get-StagedNessusMsi
 }
 if ([string]::IsNullOrWhiteSpace($MsiPath) -or -not (Test-Path $MsiPath)) {
-    Write-Log '  MSI not found. Stage NessusAgent-*.msi beside this script or in C:\,' -Level ERROR
-    Write-Log '  or pass -MsiPath explicitly. Searched the script directory and C:\.' -Level ERROR
+    Write-Log '  MSI not found. Upload NessusAgent-*.msi as this Custom Script''s Dependency File' -Level ERROR
+    Write-Log '  (EC extracts it into $PSScriptRoot), stage it in C:\, or pass -MsiPath locally.' -Level ERROR
+    Write-Log '  Do not put a quoted MSI path in EC Script Arguments -- those get mangled.' -Level ERROR
     exit 1
 }
 Write-Log ('  Target MSI : ' + $MsiPath)
