@@ -114,7 +114,7 @@ Full teardown + reinstall of a broken Nessus Agent, with optional relink.
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
-| `-MsiPath` | string | `''` | Path to the Nessus Agent MSI. If empty, searches the script directory then `C:\` for `NessusAgent-*.msi`, preferring the architecture-matching, highest-versioned file. |
+| `-MsiPath` | string | `''` | Path to the Nessus Agent MSI. Leave empty in Endpoint Central: upload `NessusAgent-*.msi` as a Dependency File (EC extracts it into `$PSScriptRoot`). If empty, searches `$PSScriptRoot` then `C:\`, preferring the architecture-matching, highest-versioned file. Do not pass a quoted path as an EC argument. |
 | `-LinkKey` | string | embedded CompoSecure key | Tenable linking key used to relink after install. |
 | `-LinkGroups` | string | `''` | Agent group(s) for relink. If empty, groups are resolved per-host from the embedded prefix-rule/override map. |
 | `-LinkHost` | string | `sensor.cloud.tenable.com` | Tenable manager host. |

@@ -61,10 +61,10 @@
         Dependency File instead: EC extracts Dependency Files into the SAME
         folder the script itself runs from, which PowerShell exposes as
         $PSScriptRoot, so no path needs to be configured by hand.
-      * Get-StagedNessusMsi (same search + arch-matching logic already
-        proven in NessusAgent_CleanReinstall.ps1) checks $PSScriptRoot
-        first, then C:\ as a manual-staging fallback, and prefers a
-        filename matching this host's architecture (x64/win32/arm64).
+      * Get-StagedNessusMsi checks $PSScriptRoot first (same as
+        NessusAgent_CleanReinstall.ps1 v4.2), then C:\ as a
+        manual-staging fallback, and prefers a filename matching this
+        host's architecture (x64/win32/arm64).
       * Invoke-Msi (ported from NessusAgent_CleanReinstall.ps1) runs
         msiexec by FULL PATH with -NoNewWindow -- a bare 'msiexec.exe'
         goes through ShellExecute and fails under EC's SYSTEM context --
