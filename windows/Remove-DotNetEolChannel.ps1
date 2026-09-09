@@ -36,15 +36,35 @@
         does not clear. This script uninstalls the bundle first, then any
         leftover MSI components, then verifies by re-reading ARP and disk.
 
-    Default target is major 6 (the CSLT-043 SEoL channel). Override locally
-    with -Major 9 etc.; do not pass a valued parameter through EC -- use the
-    default, or the -DotNet7 / -DotNet9 switches.
+    Default target is major 6 (the CSLT-043 SEoL channel) when no -DotNetN
+    switch is passed. Override locally with -Major N; do not pass a valued
+    parameter through EC -- use the bare switches. Multiple -DotNetN
+    switches in one run are allowed (CSLT-251 needed 6 and 9 together).
+
+    CSLT-251 (2026-09-09): -InstallSuccessorMajor on Update-DotNetRuntimes
+    staged .NET 10 next to 9 and left 6.0.36 / 9.0.20 in place -- that
+    script never deletes a major. This script is what removes them.
+    -DotNet8 is included because 8 reaches SEoL on 2026-11-10; removing it
+    before that date is still a human decision (apps pin to net8.0).
 
 .PARAMETER Major
-    Channel to remove. Default 6. Local/terminal use only.
+    Channel to remove. Default 6 when no -DotNetN switch is set.
+    Local/terminal use only.
+
+.PARAMETER DotNet5
+    Same as -Major 5; a bare switch so it survives EC's argument field.
+
+.PARAMETER DotNet6
+    Same as -Major 6; a bare switch so it survives EC's argument field.
+    Explicitly selecting 6 is useful when combining with other -DotNetN
+    switches; with no switches the script already defaults to 6.
 
 .PARAMETER DotNet7
     Same as -Major 7; a bare switch so it survives EC's argument field.
+
+.PARAMETER DotNet8
+    Same as -Major 8; a bare switch so it survives EC's argument field.
+    .NET 8 is in support until 2026-11-10 -- the script warns and proceeds.
 
 .PARAMETER DotNet9
     Same as -Major 9; a bare switch so it survives EC's argument field.
@@ -63,7 +83,7 @@
 
 .NOTES
     Deploy via Endpoint Central (SYSTEM). Repository, -File only.
-    Script Arguments: bare switches, e.g. -RemoveStaleFolders
+    Script Arguments: bare switches, e.g. -DotNet8 -DotNet9 -RemoveStaleFolders
                       (no $ and no quotes -- EC mangles both)
     Specify exit code(s): 0,3010
     Exit 2 is a human decision (non-Microsoft dependent, in-use folder) and
@@ -76,7 +96,10 @@
 [CmdletBinding()]
 param(
     [int]$Major = 6,
+    [switch]$DotNet5,
+    [switch]$DotNet6,
     [switch]$DotNet7,
+    [switch]$DotNet8,
     [switch]$DotNet9,
     [switch]$Force,
     [switch]$RemoveStaleFolders,
@@ -84,11 +107,26 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-if ($DotNet7) { $Major = 7 }
-if ($DotNet9) { $Major = 9 }
+
+# Bare EC switches select one or more majors. -Major is local/terminal only
+# and is ignored when any -DotNetN switch is set, so `-DotNet8` does not
+# also remove 6 just because $Major defaults to 6.
+$script:TargetMajors = @()
+if ($DotNet5) { $script:TargetMajors += 5 }
+if ($DotNet6) { $script:TargetMajors += 6 }
+if ($DotNet7) { $script:TargetMajors += 7 }
+if ($DotNet8) { $script:TargetMajors += 8 }
+if ($DotNet9) { $script:TargetMajors += 9 }
+if ($script:TargetMajors.Count -eq 0) {
+    $script:TargetMajors = @($Major)
+} elseif ($PSBoundParameters -and $PSBoundParameters.ContainsKey('Major') -and ($script:TargetMajors -notcontains $Major)) {
+    $script:TargetMajors += $Major
+}
+$script:TargetMajors = @($script:TargetMajors | Sort-Object -Unique)
+$MajorLabel = ($script:TargetMajors -join '-')
 
 $LogDir  = 'C:\Logs\CompoSecure'
-$LogFile = Join-Path $LogDir ('RemoveDotNetEol_' + $Major + '_' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '.log')
+$LogFile = Join-Path $LogDir ('RemoveDotNetEol_' + $MajorLabel + '_' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '.log')
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
 
 $ArpPaths = @(
@@ -118,6 +156,53 @@ function Write-Log {
     $line = '[' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '] [' + $Level + '] ' + $Msg
     Write-Host $line
     Add-Content -Path $LogFile -Value $line -ErrorAction SilentlyContinue
+}
+
+function Test-PendingReboot {
+    $reasons = @()
+    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') {
+        $reasons += 'Component Based Servicing: RebootPending'
+    }
+    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') {
+        $reasons += 'Windows Update: RebootRequired'
+    }
+    $pfro = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations
+    if ($pfro) { $reasons += ('PendingFileRenameOperations: ' + @($pfro).Count + ' entries') }
+    return $reasons
+}
+
+function Merge-ChannelExit {
+    # Prefer hard failure, then human decision, then reboot-needed success.
+    param([int]$Current, [int]$Incoming)
+    foreach ($p in @(1, 2, 3010, 0)) {
+        if ($Current -eq $p -or $Incoming -eq $p) { return $p }
+    }
+    return $Incoming
+}
+
+function Invoke-ArpHardRemoval {
+    # Registry-only strip of an ARP key whose uninstall was a no-op and which
+    # has no foreign WiX holder. Same fallback Update-DotNetRuntimes uses for
+    # dead 6.x/7.x entries (CSMELT-19: exit 0, entry survived).
+    param($Entry)
+    Write-Log '    No foreign WiX holder and uninstall did not drop the ARP key --' -Level WARN
+    Write-Log '    stripping the registration directly (registry-only).' -Level WARN
+    if ($DryRun) { Write-Log '    [DRYRUN] Would strip ARP key.'; return $true }
+    try {
+        Remove-Item -Path $Entry.PSPath -Recurse -Force -ErrorAction Stop
+        Start-Sleep -Seconds 1
+        $stillThere = Get-ItemProperty -Path $ArpPaths -ErrorAction SilentlyContinue |
+                      Where-Object { $_.PSChildName -eq $Entry.PSChildName }
+        if (-not $stillThere) {
+            Write-Log '    Hard removal succeeded -- orphaned entry cleared.'
+            return $true
+        }
+        Write-Log '    Hard removal did not stick. Leaving it; escalate manually.' -Level ERROR
+        return $false
+    } catch {
+        Write-Log ('    Hard removal failed: ' + $_) -Level ERROR
+        return $false
+    }
 }
 
 function Invoke-Msi {
@@ -318,7 +403,7 @@ function Invoke-UninstallEntry {
         if ($null -eq $rc) {
             $guid = Get-ProductGuid $Entry
             if ($guid) {
-                $msiLog = Join-Path $LogDir ('msi_uninstall_dotnet' + $Major + '_' + ($guid.Trim('{}')) + '.log')
+                $msiLog = Join-Path $LogDir ('msi_uninstall_dotnet' + $script:Major + '_' + ($guid.Trim('{}')) + '.log')
                 Write-Log ('    msiexec /x ' + $guid)
                 $rc = Invoke-Msi ('/x ' + $guid + ' /qn /norestart /l*v "' + $msiLog + '"')
             } else {
@@ -382,24 +467,15 @@ function Remove-FolderSafe {
     }
 }
 
-# ------------------------------------------------------------------
-Write-Log '=============================================='
-Write-Log (' Remove-DotNetEolChannel -- plugin 172179 -- .NET ' + $Major + '.x')
-Write-Log (' Host   : ' + $env:COMPUTERNAME)
-Write-Log ' Switches received:'
-Write-Log ('   -Major              : ' + $Major)
-Write-Log ('   -DotNet7            : ' + $DotNet7)
-Write-Log ('   -DotNet9            : ' + $DotNet9)
-Write-Log ('   -Force              : ' + $Force)
-Write-Log ('   -RemoveStaleFolders : ' + $RemoveStaleFolders)
-Write-Log ('   -DryRun             : ' + $DryRun)
-if ($MyInvocation.Line) { Write-Log (' Invoked as: ' + $MyInvocation.Line.Trim()) }
-Write-Log '=============================================='
-Write-Log 'This does NOT touch other majors. .NET 8 and .NET 10 on this host stay.'
+function Invoke-RemoveOneMajor {
+    param([int]$Major)
+    $script:Major = $Major
+    $script:UninstallFail = $false
+    $script:NeedsHuman = $false
 
-# ------------------------------------------------------------------
-Write-Log ''
-Write-Log '[1/5] Inventory'
+    Write-Log ''
+    Write-Log ('======== .NET ' + $Major + '.x ========')
+    Write-Log '[1/5] Inventory'
 $entries = @(Get-ChannelArp $Major | Sort-Object { Get-UninstallRank $_ }, DisplayName)
 if ($entries.Count -eq 0) {
     Write-Log ('  No ARP entries for Microsoft .NET ' + $Major + '.x.')
@@ -445,14 +521,14 @@ if ($foreign.Count -gt 0) {
     Write-Log ''
     Write-Log '  Non-Microsoft (or other-major) products hold this channel:' -Level WARN
     foreach ($n in $foreign) { Write-Log ('    * ' + $n) -Level WARN }
-    Write-Log '  Removing .NET ' + $Major + ' WILL break those apps -- they pin to this major' -Level WARN
-    Write-Log '  and do not roll forward to 8/10. On CSLT-043 the likely candidates are' -Level WARN
-    Write-Log '  Halcyon AR, Minitab 21, DraftSight 2023, Dell Optimizer -- confirm with' -Level WARN
-    Write-Log '  the machine owner before using -Force.' -Level WARN
+    Write-Log ('  Removing .NET ' + $Major + ' WILL break those apps -- they pin to this major') -Level WARN
+    Write-Log '  and do not roll forward to a later major. Confirm with the machine owner' -Level WARN
+    Write-Log '  before using -Force.' -Level WARN
     if (-not $Force) {
-        Write-Log '  Refusing to remove. Re-run with -Force after the owner signs off.' -Level ERROR
-        Write-Log '=============================================='
-        exit 2
+        Write-Log '  Refusing to remove this major. Re-run with -Force after the owner signs off.' -Level ERROR
+        Write-Log '  Other selected majors (if any) will still be processed.' -Level WARN
+        $script:NeedsHuman = $true
+        return 2
     }
     Write-Log '  -Force set: continuing anyway.' -Level WARN
 }
@@ -460,8 +536,7 @@ if ($foreign.Count -gt 0) {
 if ($entries.Count -eq 0 -and $folders.Count -eq 0) {
     Write-Log ''
     Write-Log ('Nothing to remediate -- .NET ' + $Major + '.x is not present.')
-    Write-Log '=============================================='
-    exit 0
+    return 0
 }
 
 # ------------------------------------------------------------------
@@ -484,6 +559,34 @@ if ($leftArp.Count -gt 0 -and -not $DryRun) {
     }
 }
 
+# Third pass: uninstall no-op with no FOREIGN holder (own-channel WiX refs
+# like "ASP.NET Core N.x Shared Framework" holding ".NET Runtime N.x" are
+# expected during teardown). Strip leftover ARP so Tenable/Add-Remove
+# Programs do not keep a dead DisplayVersion (CSMELT-19).
+$leftArp = @(Get-ChannelArp $Major)
+if ($leftArp.Count -gt 0 -and -not $DryRun) {
+    $leftVersNow = @(Get-ChannelVersionsOnDisk $Major)
+    foreach ($e in $leftArp) {
+        if ($e.DisplayName -match '(\d+\.\d+\.\d+)') {
+            $v = $matches[1]
+            if ($leftVersNow -notcontains $v) { $leftVersNow += $v }
+        }
+    }
+    $foreignLeft = @()
+    if ($leftVersNow.Count -gt 0) {
+        $foreignLeft = @(Get-WixHolders $leftVersNow | Where-Object {
+            -not (Test-IsOwnChannelProduct -Name $_.Name -Maj $Major)
+        })
+    }
+    if ($foreignLeft.Count -gt 0) {
+        Write-Log '  Leftover ARP still has a foreign WiX holder -- not stripping:' -Level WARN
+        foreach ($h in $foreignLeft) { Write-Log ('    ' + $h.Name) -Level WARN }
+    } else {
+        Write-Log '  Third pass -- stripping leftover ARP with no foreign holder:'
+        foreach ($e in $leftArp) { Invoke-ArpHardRemoval $e | Out-Null }
+    }
+}
+
 # ------------------------------------------------------------------
 Write-Log ''
 Write-Log '[4/5] Leftover folders / Package Cache'
@@ -493,7 +596,8 @@ $leftVers    = @(Get-ChannelVersionsOnDisk $Major)
 $liveHold    = @()
 if ($leftVers.Count -gt 0) {
     $liveHold = @(Get-WixHolders $leftVers | Where-Object {
-        $_.Name -notmatch 'orphaned provider' -and $_.Name -notmatch 'no ARP name'
+        $_.Name -notmatch 'orphaned provider' -and $_.Name -notmatch 'no ARP name' -and
+        -not (Test-IsOwnChannelProduct -Name $_.Name -Maj $Major)
     })
 }
 
@@ -558,17 +662,15 @@ foreach ($root in $DotNetRoots) {
 
 Write-Log ''
 if ($DryRun) {
-    Write-Log 'DRY_RUN -- nothing was changed.'
-    Write-Log '=============================================='
-    exit 0
+    Write-Log 'DRY_RUN -- nothing was changed for this major.'
+    return 0
 }
 
 if ($finalArp.Count -eq 0 -and $finalFolders.Count -eq 0 -and -not $stillListed) {
     Write-Log ('RESULT: .NET ' + $Major + '.x is gone (ARP, folders, and dotnet --list-runtimes).')
-    Write-Log 'Re-run a Nessus scan to confirm plugin 172179 clears. It keys on folder presence.'
-    Write-Log '=============================================='
-    if ($script:Reboot) { exit 3010 }
-    exit 0
+    Write-Log 'Re-run a Nessus scan to confirm plugin 172179 / 172178 clear. They key on folder presence.'
+    if ($script:Reboot) { return 3010 }
+    return 0
 }
 
 Write-Log ('RESULT: .NET ' + $Major + '.x is STILL present.') -Level ERROR
@@ -583,6 +685,52 @@ if ($finalFolders.Count -gt 0) {
 if ($stillListed) {
     Write-Log '  dotnet --list-runtimes still reports this major.' -Level ERROR
 }
+if ($script:NeedsHuman) { return 2 }
+return 1
+}
+
+# ------------------------------------------------------------------
 Write-Log '=============================================='
-if ($script:NeedsHuman) { exit 2 }
-exit 1
+Write-Log (' Remove-DotNetEolChannel -- plugin 172179/172178 -- .NET ' + $MajorLabel + '.x')
+Write-Log (' Host   : ' + $env:COMPUTERNAME)
+Write-Log ' Switches received:'
+Write-Log ('   -Major              : ' + $Major + '  (used only when no -DotNetN switch is set)')
+Write-Log ('   -DotNet5            : ' + $DotNet5)
+Write-Log ('   -DotNet6            : ' + $DotNet6)
+Write-Log ('   -DotNet7            : ' + $DotNet7)
+Write-Log ('   -DotNet8            : ' + $DotNet8)
+Write-Log ('   -DotNet9            : ' + $DotNet9)
+Write-Log ('   -Force              : ' + $Force)
+Write-Log ('   -RemoveStaleFolders : ' + $RemoveStaleFolders)
+Write-Log ('   -DryRun             : ' + $DryRun)
+Write-Log (' Targets : .NET ' + (($script:TargetMajors | ForEach-Object { "$_.x" }) -join ', .NET '))
+if ($MyInvocation.Line) { Write-Log (' Invoked as: ' + $MyInvocation.Line.Trim()) }
+Write-Log '=============================================='
+Write-Log 'Each selected major is removed independently. Other majors stay.'
+
+$pending = @(Test-PendingReboot)
+if ($pending.Count -gt 0) {
+    Write-Log ''
+    Write-Log '*** PENDING REBOOT DETECTED -- uninstalls may 1603 / no-op ***' -Level WARN
+    foreach ($r in $pending) { Write-Log ('***   ' + $r) -Level WARN }
+    Write-Log '*** Reboot first for the most reliable result. Continuing anyway.' -Level WARN
+}
+
+if ($script:TargetMajors -contains 8) {
+    Write-Log ''
+    Write-Log '*** .NET 8 is in support until 2026-11-10 ***' -Level WARN
+    Write-Log '*** Removing it now will break any app that targets net8.0 / net8.0-windows.' -Level WARN
+    Write-Log '*** After that date it generates SEoL findings (172179) that patching cannot clear.' -Level WARN
+}
+
+$overall = 0
+foreach ($m in $script:TargetMajors) {
+    $code = Invoke-RemoveOneMajor -Major $m
+    $overall = Merge-ChannelExit -Current $overall -Incoming $code
+}
+
+Write-Log ''
+Write-Log '=============================================='
+Write-Log (' Combined result for .NET ' + $MajorLabel + '.x : exit ' + $overall)
+Write-Log '=============================================='
+exit $overall

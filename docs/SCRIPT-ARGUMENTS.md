@@ -161,14 +161,18 @@ Quotes service `ImagePath` values that contain unquoted spaces. Requires adminis
 | `-WhatIf` | switch | off | Preview only (via `SupportsShouldProcess`); reports the services it would fix without writing to the registry. |
 
 ## Remove-DotNetEolChannel.ps1
-Removes an end-of-support .NET runtime channel (default major 6).
+Removes an end-of-support .NET runtime channel. With no `-DotNetN` switch the target is major 6. Multiple `-DotNetN` switches in one run are processed independently.
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
-| `-Major` | int | `6` | The .NET major channel to remove. Local/terminal use (do not pass a valued parameter through EC). |
-| `-DotNet9` | switch | off | Shorthand for `-Major 9`; a bare switch that survives EC's argument field. |
+| `-Major` | int | `6` | The .NET major channel to remove. Local/terminal use only (do not pass a valued parameter through EC). Ignored when any `-DotNetN` switch is set. |
+| `-DotNet5` | switch | off | Remove the .NET 5 channel. Bare switch for EC. |
+| `-DotNet6` | switch | off | Remove the .NET 6 channel. Bare switch for EC. Same as the no-switch default; use it when combining with other majors. |
+| `-DotNet7` | switch | off | Remove the .NET 7 channel. Bare switch for EC. |
+| `-DotNet8` | switch | off | Remove the .NET 8 channel. Bare switch for EC. .NET 8 is in support until 2026-11-10; the script warns and proceeds. |
+| `-DotNet9` | switch | off | Remove the .NET 9 channel. Bare switch for EC. |
 | `-Force` | switch | off | Proceed even if a non-Microsoft (or other-major) product holds a WiX dependency on this channel. Will break that app — confirm with the owner first. |
-| `-RemoveStaleFolders` | switch | off | After uninstall, delete leftover `shared\`/`host\fxr\` folders and orphan Package Cache installers for this major when no live dependent remains. |
+| `-RemoveStaleFolders` | switch | off | After uninstall, delete leftover `shared\`/`host\fxr\` folders and orphan Package Cache installers for this major when no live *foreign* dependent remains. |
 | `-DryRun` | switch | off | Report what would be removed; change nothing. |
 
 ## Remove-3DViewer.ps1
