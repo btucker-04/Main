@@ -1625,7 +1625,8 @@ Write-Log 'All present flavors advanced. Re-run a Nessus scan to confirm.'
 if ($EolSeen.Count -gt 0) {
     Write-Log ('REMINDER: EOL channel(s) still installed on this host: .NET ' + (($EolSeen | Sort-Object) -join ', .NET ')) -Level WARN
     Write-Log 'Patched to final build, but SEoL findings persist until removal/migration.' -Level WARN
-    Write-Log 'To remove the channel: Remove-DotNetEolChannel.ps1 (default major 6).' -Level WARN
+    Write-Log 'To remove: Remove-DotNetEolChannel.ps1 with -DotNet5 / -DotNet6 / -DotNet7 / -DotNet8 / -DotNet9' -Level WARN
+    Write-Log '(one or more in the same run). No switch defaults to major 6. Pair with -RemoveStaleFolders.' -Level WARN
 }
 Write-Log '=============================================='
 if ($Reboot) { exit 3010 }
