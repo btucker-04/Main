@@ -34,10 +34,16 @@ export HOME
 CFG_DRY_RUN="0"
 CFG_FORCE_CLOSE="0"
 CFG_NO_INSTALL="0"
+# Per-brew-step wall-clock limit, seconds. gstreamer bundles gst-plugins-rs,
+# so a source build (no matching bottle) runs for hours and Mosyle kills the
+# job mid-flight. Ending on our own terms keeps the log and the exit code
+# meaningful. 0 = no limit.
+CFG_BREW_TIMEOUT="2700"
 # =============================================================================
 DRY_RUN="${DRY_RUN:-$CFG_DRY_RUN}"
 FORCE_CLOSE="${FORCE_CLOSE:-$CFG_FORCE_CLOSE}"
 NO_INSTALL="${NO_INSTALL:-$CFG_NO_INSTALL}"
+BREW_TIMEOUT="${BREW_TIMEOUT:-$CFG_BREW_TIMEOUT}"
 
 LOG_DIR="${LOG_DIR:-/var/log/composecure}"
 LOG_FILE="$LOG_DIR/gstreamer_update.log"
@@ -69,6 +75,7 @@ keg_version() {
 VULN_SEEN=0
 VULN_REMAINING=0
 NEEDS_HUMAN=0
+BREW_TIMED_OUT=0
 
 log "===== update-gstreamer.sh START ====="
 log "Host: $(hostname -s 2>/dev/null || hostname)   plugins 326245/326246"
@@ -105,7 +112,12 @@ valid_macos_user() {
     return 0
 }
 
-CONSOLE_USER=$(stat -f "%Su" /dev/console 2>/dev/null || true)
+# BREW_USER may be preset (brew refuses to run as root, and console-user
+# detection has no answer on an unattended machine at the login window).
+CONSOLE_USER="${BREW_USER:-}"
+if ! valid_macos_user "$CONSOLE_USER"; then
+    CONSOLE_USER=$(stat -f "%Su" /dev/console 2>/dev/null || true)
+fi
 if ! valid_macos_user "$CONSOLE_USER"; then
     if [ -x "$BREW_PREFIX/bin/brew" ]; then
         CONSOLE_USER=$(stat -f "%Su" "$BREW_PREFIX/bin/brew" 2>/dev/null || true)
@@ -124,11 +136,71 @@ if [ -x "$BREW_PREFIX/bin/brew" ]; then
 fi
 
 run_brew() {
+    # brew writes to its own file on disk rather than into $(...). Capturing
+    # output in a subshell meant a Mosyle timeout kill during `brew update`
+    # discarded every line of it -- the jriegel-mac 2026-09-14 run ended
+    # after "[1] Inventory" with no record of what brew was doing.
+    # $1 = step label used for the per-step log filename.
+    local step="$1"
+    shift
+    local step_log="$LOG_DIR/gstreamer_brew_${step}.log"
+    local start
+    start=$(date +%s)
+
+    # Once one step has been stopped at the limit, the rest would only burn
+    # another full timeout each and push the job past Mosyle's own limit.
+    if [ "$BREW_TIMED_OUT" -eq 1 ]; then
+        log "  brew $* -- skipped (an earlier brew step hit the timeout)"
+        return 1
+    fi
+
+    log "  brew $* -- running as $BREW_USER"
+    log "    live output: $step_log"
+    if [ "$BREW_TIMEOUT" -gt 0 ]; then
+        log "    limit: ${BREW_TIMEOUT}s"
+    fi
+
+    # The redirect is deliberately the root shell's, not sudo's: root owns
+    # $LOG_DIR and $BREW_USER may not be able to write there.
+    : > "$step_log"
     sudo -u "$BREW_USER" \
         HOME="/Users/$BREW_USER" \
         PATH="$BREW_PREFIX/bin:$BREW_PREFIX/sbin:/usr/bin:/bin:/usr/sbin:/sbin" \
         NONINTERACTIVE=1 \
-        "$BREW_PREFIX/bin/brew" "$@"
+        HOMEBREW_NO_AUTO_UPDATE=1 \
+        HOMEBREW_NO_ANALYTICS=1 \
+        HOMEBREW_NO_ENV_HINTS=1 \
+        "$BREW_PREFIX/bin/brew" "$@" >>"$step_log" 2>&1 &
+    local brew_pid=$!
+
+    local waited=0
+    while kill -0 "$brew_pid" 2>/dev/null; do
+        sleep 2
+        waited=$((waited + 2))
+        # Heartbeat so a killed run still shows how far brew got.
+        if [ $((waited % 300)) -eq 0 ]; then
+            log "    ...still running (${waited}s): $(tail -n 1 "$step_log" 2>/dev/null)"
+        fi
+        if [ "$BREW_TIMEOUT" -gt 0 ] && [ "$waited" -ge "$BREW_TIMEOUT" ]; then
+            log "    TIMEOUT after ${waited}s -- terminating brew."
+            kill "$brew_pid" 2>/dev/null || true
+            sleep 5
+            kill -9 "$brew_pid" 2>/dev/null || true
+            BREW_TIMED_OUT=1
+            break
+        fi
+    done
+
+    wait "$brew_pid" 2>/dev/null
+    local rc=$?
+    local elapsed=$(( $(date +%s) - start ))
+
+    while IFS= read -r line; do
+        [ -n "$line" ] && log "    $line"
+    done < <(tail -n 40 "$step_log" 2>/dev/null)
+
+    log "  brew $1 finished: exit $rc after ${elapsed}s"
+    return "$rc"
 }
 
 # -----------------------------------------------------------------------
@@ -209,15 +281,30 @@ elif [ -z "$BREW_USER" ] || [ ! -x "$BREW_PREFIX/bin/brew" ]; then
         NEEDS_HUMAN=1
     fi
 else
-    log "  brew update..."
-    OUT=$(run_brew update 2>&1); log "  $OUT"
-    log "  brew upgrade gstreamer ..."
-    OUT=$(run_brew upgrade gstreamer 2>&1); log "  $OUT"
+    # `brew update` refreshes the formula; without it `upgrade` may still see
+    # 1.26.2 as current. HOMEBREW_NO_AUTO_UPDATE is set in run_brew so the
+    # upgrade step does not silently repeat this.
+    run_brew update update || log "  brew update failed -- continuing with the formula already on disk."
+
+    # --force-bottle keeps this off the multi-hour gst-plugins-rs source
+    # build path. If no bottle exists the step fails fast and is reported,
+    # which is a far better outcome than being killed at the Mosyle timeout.
+    if ! run_brew upgrade_gstreamer upgrade --force-bottle gstreamer; then
+        if [ "$BREW_TIMED_OUT" -eq 1 ]; then
+            log "  Upgrade hit the ${BREW_TIMEOUT}s limit."
+        else
+            log "  Bottled upgrade failed -- retrying without --force-bottle (may build from source)."
+            run_brew upgrade_gstreamer_src upgrade gstreamer || \
+                log "  brew upgrade gstreamer failed. See the per-step log above."
+        fi
+    fi
+
     for f in $SPLIT_PRESENT; do
-        log "  brew upgrade $f (legacy split formula)..."
-        OUT=$(run_brew upgrade "$f" 2>&1); log "  $OUT"
+        run_brew "upgrade_${f}" upgrade "$f" || \
+            log "  brew upgrade $f failed (legacy split formula) -- cleanup below still applies."
     done
-    OUT=$(run_brew cleanup gstreamer 2>&1); log "  cleanup gstreamer: $OUT"
+
+    run_brew cleanup_gstreamer cleanup gstreamer || log "  brew cleanup gstreamer failed."
 fi
 
 # Re-read patched state after upgrade
@@ -318,6 +405,15 @@ if [ "$DRY_RUN" = "1" ]; then
 fi
 if [ "$REMAIN" -eq 1 ] || [ "$VULN_REMAINING" -eq 1 ]; then
     log "RESULT: vulnerable GStreamer remains -- review log."
+    if [ "$BREW_TIMED_OUT" -eq 1 ]; then
+        log "        brew exceeded BREW_TIMEOUT=${BREW_TIMEOUT}s and was stopped."
+        log "        gstreamer bundles gst-plugins-rs; with no matching bottle it"
+        log "        builds from source for hours. Either raise CFG_BREW_TIMEOUT,"
+        log "        or run 'brew upgrade gstreamer' once by hand on this host and"
+        log "        re-run this script with NO_INSTALL=1 to do the keg cleanup."
+        log "===== END (attention) ====="
+        exit 2
+    fi
     if [ "$NEEDS_HUMAN" -eq 1 ]; then
         log "        brew could not be run as a non-root user (Mosyle is root)."
         log "===== END (attention) ====="
