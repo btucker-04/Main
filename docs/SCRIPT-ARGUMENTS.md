@@ -315,8 +315,12 @@ Upgrades Homebrew GStreamer to >= 1.28.5 and removes leftover Cellar kegs (plugi
 |----------------------|----------------|-------------|
 | `DRY_RUN` | `CFG_DRY_RUN="0"` | Set `1` to report only; change nothing. |
 | `FORCE_CLOSE` | `CFG_FORCE_CLOSE="0"` | Set `1` to TERM `gst-launch` / `gst-play` helpers before replacing kegs. Default continues anyway. |
-| `NO_INSTALL` | `CFG_NO_INSTALL="0"` | Set `1` to skip `brew upgrade` (inventory + keg cleanup only). Terminal/tests. |
+| `NO_INSTALL` | `CFG_NO_INSTALL="0"` | Set `1` to skip `brew upgrade` and only do inventory + keg cleanup. Use after upgrading the keg by hand. |
+| `BREW_TIMEOUT` | `CFG_BREW_TIMEOUT="2700"` | Per-brew-step wall-clock limit in seconds; `0` disables. `gstreamer` bundles `gst-plugins-rs`, so a source build runs for hours — stopping on our own terms keeps the log and exit code meaningful instead of being killed by Mosyle. Remaining brew steps are skipped once one step hits the limit. |
+| `BREW_USER` | auto (console user, else `brew` owner) | Force the account `brew` runs as. `brew` refuses to run as root, and console-user detection has no answer at the login window. |
 | `BREW_PREFIX` | auto `/opt/homebrew` or `/usr/local` | Override Homebrew prefix (tests). |
+
+Each `brew` invocation streams to its own `/var/log/composecure/gstreamer_brew_<step>.log`, so a killed run still shows how far brew got.
 
 ## get-mac-reboot-reason.sh
 Read-only diagnostic explaining the last restart. Reads one **environment variable**.
