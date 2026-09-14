@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# update-adobe-rum.sh  (v5)  (v2)
+# update-adobe-rum.sh  (v6)
 # Generic Adobe updater via Remote Update Manager (RUM).
 # Platform : macOS (bash 3.2 compatible) | Deploy: Mosyle (runs as root)
 #
@@ -19,6 +19,23 @@
 # 2026-08-07, running as root). Unfiltered is the reliable path. Set SAP_CODES to
 # target specific products; if that call fails the script falls back to
 # unfiltered unless NO_FALLBACK=1.
+#
+# v6 (from the 2026-09-14 ARMB-08 run):
+#   * A live RemoteUpdateManager that has been running for STALE_RUM_SECONDS
+#     (default 10 min) is treated as hung, not as a concurrent Mosyle/manual
+#     job. The script waits WAIT_FOR_RUM_SECONDS (default 120s), then if
+#     KILL_STALE_RUM=1 (default) sends SIGTERM, then SIGKILL, and retries
+#     install once. Younger processes still defer (exit 2) so we do not
+#     interrupt a download that started seconds ago. Killing a mid-download
+#     RUM can leave partial HD media (Adobe 118/129/102 on this host) -- the
+#     age gate is the guard. A lock with NO process is still reboot-only;
+#     there is no version-stable lock file to delete.
+#   * Contention is resolved BEFORE --action=list so the advisory call does
+#     not slam into an already-running instance (ARMB-08: list and install
+#     both RC 1 in ~1s while pid 66008 was live).
+#   * Lock-message deferral only applies when install actually failed
+#     (RUM_OK=0). A successful retry after a first-attempt lock must not
+#     be overturned by the still-recent log line from that first attempt.
 #
 # v5 (from the 2026-08-19 CSPRMB-12-A run):
 #   * v4's lock detection was DEAD CODE. It checked $LAST_RUM_OUT (RUM's
@@ -103,8 +120,15 @@
 #        Any listed app still below its minimum makes the run fail (exit 1).
 #   SAP_CODES="PHSP,ILST"   target RUM at specific products (see note above)
 #   FORCE_CLOSE=1           quit running Adobe apps instead of aborting
+#   KILL_STALE_RUM=1        terminate RemoteUpdateManager if still running
+#                           after WAIT_FOR_RUM_SECONDS AND elapsed age
+#                           >= STALE_RUM_SECONDS (default on)
+#   WAIT_FOR_RUM_SECONDS=120  how long to wait for an existing RUM to finish
+#   STALE_RUM_SECONDS=600     elapsed age (from ps etime) before a live RUM
+#                             is treated as hung rather than concurrent
 #   NO_FALLBACK=1           do not retry unfiltered if a targeted call fails
 #   DRY_RUN=1               inventory + RUM list only; install nothing
+#                             (never kills RUM)
 #
 # Exit: 0 = nothing needed, or everything that was asked for reached its target
 #       2 = skipped (Adobe apps running), or apps updated but no TARGETS given
@@ -117,12 +141,26 @@ HOME="${HOME:-/var/root}"
 export HOME
 
 RUM="/usr/local/bin/RemoteUpdateManager"
+
+# CONFIG -- Mosyle cannot pass env at deploy; edit these. A terminal-set
+# environment variable still wins over the matching CFG_ default.
+CFG_FORCE_CLOSE="${CFG_FORCE_CLOSE:-0}"
+CFG_KILL_STALE_RUM="${CFG_KILL_STALE_RUM:-1}"
+CFG_WAIT_FOR_RUM_SECONDS="${CFG_WAIT_FOR_RUM_SECONDS:-120}"
+CFG_STALE_RUM_SECONDS="${CFG_STALE_RUM_SECONDS:-600}"
+CFG_NO_FALLBACK="${CFG_NO_FALLBACK:-0}"
+CFG_DRY_RUN="${CFG_DRY_RUN:-0}"
+CFG_IGNORE_HELPERS="${CFG_IGNORE_HELPERS:-1}"
+
 TARGETS="${TARGETS:-}"
 SAP_CODES="${SAP_CODES:-}"
-FORCE_CLOSE="${FORCE_CLOSE:-0}"
-NO_FALLBACK="${NO_FALLBACK:-0}"
-DRY_RUN="${DRY_RUN:-0}"
-IGNORE_HELPERS="${IGNORE_HELPERS:-1}"
+FORCE_CLOSE="${FORCE_CLOSE:-$CFG_FORCE_CLOSE}"
+KILL_STALE_RUM="${KILL_STALE_RUM:-$CFG_KILL_STALE_RUM}"
+WAIT_FOR_RUM_SECONDS="${WAIT_FOR_RUM_SECONDS:-$CFG_WAIT_FOR_RUM_SECONDS}"
+STALE_RUM_SECONDS="${STALE_RUM_SECONDS:-$CFG_STALE_RUM_SECONDS}"
+NO_FALLBACK="${NO_FALLBACK:-$CFG_NO_FALLBACK}"
+DRY_RUN="${DRY_RUN:-$CFG_DRY_RUN}"
+IGNORE_HELPERS="${IGNORE_HELPERS:-$CFG_IGNORE_HELPERS}"
 
 LOG_DIR="/var/log/composecure"
 LOG_FILE="$LOG_DIR/adobe_rum_update.log"
@@ -282,6 +320,204 @@ EOF2
     return 1
 }
 
+# BSD / POSIX ps etime: [[DD-]HH:]MM:SS (leading zeros). Strip them so bash
+# arithmetic does not treat 08 as octal.
+_etime_field_dec() {
+    n="${1:-0}"
+    n=$(printf '%s' "$n" | sed 's/^0*\([0-9]\)/\1/; s/^0*$/0/')
+    printf '%s' "$n"
+}
+
+etime_to_seconds() {
+    raw="${1:-}"
+    raw=$(printf '%s' "$raw" | tr -d '[:space:]')
+    [ -n "$raw" ] || { echo 0; return 1; }
+    days=0
+    rest="$raw"
+    case "$raw" in
+        *-*)
+            days=$(_etime_field_dec "${raw%%-*}")
+            rest="${raw#*-}"
+            ;;
+    esac
+    ncolon=$(printf '%s' "$rest" | tr -cd ':' | wc -c | tr -d ' ')
+    h=0
+    m=0
+    s=0
+    case "$ncolon" in
+        0)
+            s=$(_etime_field_dec "$rest")
+            ;;
+        1)
+            m=$(_etime_field_dec "${rest%%:*}")
+            s=$(_etime_field_dec "${rest#*:}")
+            ;;
+        2)
+            h=$(_etime_field_dec "${rest%%:*}")
+            rest="${rest#*:}"
+            m=$(_etime_field_dec "${rest%%:*}")
+            s=$(_etime_field_dec "${rest#*:}")
+            ;;
+        *)
+            echo 0
+            return 1
+            ;;
+    esac
+    echo $((days * 86400 + h * 3600 + m * 60 + s))
+}
+
+rum_live_pids() {
+    pgrep -x RemoteUpdateManager 2>/dev/null || true
+}
+
+rum_pid_elapsed_seconds() {
+    pid="$1"
+    et=$(ps -o etime= -p "$pid" 2>/dev/null | head -1)
+    [ -n "$et" ] || { echo 0; return 1; }
+    etime_to_seconds "$et"
+}
+
+# Oldest (largest elapsed) live RUM, or 0 if none.
+rum_oldest_elapsed_seconds() {
+    oldest=0
+    for pid in $(rum_live_pids); do
+        [ -n "$pid" ] || continue
+        age=$(rum_pid_elapsed_seconds "$pid")
+        [ "$age" -gt "$oldest" ] && oldest="$age"
+    done
+    echo "$oldest"
+}
+
+wait_for_rum_exit() {
+    timeout_s="${1:-0}"
+    [ "$timeout_s" -gt 0 ] || return 0
+    elapsed=0
+    while [ "$elapsed" -lt "$timeout_s" ]; do
+        pids=$(rum_live_pids)
+        [ -z "$pids" ] && return 0
+        sleep 5
+        elapsed=$((elapsed + 5))
+    done
+    pids=$(rum_live_pids)
+    [ -z "$pids" ]
+}
+
+terminate_rum_processes() {
+    pids=$(rum_live_pids)
+    [ -n "$pids" ] || return 0
+    log "  Sending SIGTERM to RemoteUpdateManager pid(s): $(echo "$pids" | tr '\n' ' ')"
+    for pid in $pids; do
+        kill -TERM "$pid" 2>/dev/null || true
+    done
+    wait_secs=15
+    waited=0
+    while [ "$waited" -lt "$wait_secs" ]; do
+        [ -z "$(rum_live_pids)" ] && return 0
+        sleep 1
+        waited=$((waited + 1))
+    done
+    pids=$(rum_live_pids)
+    [ -n "$pids" ] || return 0
+    log "  Still alive after SIGTERM; sending SIGKILL to pid(s): $(echo "$pids" | tr '\n' ' ')"
+    for pid in $pids; do
+        kill -KILL "$pid" 2>/dev/null || true
+    done
+    sleep 3
+    [ -z "$(rum_live_pids)" ]
+}
+
+# 0 = no live RUM (safe to invoke); 1 = still occupied, caller should defer.
+resolve_rum_contention() {
+    pids=$(rum_live_pids)
+    if [ -z "$pids" ]; then
+        return 0
+    fi
+    age=$(rum_oldest_elapsed_seconds)
+    log "  RemoteUpdateManager already running (pid(s): $(echo "$pids" | tr '\n' ' ') oldest elapsed ${age}s)."
+    if [ "$WAIT_FOR_RUM_SECONDS" -gt 0 ]; then
+        log "  Waiting up to ${WAIT_FOR_RUM_SECONDS}s for it to finish..."
+        wait_for_rum_exit "$WAIT_FOR_RUM_SECONDS" || true
+        pids=$(rum_live_pids)
+        if [ -z "$pids" ]; then
+            log "  Prior RUM exited. Continuing."
+            return 0
+        fi
+        age=$(rum_oldest_elapsed_seconds)
+        log "  Still running after wait (oldest elapsed ${age}s)."
+    fi
+    if [ "$DRY_RUN" = "1" ]; then
+        log "  DRY_RUN=1 -- not killing RUM. Deferring."
+        return 1
+    fi
+    if [ "$KILL_STALE_RUM" = "1" ] && [ "$age" -ge "$STALE_RUM_SECONDS" ]; then
+        log "  Treating as STALE (elapsed ${age}s >= STALE_RUM_SECONDS=${STALE_RUM_SECONDS})."
+        log "  WARNING: stopping a mid-download RUM can leave partial Adobe HD media"
+        log "  (errors 118/129/102). The age gate is the guard against killing a"
+        log "  young concurrent job."
+        if terminate_rum_processes; then
+            log "  Stale RUM terminated. Continuing."
+            return 0
+        fi
+        log "  RUM survived SIGKILL. Deferring."
+        return 1
+    fi
+    log "  Concurrent/young RUM (elapsed ${age}s < STALE_RUM_SECONDS=${STALE_RUM_SECONDS}"
+    log "  or KILL_STALE_RUM=${KILL_STALE_RUM}). Not interrupting. Re-run later."
+    return 1
+}
+
+handle_rum_lock_failure() {
+    LOCK_HIT=$(recent_lock_message)
+    [ -n "$LOCK_HIT" ] || return 0
+    log "  Found a RECENT lock message in RUM's own log: $LOCK_HIT"
+    REAL_PROC=$(rum_live_pids)
+    if [ -n "$REAL_PROC" ]; then
+        if resolve_rum_contention; then
+            log "  Retrying install once after clearing the live RUM instance..."
+            rum_install_once
+            if [ "$RUM_OK" -eq 1 ]; then
+                return 0
+            fi
+            LOCK_HIT=$(recent_lock_message)
+            REAL_PROC=$(rum_live_pids)
+            if [ "$RUM_OK" -eq 0 ] && [ -n "$LOCK_HIT" ] && [ -n "$REAL_PROC" ]; then
+                log "  A RemoteUpdateManager process is still running (pid: $(echo "$REAL_PROC" | tr '\n' ' '))."
+                log "  Deferring rather than looping. Re-run later."
+                log "===== END (deferred: real RUM instance in progress) ====="
+                exit 2
+            fi
+            if [ "$RUM_OK" -eq 0 ] && [ -n "$LOCK_HIT" ] && [ -z "$REAL_PROC" ]; then
+                log "  RUM reported another instance running moments ago, but NO such process"
+                log "  exists now (checked: pgrep -x RemoteUpdateManager). This is a STALE LOCK"
+                log "  left by a crashed/killed run, not a live conflict."
+                log "  There is no documented, version-stable file to delete for this --"
+                log "  guessing at one risks touching the wrong thing. The fix that reliably"
+                log "  clears orphaned process/session state is a REBOOT. Retrying this script"
+                log "  without one will keep failing identically."
+                report_signature_mismatches
+                log "===== END (stale RUM lock -- reboot required) ====="
+                exit 2
+            fi
+            return 0
+        fi
+        log "  A RemoteUpdateManager process IS genuinely running (pid: $(echo "$REAL_PROC" | tr '\n' ' '))."
+        log "  This is a real lock, not stale -- deferring rather than interfering with"
+        log "  it (concurrent manual run or another deployment?). Re-run later."
+        log "===== END (deferred: real RUM instance in progress) ====="
+        exit 2
+    fi
+    log "  RUM reported another instance running moments ago, but NO such process"
+    log "  exists now (checked: pgrep -x RemoteUpdateManager). This is a STALE LOCK"
+    log "  left by a crashed/killed run, not a live conflict."
+    log "  There is no documented, version-stable file to delete for this --"
+    log "  guessing at one risks touching the wrong thing. The fix that reliably"
+    log "  clears orphaned process/session state is a REBOOT. Retrying this script"
+    log "  without one will keep failing identically."
+    report_signature_mismatches
+    log "===== END (stale RUM lock -- reboot required) ====="
+    exit 2
+}
+
 # Surfaced as its own signal: content-signature validation failures on a
 # segmented download are a sharper diagnosis than a generic download failure,
 # and match an SSL-inspecting proxy altering bytes in transit.
@@ -311,9 +547,89 @@ run_rum() {
     return $rc
 }
 
+rum_install_once() {
+    RUM_OK=0
+    if [ -n "$SAP_CODES" ]; then
+        if run_rum "install ($SAP_CODES)" --productVersions="$SAP_CODES" --action=install; then
+            RUM_OK=1
+        else
+            log "  Targeted install failed. --productVersions is a known cause of an"
+            log "  immediate RC 1 on some RUM builds."
+            dump_rum_log
+            if [ "$NO_FALLBACK" = "1" ]; then
+                log "  NO_FALLBACK=1 -- not retrying unfiltered."
+            else
+                log "  Retrying unfiltered. NOTE: this updates EVERY Adobe product here."
+                run_rum "install (all products)" --action=install && RUM_OK=1
+            fi
+        fi
+    else
+        run_rum "install (all products)" --action=install && RUM_OK=1
+    fi
+}
+
+if [ "${RUM_SELFTEST:-0}" = "1" ] || [ "${RUM_SELFTEST:-0}" = "kill" ]; then
+    fail=0
+    got=$(etime_to_seconds '01:02')
+    [ "$got" = "62" ] || { echo "etime_to_seconds '01:02' => $got (want 62)" >&2; fail=1; }
+    got=$(etime_to_seconds '08:09')
+    [ "$got" = "489" ] || { echo "etime_to_seconds '08:09' => $got (want 489)" >&2; fail=1; }
+    got=$(etime_to_seconds '01:02:03')
+    [ "$got" = "3723" ] || { echo "etime_to_seconds '01:02:03' => $got (want 3723)" >&2; fail=1; }
+    got=$(etime_to_seconds '1-02:03:04')
+    [ "$got" = "93784" ] || { echo "etime_to_seconds '1-02:03:04' => $got (want 93784)" >&2; fail=1; }
+    got=$(etime_to_seconds '  02:00  ')
+    [ "$got" = "120" ] || { echo "etime_to_seconds '  02:00  ' => $got (want 120)" >&2; fail=1; }
+    if [ "${RUM_SELFTEST:-0}" != "kill" ]; then
+        exit "$fail"
+    fi
+    if [ "$fail" -ne 0 ]; then
+        exit "$fail"
+    fi
+    WAIT_FOR_RUM_SECONDS=0
+    STALE_RUM_SECONDS=0
+    KILL_STALE_RUM=1
+    DRY_RUN=0
+    fake="$WORK/RemoteUpdateManager"
+    cp /bin/sleep "$fake"
+    chmod +x "$fake"
+    "$fake" 120 &
+    fpid=$!
+    sleep 1
+    if [ -z "$(rum_live_pids)" ]; then
+        echo "pgrep -x RemoteUpdateManager did not see fake pid $fpid (expected on Linux 15-char comm; macOS should match)." >&2
+        age=$(rum_pid_elapsed_seconds "$fpid")
+        echo "rum_pid_elapsed_seconds($fpid)=$age (ps etime parse)"
+        if [ "$age" -lt 0 ] || [ "$age" -gt 30 ]; then
+            echo "unexpected elapsed $age for fake pid" >&2
+            kill -KILL "$fpid" 2>/dev/null || true
+            exit 1
+        fi
+        kill -KILL "$fpid" 2>/dev/null || true
+        wait "$fpid" 2>/dev/null || true
+        if terminate_rum_processes; then
+            echo "etime+ps-elapsed selftest ok (no pgrep match on this OS)"
+            exit 0
+        fi
+        exit 1
+    fi
+    if ! resolve_rum_contention; then
+        echo "resolve_rum_contention failed to clear fake RUM pid $fpid" >&2
+        kill -KILL "$fpid" 2>/dev/null || true
+        exit 1
+    fi
+    if [ -n "$(rum_live_pids)" ]; then
+        echo "fake RUM still running after resolve" >&2
+        exit 1
+    fi
+    echo "kill-stale selftest ok"
+    exit 0
+fi
+
 log "===== update-adobe-rum.sh START ====="
 log "Host: $(hostname -s)"
 log "TARGETS=${TARGETS:-<none>}  SAP_CODES=${SAP_CODES:-<none, unfiltered>}  DRY_RUN=$DRY_RUN"
+log "FORCE_CLOSE=$FORCE_CLOSE  KILL_STALE_RUM=$KILL_STALE_RUM  WAIT_FOR_RUM_SECONDS=$WAIT_FOR_RUM_SECONDS  STALE_RUM_SECONDS=$STALE_RUM_SECONDS"
 
 # -----------------------------------------------------------------------
 # 1. Inventory before
@@ -431,6 +747,10 @@ fi
 # -----------------------------------------------------------------------
 log ""
 log "[5] RUM list (advisory -- the authority is the version diff in [7])..."
+if ! resolve_rum_contention; then
+    log "===== END (deferred: RemoteUpdateManager already running) ====="
+    exit 2
+fi
 if [ -n "$SAP_CODES" ]; then
     run_rum "list ($SAP_CODES)" --productVersions="$SAP_CODES" --action=list || \
         run_rum "list (all products)" --action=list || true
@@ -454,49 +774,13 @@ log "[6] Installing updates (machine kept awake)..."
 CAFFEINATE_PID=$!
 disown "$CAFFEINATE_PID" 2>/dev/null || true
 
-RUM_OK=0
-if [ -n "$SAP_CODES" ]; then
-    if run_rum "install ($SAP_CODES)" --productVersions="$SAP_CODES" --action=install; then
-        RUM_OK=1
-    else
-        log "  Targeted install failed. --productVersions is a known cause of an"
-        log "  immediate RC 1 on some RUM builds."
-        dump_rum_log
-        if [ "$NO_FALLBACK" = "1" ]; then
-            log "  NO_FALLBACK=1 -- not retrying unfiltered."
-        else
-            log "  Retrying unfiltered. NOTE: this updates EVERY Adobe product here."
-            run_rum "install (all products)" --action=install && RUM_OK=1
-        fi
-    fi
-else
-    run_rum "install (all products)" --action=install && RUM_OK=1
-fi
+rum_install_once
 [ "$RUM_OK" -eq 0 ] && dump_rum_log
-kill "$CAFFEINATE_PID" 2>/dev/null; CAFFEINATE_PID=""
 
-LOCK_HIT=$(recent_lock_message)
-if [ -n "$LOCK_HIT" ]; then
-    log "  Found a RECENT lock message in RUM's own log: $LOCK_HIT"
-    REAL_PROC=$(pgrep -x RemoteUpdateManager 2>/dev/null || true)
-    if [ -n "$REAL_PROC" ]; then
-        log "  A RemoteUpdateManager process IS genuinely running (pid: $REAL_PROC)."
-        log "  This is a real lock, not stale -- deferring rather than interfering with"
-        log "  it (concurrent manual run or another deployment?). Re-run later."
-        log "===== END (deferred: real RUM instance in progress) ====="
-        exit 2
-    fi
-    log "  RUM reported another instance running moments ago, but NO such process"
-    log "  exists now (checked: pgrep -x RemoteUpdateManager). This is a STALE LOCK"
-    log "  left by a crashed/killed run, not a live conflict."
-    log "  There is no documented, version-stable file to delete for this --"
-    log "  guessing at one risks touching the wrong thing. The fix that reliably"
-    log "  clears orphaned process/session state is a REBOOT. Retrying this script"
-    log "  without one will keep failing identically."
-    report_signature_mismatches
-    log "===== END (stale RUM lock -- reboot required) ====="
-    exit 2
+if [ "$RUM_OK" -eq 0 ]; then
+    handle_rum_lock_failure
 fi
+kill "$CAFFEINATE_PID" 2>/dev/null; CAFFEINATE_PID=""
 report_signature_mismatches
 
 # -----------------------------------------------------------------------
