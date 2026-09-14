@@ -308,6 +308,16 @@ Updates Go (official tree + Homebrew; per-user managers report-only). Reads **en
 | `DRY_RUN` | `CFG_DRY_RUN="0"` | Set `1` to report only; change nothing. |
 | `FORCE_CLOSE` | `CFG_FORCE_CLOSE="0"` | Set `1` to terminate running Go toolchain processes before swapping `/usr/local/go`. Default refuses to swap under a running compile. |
 
+## update-gstreamer.sh
+Upgrades Homebrew GStreamer to >= 1.28.5 and removes leftover Cellar kegs (plugins 326245 / 326246). Reads **environment variables**, with an in-script `CONFIG` block for Mosyle.
+
+| Environment variable | CONFIG default | Description |
+|----------------------|----------------|-------------|
+| `DRY_RUN` | `CFG_DRY_RUN="0"` | Set `1` to report only; change nothing. |
+| `FORCE_CLOSE` | `CFG_FORCE_CLOSE="0"` | Set `1` to TERM `gst-launch` / `gst-play` helpers before replacing kegs. Default continues anyway. |
+| `NO_INSTALL` | `CFG_NO_INSTALL="0"` | Set `1` to skip `brew upgrade` (inventory + keg cleanup only). Terminal/tests. |
+| `BREW_PREFIX` | auto `/opt/homebrew` or `/usr/local` | Override Homebrew prefix (tests). |
+
 ## get-mac-reboot-reason.sh
 Read-only diagnostic explaining the last restart. Reads one **environment variable**.
 
