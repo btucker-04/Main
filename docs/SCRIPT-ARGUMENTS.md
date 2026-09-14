@@ -267,16 +267,19 @@ Checks agent state and fixes only what is broken. Reads **environment variables*
 | `RESET_TENABLE_TAG` | `0` | Set `1` to recover from an HTTP 409 duplicate-identity link rejection by deleting `/private/etc/tenable_tag` (agent regenerates one) and retrying the link. Off by default: the host then links as a **new** agent and the stale record stays in Tenable holding a license seat until a human deletes it (Sensors > Agents). Without this, a 409 exits 2 with the diagnosis. |
 
 ## update-adobe-rum.sh
-Generic Adobe updater via Remote Update Manager. Reads **environment variables**.
+Generic Adobe updater via Remote Update Manager. Reads **environment variables**, with in-script `CFG_*` defaults for Mosyle (which cannot pass env at deploy). A terminal-set variable wins over `CFG_*`.
 
 | Environment variable | Default | Description |
 |----------------------|---------|-------------|
 | `TARGETS` | `''` | Semicolon-separated `NamePattern=MinVersion` pairs; any listed app still below its minimum makes the run fail (exit 1). |
 | `SAP_CODES` | `''` (unfiltered) | Comma-separated SAP codes to target specific Adobe products (e.g. `PHSP,ILST`). Falls back to unfiltered unless `NO_FALLBACK=1`. |
-| `FORCE_CLOSE` | `0` | Set `1` to quit running Adobe apps instead of aborting (exit 2). |
-| `NO_FALLBACK` | `0` | Set `1` to not retry unfiltered when a targeted call fails. |
-| `DRY_RUN` | `0` | Set `1` to inventory + run `RUM --action=list` only; install nothing. |
-| `IGNORE_HELPERS` | `1` | Set `0` to treat Adobe background helper/XPC processes as blockers (strict behavior). |
+| `FORCE_CLOSE` | `CFG_FORCE_CLOSE="0"` | Set `1` to quit running Adobe apps instead of aborting (exit 2). |
+| `KILL_STALE_RUM` | `CFG_KILL_STALE_RUM="1"` | Set `1` (default) to SIGTERM/SIGKILL a live `RemoteUpdateManager` that is still running after `WAIT_FOR_RUM_SECONDS` **and** whose `ps` elapsed age is `>= STALE_RUM_SECONDS`. Younger processes are treated as concurrent jobs and deferred (exit 2). `DRY_RUN=1` never kills. A lock with **no** process still requires a reboot. |
+| `WAIT_FOR_RUM_SECONDS` | `CFG_WAIT_FOR_RUM_SECONDS="120"` | Seconds to wait for an already-running RUM to exit before considering a kill. |
+| `STALE_RUM_SECONDS` | `CFG_STALE_RUM_SECONDS="600"` | Minimum `ps etime` (seconds) before a live RUM is treated as hung. Default 10 minutes so a just-started Mosyle/manual download is not killed. |
+| `NO_FALLBACK` | `CFG_NO_FALLBACK="0"` | Set `1` to not retry unfiltered when a targeted call fails. |
+| `DRY_RUN` | `CFG_DRY_RUN="0"` | Set `1` to inventory + run `RUM --action=list` only; install nothing. |
+| `IGNORE_HELPERS` | `CFG_IGNORE_HELPERS="1"` | Set `0` to treat Adobe background helper/XPC processes as blockers (strict behavior). |
 
 ## remediate-ruby-gem.sh
 Generic vulnerable-gem remediator. Accepts, in precedence order, **positional args > environment variables > in-script `CONFIG` block**.
