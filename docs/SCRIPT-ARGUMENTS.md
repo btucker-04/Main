@@ -184,11 +184,14 @@ Removes the Microsoft 3D Viewer Store app.
 | `-DryRun` | switch | off | Report what would be removed without removing anything. |
 
 ## Fix-InsecureServicePermissions.ps1
-Tightens loose `Users` ACLs on the flagged SolidWorks service directories.
+Tightens loose Everyone / Users / Domain Users / Authenticated Users ACLs on **discovered** service-executable directories (Nessus plugin 65057). Default run walks `HKLM:\SYSTEM\CurrentControlSet\Services`, skips Windows / Defender / WindowsApps, and only changes the folder that contains the `.exe` (e.g. swissQprint `...\mariadb-<ver>\bin`, not the vendor tree). Empty EC arguments = full discovery. Optional `-Service MariaDB` limits the run to that service (recommended first pass on OT / shop-floor hosts).
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
 | `-DryRun` | switch | off | Show current ACLs and what would change, without modifying anything. |
+| `-Path` | string | `''` | Semicolon-separated extra directories to consider in addition to discovery. |
+| `-Service` | string | `''` | Semicolon-separated service-name filter (registry / Win32 name, wildcards allowed). Empty = all non-protected services. |
+| `-IncludeMicrosoft` | switch | off | Also consider services under Windows / Defender / WindowsApps (normally skipped). |
 
 ## Get-DotNetDependencyReferences.ps1
 Read-only: lists MSI dependency providers holding references on old .NET versions.
