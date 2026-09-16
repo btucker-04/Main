@@ -163,6 +163,8 @@ Quotes service `ImagePath` values that contain unquoted spaces. Requires adminis
 ## Remove-DotNetEolChannel.ps1
 Removes an end-of-support .NET runtime channel. With no `-DotNetN` switch the target is major 6. Multiple `-DotNetN` switches in one run are processed independently.
 
+Inventory and verification cover ARP, `shared\`/`host\fxr\`/`sdk\` folders, `dotnet --list-runtimes`, **SWID tags** (`<root>\swidtag`) and **host binary file versions**. The last two matter when an uninstall returns 1612 (cached MSI missing) and removes no files: the ARP key can end up stripped while a four-part file version such as `6.0.18.32522` still satisfies plugin 172179 (CSLT-020). `<root>\dotnet.exe` is the shared muxer and is never deleted — repair or reinstall the newest .NET Host instead.
+
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
 | `-Major` | int | `6` | The .NET major channel to remove. Local/terminal use only (do not pass a valued parameter through EC). Ignored when any `-DotNetN` switch is set. |
@@ -172,7 +174,7 @@ Removes an end-of-support .NET runtime channel. With no `-DotNetN` switch the ta
 | `-DotNet8` | switch | off | Remove the .NET 8 channel. Bare switch for EC. .NET 8 is in support until 2026-11-10; the script warns and proceeds. |
 | `-DotNet9` | switch | off | Remove the .NET 9 channel. Bare switch for EC. |
 | `-Force` | switch | off | Proceed even if a non-Microsoft (or other-major) product holds a WiX dependency on this channel. Will break that app — confirm with the owner first. |
-| `-RemoveStaleFolders` | switch | off | After uninstall, delete leftover `shared\`/`host\fxr\` folders and orphan Package Cache installers for this major when no live *foreign* dependent remains. |
+| `-RemoveStaleFolders` | switch | off | After uninstall, delete leftover `shared\`/`host\fxr\` folders, SWID tags, versioned `hostfxr.dll` files, and orphan Package Cache installers for this major when no live *foreign* dependent remains. Never deletes `<root>\dotnet.exe`. |
 | `-DryRun` | switch | off | Report what would be removed; change nothing. |
 
 ## Remove-3DViewer.ps1
@@ -201,7 +203,7 @@ Read-only: lists MSI dependency providers holding references on old .NET version
 | `-VersionMatch` | string | `10.0.3` | Version string to match in provider key names. |
 
 ## Get-DotNetArtifactInventory.ps1
-Read-only: classifies where each .NET version exists (live / cache-only / orphan). **No arguments.**
+Read-only: classifies where each .NET version exists (`LIVE` / `CACHE-ONLY` / `FILE-ONLY` / `REGISTERED-NO-PAYLOAD` / orphaned cache). Cross-references `dotnet --list-runtimes`, `shared\` folders, `host\fxr`, ARP, Package Cache, **SWID tags** and **host binary file versions**. `FILE-ONLY` is the CSLT-020 state: no runtime folder and no cached installer, but a SWID tag or `dotnet.exe`/`hostfxr.dll` file version still reports the version to plugin 172179. Run this first when an SEoL finding will not clear. **No arguments.**
 
 ## Get-VisualStudioInstallerLogs.ps1
 Read-only: dumps the tail of recent Visual Studio installer logs. **No arguments.**

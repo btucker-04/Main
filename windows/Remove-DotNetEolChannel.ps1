@@ -41,6 +41,26 @@
     parameter through EC -- use the bare switches. Multiple -DotNetN
     switches in one run are allowed (CSLT-251 needed 6 and 9 together).
 
+    CSLT-020 (2026-09-15): the run reported "RESULT: .NET 6.x is gone" and
+    exited 0, but plugin 172179 RESURFACED on the agent scan reporting
+    'C:\Program Files\dotnet\  6.0.18.32522'. Chain:
+      * 'Microsoft .NET Host - 6.0.18 (x64)' and 'Host FX Resolver - 6.0.18
+        (x64)' both returned 1612 (cached MSI missing) -- so NO FILES were
+        removed.
+      * The third pass then stripped both ARP keys registry-only, which made
+        ARP look clean while the payload stayed on disk.
+      * Verification checked ARP, shared\/host\fxr\/sdk\ folders, and
+        'dotnet --list-runtimes'. None of those cover the .NET Host's own
+        artifacts: <root>\swidtag\*.swidtag and <root>\dotnet.exe.
+        --list-runtimes reports SHARED FRAMEWORKS only, never the host or
+        muxer, and 6.0.18.32522 is a four-part FILE version, not a folder.
+    So the script now also inventories, cleans, and verifies SWID tags and
+    host binary file versions. SWID tags are ISO 19770-2 inventory records
+    (metadata only -- safe to delete). <root>\dotnet.exe is the shared muxer
+    every installed major runs through: it is reported and never deleted,
+    since removing it to clear a 6.x finding would break 9.0.20 on this host.
+    The fix there is to repair/reinstall the newest .NET Host.
+
     CSLT-251 (2026-09-09): -InstallSuccessorMajor on Update-DotNetRuntimes
     staged .NET 10 next to 9 and left 6.0.36 / 9.0.20 in place -- that
     script never deletes a major. This script is what removes them.
@@ -74,9 +94,11 @@
     channel (will break that app -- confirm with the owner first).
 
 .PARAMETER RemoveStaleFolders
-    After uninstall, delete leftover shared\ / host\fxr\ folders and orphan
-    Package Cache installers for this major when no live WiX dependent
-    remains. Same guard as Update-DotNetRuntimes: in-use folders are skipped.
+    After uninstall, delete leftover shared\ / host\fxr\ folders, SWID tags
+    (<root>\swidtag) and versioned hostfxr.dll files, plus orphan Package
+    Cache installers for this major, when no live WiX dependent remains.
+    Same guard as Update-DotNetRuntimes: in-use folders are skipped. The
+    shared muxer <root>\dotnet.exe is never deleted (exit 2 instead).
 
 .PARAMETER DryRun
     Report what would be removed; change nothing.
@@ -126,8 +148,12 @@ $script:TargetMajors = @($script:TargetMajors | Sort-Object -Unique)
 $MajorLabel = ($script:TargetMajors -join '-')
 
 $LogDir  = 'C:\Logs\CompoSecure'
-$LogFile = Join-Path $LogDir ('RemoveDotNetEol_' + $MajorLabel + '_' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '.log')
-if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
+# Concatenated, not Join-Path: Join-Path validates the drive qualifier, which
+# makes this file impossible to dot-source for unit tests off Windows.
+$LogFile = $LogDir + '\RemoveDotNetEol_' + $MajorLabel + '_' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '.log'
+if (-not (Test-Path $LogDir)) {
+    New-Item -ItemType Directory -Path $LogDir -Force -ErrorAction SilentlyContinue | Out-Null
+}
 
 $ArpPaths = @(
     'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
@@ -338,6 +364,149 @@ function Get-ChannelVersionsOnDisk {
     return $vers
 }
 
+# ---- FILE-level artifacts (CSLT-020) ---------------------------------------
+# Folder checks are not sufficient. On CSLT-020 the 6.0.18 'Host' and 'Host FX
+# Resolver' MSIs both returned 1612 (cached MSI missing), so NO files were
+# removed, yet the ARP keys were then stripped registry-only. shared\ /
+# host\fxr\ / sdk\ were all clean and 'dotnet --list-runtimes' only reports
+# SHARED FRAMEWORKS, never the host/muxer -- so the run declared success while
+# Tenable 172179 kept reporting 'C:\Program Files\dotnet\ 6.0.18.32522'.
+# 6.0.18.32522 is a four-part FILE version, not a folder name.
+
+function Test-VersionInMajor {
+    # Major must be the FIRST dotted component: '16.0.18' is not 6.x, and the
+    # internal ARP DisplayVersion scheme (48.75.61559) is never a real major.
+    param([string]$Version, [int]$Maj)
+    if ([string]::IsNullOrWhiteSpace($Version)) { return $false }
+    return ($Version.Trim() -match ('^' + $Maj + '\.\d+'))
+}
+
+function Get-VersionFromArtifactName {
+    param([string]$Name)
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $null }
+    if ($Name -match '(\d+\.\d+\.\d+)') { return $Matches[1] }
+    return $null
+}
+
+function Test-ArtifactNameInMajor {
+    param([string]$Name, [int]$Maj)
+    $v = Get-VersionFromArtifactName -Name $Name
+    if (-not $v) { return $false }
+    return (Test-VersionInMajor -Version $v -Maj $Maj)
+}
+
+function Get-VersionFromSwidContent {
+    # SWID tags are the ISO 19770-2 inventory records vendors ship precisely so
+    # scanners can identify an install without ARP.
+    param([string]$Content)
+    if ([string]::IsNullOrWhiteSpace($Content)) { return $null }
+    if ($Content -match 'version\s*=\s*"(\d+\.\d+\.\d+[^"]*)"') { return $Matches[1] }
+    return $null
+}
+
+function Test-IsSharedMuxerPath {
+    # <root>\dotnet.exe is the muxer EVERY installed major runs through.
+    # Deleting it to clear a 6.x finding would break 9.0.20 on this host.
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    return ($Path -match '(?i)\\dotnet\\dotnet\.exe$')
+}
+
+function Test-IsDeletableArtifact {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    if (Test-IsSharedMuxerPath -Path $Path) { return $false }
+    return $true
+}
+
+function Get-ChannelSwidTags {
+    param([int]$Maj)
+    $out = @()
+    foreach ($root in $DotNetRoots) {
+        $swidDir = $root + '\swidtag'
+        if (-not (Test-Path -LiteralPath $swidDir)) { continue }
+        Get-ChildItem -LiteralPath $swidDir -File -ErrorAction SilentlyContinue | ForEach-Object {
+            $hit = Test-ArtifactNameInMajor -Name $_.Name -Maj $Maj
+            if (-not $hit -and $_.Extension -eq '.swidtag') {
+                $content = Get-Content -LiteralPath $_.FullName -Raw -ErrorAction SilentlyContinue
+                $cv = Get-VersionFromSwidContent -Content $content
+                if ($cv) { $hit = Test-VersionInMajor -Version $cv -Maj $Maj }
+            }
+            if ($hit) { $out += $_.FullName }
+        }
+    }
+    return $out
+}
+
+function Get-ChannelHostFiles {
+    # Host-owned binaries whose FILE version can still report the EOL major
+    # after a 1612 uninstall. Reported, and only the non-muxer ones deleted.
+    param([int]$Maj)
+    $out = @()
+    foreach ($root in $DotNetRoots) {
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+        $candidates = @($root + '\dotnet.exe')
+        $fxr = $root + '\host\fxr'
+        if (Test-Path -LiteralPath $fxr) {
+            Get-ChildItem -LiteralPath $fxr -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+                $candidates += ($_.FullName + '\hostfxr.dll')
+            }
+        }
+        foreach ($c in $candidates) {
+            if (-not (Test-Path -LiteralPath $c)) { continue }
+            $fv = $null
+            $pv = $null
+            try {
+                $vi = (Get-Item -LiteralPath $c -ErrorAction Stop).VersionInfo
+                $fv = $vi.FileVersion
+                $pv = $vi.ProductVersion
+            } catch {
+                continue
+            }
+            if ((Test-VersionInMajor -Version $fv -Maj $Maj) -or
+                (Test-VersionInMajor -Version $pv -Maj $Maj)) {
+                $out += [pscustomobject]@{
+                    Path           = $c
+                    FileVersion    = $fv
+                    ProductVersion = $pv
+                    IsSharedMuxer  = [bool](Test-IsSharedMuxerPath -Path $c)
+                }
+            }
+        }
+    }
+    return $out
+}
+
+function Test-ChannelFullyRemoved {
+    # Single source of truth for "is this major gone". CSLT-020 passed the
+    # first three checks and still had a 6.0.18 SWID/file artifact, so the
+    # run reported success while plugin 172179 stayed up.
+    param(
+        [int]$ArpCount,
+        [int]$FolderCount,
+        [int]$SwidCount,
+        [int]$HostFileCount,
+        [bool]$StillListed
+    )
+    if ($StillListed) { return $false }
+    return ($ArpCount -eq 0 -and $FolderCount -eq 0 -and $SwidCount -eq 0 -and $HostFileCount -eq 0)
+}
+
+function Remove-FileSafe {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $true }
+    if ($DryRun) { Write-Log ('    [DRYRUN] Would delete ' + $Path); return $true }
+    try {
+        Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+        Write-Log ('    Deleted: ' + $Path)
+        return $true
+    } catch {
+        Write-Log ('    IN USE / locked, skipped: ' + $Path) -Level WARN
+        $script:NeedsHuman = $true
+        return $false
+    }
+}
+
 function Get-WixHolders {
     param([string[]]$Versions)
     $depRoot = 'HKLM:\SOFTWARE\Classes\Installer\Dependencies'
@@ -495,6 +664,18 @@ if ($folders.Count -eq 0) {
     foreach ($f in $folders) { Write-Log ('  DISK ' + $f) }
 }
 
+$swidTags = @(Get-ChannelSwidTags $Major)
+foreach ($s in $swidTags) { Write-Log ('  SWID ' + $s) }
+$hostFiles = @(Get-ChannelHostFiles $Major)
+foreach ($h in $hostFiles) {
+    $tag = if ($h.IsSharedMuxer) { '  [SHARED MUXER]' } else { '' }
+    Write-Log ('  FILE ' + $h.Path + '  [file ' + $h.FileVersion + ' / product ' + $h.ProductVersion + ']' + $tag)
+}
+if ($swidTags.Count -gt 0 -or $hostFiles.Count -gt 0) {
+    Write-Log '  NOTE: the SWID/FILE artifacts above are what plugin 172179 reads when' -Level WARN
+    Write-Log '  ARP and shared\ folders are already clean (CSLT-020).' -Level WARN
+}
+
 $versions = @(Get-ChannelVersionsOnDisk $Major)
 foreach ($e in $entries) {
     if ($e.DisplayName -match '(\d+\.\d+\.\d+)') {
@@ -533,7 +714,8 @@ if ($foreign.Count -gt 0) {
     Write-Log '  -Force set: continuing anyway.' -Level WARN
 }
 
-if ($entries.Count -eq 0 -and $folders.Count -eq 0) {
+if ($entries.Count -eq 0 -and $folders.Count -eq 0 -and
+    $swidTags.Count -eq 0 -and $hostFiles.Count -eq 0) {
     Write-Log ''
     Write-Log ('Nothing to remediate -- .NET ' + $Major + '.x is not present.')
     return 0
@@ -589,9 +771,11 @@ if ($leftArp.Count -gt 0 -and -not $DryRun) {
 
 # ------------------------------------------------------------------
 Write-Log ''
-Write-Log '[4/5] Leftover folders / Package Cache'
+Write-Log '[4/5] Leftover folders / SWID tags / host files / Package Cache'
 $leftFolders = @(Get-ChannelFolders $Major)
 $leftArp     = @(Get-ChannelArp $Major)
+$leftSwid    = @(Get-ChannelSwidTags $Major)
+$leftHost    = @(Get-ChannelHostFiles $Major)
 $leftVers    = @(Get-ChannelVersionsOnDisk $Major)
 $liveHold    = @()
 if ($leftVers.Count -gt 0) {
@@ -601,8 +785,9 @@ if ($leftVers.Count -gt 0) {
     })
 }
 
-if ($leftFolders.Count -eq 0 -and $leftArp.Count -eq 0) {
-    Write-Log '  No leftover ARP or runtime folders for this channel.'
+if ($leftFolders.Count -eq 0 -and $leftArp.Count -eq 0 -and
+    $leftSwid.Count -eq 0 -and $leftHost.Count -eq 0) {
+    Write-Log '  No leftover ARP, runtime folders, SWID tags or host files for this channel.'
 } elseif (-not $RemoveStaleFolders) {
     if ($leftFolders.Count -gt 0) {
         Write-Log '  Payload folders remain. Tenable plugin 172179 keys on folder presence,' -Level WARN
@@ -616,6 +801,12 @@ if ($leftFolders.Count -eq 0 -and $leftArp.Count -eq 0) {
         foreach ($e in $leftArp) { Write-Log ('    ' + $e.DisplayName) -Level WARN }
         $script:UninstallFail = $true
     }
+    if ($leftSwid.Count -gt 0 -or $leftHost.Count -gt 0) {
+        Write-Log '  SWID tags / host files remain -- re-run with -RemoveStaleFolders.' -Level WARN
+        foreach ($s in $leftSwid) { Write-Log ('    ' + $s) -Level WARN }
+        foreach ($h in $leftHost) { Write-Log ('    ' + $h.Path) -Level WARN }
+        $script:UninstallFail = $true
+    }
 } else {
     if ($liveHold.Count -gt 0 -and -not $Force) {
         Write-Log '  REFUSING -RemoveStaleFolders -- live dependency holders remain:' -Level ERROR
@@ -623,6 +814,32 @@ if ($leftFolders.Count -eq 0 -and $leftArp.Count -eq 0) {
         $script:NeedsHuman = $true
     } else {
         foreach ($f in $leftFolders) { Remove-FolderSafe $f | Out-Null }
+
+        # SWID tags are inventory metadata only -- nothing executes them, so
+        # deleting the EOL major's tags cannot break a supported runtime.
+        foreach ($s in $leftSwid) {
+            Write-Log ('  SWID tag: ' + $s)
+            Remove-FileSafe $s | Out-Null
+        }
+
+        # Host files: versioned hostfxr.dll under host\fxr\<ver> belongs to the
+        # EOL major alone. <root>\dotnet.exe is shared by every major and is
+        # never deleted -- the fix there is to repair/reinstall the NEWEST
+        # .NET Host so the muxer's file version moves off the EOL major.
+        foreach ($h in $leftHost) {
+            if (Test-IsDeletableArtifact -Path $h.Path) {
+                Write-Log ('  Host file: ' + $h.Path + '  [' + $h.FileVersion + ']')
+                Remove-FileSafe $h.Path | Out-Null
+            } else {
+                Write-Log ('  SHARED MUXER still reports ' + $Major + '.x: ' + $h.Path) -Level WARN
+                Write-Log ('    file ' + $h.FileVersion + ' / product ' + $h.ProductVersion) -Level WARN
+                Write-Log '    NOT deleted -- every installed major runs through this binary.' -Level WARN
+                Write-Log '    Repair/reinstall the newest .NET Host (x64 and/or x86) so the' -Level WARN
+                Write-Log '    muxer version moves forward, then re-scan.' -Level WARN
+                $script:NeedsHuman = $true
+            }
+        }
+
         # Orphan Package Cache installers for this major (CACHE-ONLY artifacts
         # have been observed to keep a Tenable version finding alive).
         $cacheRoot = 'C:\ProgramData\Package Cache'
@@ -645,6 +862,8 @@ Write-Log ''
 Write-Log '[5/5] Verify'
 $finalArp     = @(Get-ChannelArp $Major)
 $finalFolders = @(Get-ChannelFolders $Major)
+$finalSwid    = @(Get-ChannelSwidTags $Major)
+$finalHost    = @(Get-ChannelHostFiles $Major)
 $stillListed  = $false
 foreach ($root in $DotNetRoots) {
     $exe = Join-Path $root 'dotnet.exe'
@@ -666,9 +885,14 @@ if ($DryRun) {
     return 0
 }
 
-if ($finalArp.Count -eq 0 -and $finalFolders.Count -eq 0 -and -not $stillListed) {
-    Write-Log ('RESULT: .NET ' + $Major + '.x is gone (ARP, folders, and dotnet --list-runtimes).')
-    Write-Log 'Re-run a Nessus scan to confirm plugin 172179 / 172178 clear. They key on folder presence.'
+Write-Log ('  SWID tags for ' + $Major + '.x remaining : ' + $finalSwid.Count)
+Write-Log ('  Host files for ' + $Major + '.x remaining: ' + $finalHost.Count)
+
+if (Test-ChannelFullyRemoved -ArpCount $finalArp.Count -FolderCount $finalFolders.Count `
+        -SwidCount $finalSwid.Count -HostFileCount $finalHost.Count -StillListed $stillListed) {
+    Write-Log ('RESULT: .NET ' + $Major + '.x is gone (ARP, folders, SWID tags, host file versions,')
+    Write-Log '        and dotnet --list-runtimes).'
+    Write-Log 'Re-run a Nessus scan to confirm plugin 172179 / 172178 clear.'
     if ($script:Reboot) { return 3010 }
     return 0
 }
@@ -685,11 +909,31 @@ if ($finalFolders.Count -gt 0) {
 if ($stillListed) {
     Write-Log '  dotnet --list-runtimes still reports this major.' -Level ERROR
 }
+if ($finalSwid.Count -gt 0) {
+    Write-Log '  Remaining SWID tags (plugin 172179 reads these even with ARP clean):' -Level ERROR
+    foreach ($s in $finalSwid) { Write-Log ('    ' + $s) -Level ERROR }
+    Write-Log '  Re-run with -RemoveStaleFolders to delete them.' -Level ERROR
+}
+if ($finalHost.Count -gt 0) {
+    Write-Log '  Remaining host files reporting this major:' -Level ERROR
+    foreach ($h in $finalHost) {
+        $tag = if ($h.IsSharedMuxer) { '  [SHARED MUXER -- repair newest .NET Host]' } else { '' }
+        Write-Log ('    ' + $h.Path + '  [file ' + $h.FileVersion + ']' + $tag) -Level ERROR
+    }
+}
+if (@(Test-PendingReboot).Count -gt 0) {
+    Write-Log '  A reboot is still pending. Files scheduled via' -Level WARN
+    Write-Log '  PendingFileRenameOperations are not gone until it happens -- reboot,' -Level WARN
+    Write-Log '  then re-run this script before re-scanning.' -Level WARN
+}
 if ($script:NeedsHuman) { return 2 }
 return 1
 }
 
 # ------------------------------------------------------------------
+# Unit tests dot-source this file for the helpers above; stop before the run.
+if ($env:REMOVE_DOTNET_EOL_DOTSOURCE -eq '1') { return }
+
 Write-Log '=============================================='
 Write-Log (' Remove-DotNetEolChannel -- plugin 172179/172178 -- .NET ' + $MajorLabel + '.x')
 Write-Log (' Host   : ' + $env:COMPUTERNAME)
