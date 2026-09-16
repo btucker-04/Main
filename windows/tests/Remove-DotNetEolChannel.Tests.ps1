@@ -84,6 +84,21 @@ Assert-True (-not (Test-ChannelFullyRemoved -ArpCount 0 -FolderCount 1 -SwidCoun
 Assert-True (-not (Test-ChannelFullyRemoved -ArpCount 0 -FolderCount 0 -SwidCount 0 -HostFileCount 0 -StillListed $true)) `
     'list-runtimes hit still fails'
 
+# --- Never leave an empty host\fxr\<ver> folder (CSPRLT-94) ------------------
+# dotnet.exe picks the HIGHEST host\fxr\<ver> directory and loads hostfxr.dll
+# from it. A folder that exists with no hostfxr.dll inside breaks the muxer
+# outright: "the required library hostfxr.dll could not be found in
+# [C:\Program Files\dotnet\host\fxr\8.0.21]". So a versioned hostfxr.dll is
+# removed by deleting its PARENT FOLDER, never the lone file.
+Assert-Eq (Get-HostFileRemovalTarget -Path 'C:\Program Files\dotnet\host\fxr\6.0.18\hostfxr.dll') `
+    'C:\Program Files\dotnet\host\fxr\6.0.18' `
+    'versioned hostfxr removal targets the parent folder'
+Assert-Eq (Get-HostFileRemovalTarget -Path 'C:\Program Files (x86)\dotnet\host\fxr\6.0.18\hostfxr.dll') `
+    'C:\Program Files (x86)\dotnet\host\fxr\6.0.18' `
+    'x86 versioned hostfxr targets its parent folder'
+Assert-Eq (Get-HostFileRemovalTarget -Path 'C:\Program Files\dotnet\dotnet.exe') $null `
+    'shared muxer has no removal target'
+
 # --- Integration: real Get-ChannelSwidTags against a simulated dotnet root ---
 # Exercises Test-Path / Get-ChildItem / name match / XML-content fallback, not
 # just the pure string helpers. The script builds paths with a literal '\', so

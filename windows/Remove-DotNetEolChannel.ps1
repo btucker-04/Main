@@ -419,6 +419,25 @@ function Test-IsDeletableArtifact {
     return $true
 }
 
+function Get-HostFileRemovalTarget {
+    # What to actually delete for a host file, or $null if nothing may be.
+    #
+    # CSPRLT-94 (2026-09-16) showed why this matters: dotnet.exe picks the
+    # HIGHEST host\fxr\<ver> directory and loads hostfxr.dll out of it. A
+    # directory that exists with no hostfxr.dll inside does not get skipped --
+    # it breaks the muxer for EVERY major:
+    #   "the required library hostfxr.dll could not be found in
+    #    [C:\Program Files\dotnet\host\fxr\8.0.21]"
+    # and then 'dotnet --list-runtimes' returns nothing at all. So a versioned
+    # hostfxr.dll is removed by deleting its PARENT FOLDER, never the file on
+    # its own.
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+    if (-not (Test-IsDeletableArtifact -Path $Path)) { return $null }
+    if ($Path -match '(?i)^(.*\\host\\fxr\\[^\\]+)\\hostfxr\.dll$') { return $Matches[1] }
+    return $Path
+}
+
 function Get-ChannelSwidTags {
     param([int]$Maj)
     $out = @()
@@ -445,7 +464,8 @@ function Get-ChannelHostFiles {
     $out = @()
     foreach ($root in $DotNetRoots) {
         if (-not (Test-Path -LiteralPath $root)) { continue }
-        $candidates = @($root + '\dotnet.exe')
+        $candidates = @()
+        $candidates += ($root + '\dotnet.exe')
         $fxr = $root + '\host\fxr'
         if (Test-Path -LiteralPath $fxr) {
             Get-ChildItem -LiteralPath $fxr -Directory -ErrorAction SilentlyContinue | ForEach-Object {
@@ -827,9 +847,17 @@ if ($leftFolders.Count -eq 0 -and $leftArp.Count -eq 0 -and
         # never deleted -- the fix there is to repair/reinstall the NEWEST
         # .NET Host so the muxer's file version moves off the EOL major.
         foreach ($h in $leftHost) {
-            if (Test-IsDeletableArtifact -Path $h.Path) {
+            $target = Get-HostFileRemovalTarget -Path $h.Path
+            if ($target) {
                 Write-Log ('  Host file: ' + $h.Path + '  [' + $h.FileVersion + ']')
-                Remove-FileSafe $h.Path | Out-Null
+                if ($target -ne $h.Path) {
+                    # Deleting the folder, not the lone DLL: an empty
+                    # host\fxr\<ver> directory breaks dotnet.exe (CSPRLT-94).
+                    Write-Log ('    Removing the whole resolver folder: ' + $target)
+                    Remove-FolderSafe $target | Out-Null
+                } else {
+                    Remove-FileSafe $h.Path | Out-Null
+                }
             } else {
                 Write-Log ('  SHARED MUXER still reports ' + $Major + '.x: ' + $h.Path) -Level WARN
                 Write-Log ('    file ' + $h.FileVersion + ' / product ' + $h.ProductVersion) -Level WARN
