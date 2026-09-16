@@ -179,6 +179,66 @@ if (Test-Path $pcRoot) {
 if ($cacheRows.Count -eq 0) { Write-Log '  No .NET bundles found in Package Cache.' }
 
 # ------------------------------------------------------------------
+# 6. SWID tags -- ISO 19770-2 inventory records under <root>\swidtag.
+#    These survive a failed (1612) MSI uninstall and are read by scanners
+#    even when ARP and shared\ are already clean (CSLT-020).
+# ------------------------------------------------------------------
+Write-Log ''
+Write-Log '[6] <root>\swidtag -- SWID inventory tags'
+$swidFound = 0
+foreach ($r in $roots) {
+    $swidDir = $r.Path + '\swidtag'
+    if (-not (Test-Path -LiteralPath $swidDir)) { continue }
+    Get-ChildItem -LiteralPath $swidDir -File -ErrorAction SilentlyContinue | ForEach-Object {
+        $ver = ''
+        if ($_.Name -match '(\d+\.\d+\.\d+)') {
+            $ver = $matches[1]
+        } else {
+            $content = Get-Content -LiteralPath $_.FullName -Raw -ErrorAction SilentlyContinue
+            if ($content -match 'version\s*=\s*"(\d+\.\d+\.\d+)') { $ver = $matches[1] }
+        }
+        Write-Log ('  ' + $r.Arch + '  ' + $_.Name + '   version=' + $ver)
+        Note $ver 'SWIDTAG' ($r.Arch + ' ' + $_.Name)
+        $swidFound++
+    }
+}
+if ($swidFound -eq 0) { Write-Log '  (no swidtag directory or no tags)' }
+
+# ------------------------------------------------------------------
+# 7. Host binary FILE versions. 'dotnet --list-runtimes' reports SHARED
+#    FRAMEWORKS only -- never the muxer or resolver -- so an EOL host left
+#    behind by a failed uninstall is invisible to sections 1-3.
+# ------------------------------------------------------------------
+Write-Log ''
+Write-Log '[7] host binary file versions (dotnet.exe / hostfxr.dll)'
+$hostFound = 0
+foreach ($r in $roots) {
+    if (-not (Test-Path -LiteralPath $r.Path)) { continue }
+    $candidates = @($r.Path + '\dotnet.exe')
+    $fxrDir = $r.Path + '\host\fxr'
+    if (Test-Path -LiteralPath $fxrDir) {
+        Get-ChildItem -LiteralPath $fxrDir -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            $candidates += ($_.FullName + '\hostfxr.dll')
+        }
+    }
+    foreach ($c in $candidates) {
+        if (-not (Test-Path -LiteralPath $c)) { continue }
+        $vi = (Get-Item -LiteralPath $c -ErrorAction SilentlyContinue).VersionInfo
+        if (-not $vi) { continue }
+        $pv = [string]$vi.ProductVersion
+        $shortVer = ''
+        if ($pv -match '^(\d+\.\d+\.\d+)') { $shortVer = $matches[1] }
+        $isMuxer = ($c -match '(?i)\\dotnet\\dotnet\.exe$')
+        $tag = if ($isMuxer) { '  [SHARED MUXER -- used by every major]' } else { '' }
+        Write-Log ('  ' + $r.Arch + '  ' + $c)
+        Write-Log ('        file=' + $vi.FileVersion + '  product=' + $pv + $tag)
+        Note $shortVer 'HOST-FILE' ($r.Arch + ' ' + (Split-Path $c -Leaf) + ' file=' + $vi.FileVersion)
+        $hostFound++
+    }
+}
+if ($hostFound -eq 0) { Write-Log '  (no host binaries found)' }
+
+# ------------------------------------------------------------------
 # Cross-reference and classify
 # ------------------------------------------------------------------
 Write-Log ''
@@ -187,17 +247,20 @@ Write-Log ' PER-VERSION CLASSIFICATION'
 Write-Log '=============================================='
 $cacheOnly = @()
 $orphanCache = @()
+$fileOnly = @()
 
 foreach ($ver in ($seen.Keys | Sort-Object { [version]$_ })) {
     $where = ($seen[$ver].Where | Sort-Object -Unique)
     $isLive  = ($where -contains 'RUNTIME-FOLDER') -or ($where -contains 'LOADABLE')
     $inCache = ($where -contains 'PACKAGE-CACHE')
     $inArp   = ($where -contains 'ARP')
+    $inFile  = ($where -contains 'SWIDTAG') -or ($where -contains 'HOST-FILE')
 
     $class = 'LIVE'
-    if (-not $isLive -and $inCache) { $class = 'CACHE-ONLY' }
-    elseif ($isLive) { $class = 'LIVE' }
-    elseif ($inArp)  { $class = 'REGISTERED-NO-PAYLOAD' }
+    if ($isLive) { $class = 'LIVE' }
+    elseif ($inCache) { $class = 'CACHE-ONLY' }
+    elseif ($inFile)  { $class = 'FILE-ONLY' }
+    elseif ($inArp)   { $class = 'REGISTERED-NO-PAYLOAD' }
 
     Write-Log ''
     Write-Log ('  ' + $ver + '   -> ' + $class)
@@ -210,6 +273,15 @@ foreach ($ver in ($seen.Keys | Sort-Object { [version]$_ })) {
         Write-Log '     NOTE: the runtime payload is GONE; only the cached installer remains.' -Level WARN
         Write-Log '     A cached .exe/.msi is not a loadable runtime. If Tenable still reports' -Level WARN
         Write-Log '     this version, the plugin is keying on the cached installer.' -Level WARN
+    }
+    if ($class -eq 'FILE-ONLY') {
+        $fileOnly += $ver
+        Write-Log '     NOTE: no runtime folder and no cached installer -- only a SWID tag' -Level WARN
+        Write-Log '     and/or a host binary file version still reports this version. This is' -Level WARN
+        Write-Log '     the CSLT-020 state: a 1612 uninstall removed nothing, the ARP key was' -Level WARN
+        Write-Log '     stripped, and plugin 172179 keeps reporting from these files.' -Level WARN
+        Write-Log '     SWID tags are safe to delete. <root>\dotnet.exe is NOT -- repair or' -Level WARN
+        Write-Log '     reinstall the newest .NET Host so the muxer version moves forward.' -Level WARN
     }
 }
 
@@ -243,9 +315,10 @@ foreach ($ver in ($seen.Keys | Sort-Object)) {
 Write-Log ''
 Write-Log '=============================================='
 Write-Log (' CACHE-ONLY versions      : ' + $(if ($cacheOnly.Count) { $cacheOnly -join ', ' } else { 'none' }))
+Write-Log (' FILE-ONLY versions       : ' + $(if ($fileOnly.Count) { $fileOnly -join ', ' } else { 'none' }))
 Write-Log (' Orphaned cache folders   : ' + $orphanCache.Count)
 Write-Log (' CSV: ' + $CsvFile)
 Write-Log '=============================================='
 
-if ($cacheOnly.Count -gt 0 -or $orphanCache.Count -gt 0) { exit 2 }
+if ($cacheOnly.Count -gt 0 -or $orphanCache.Count -gt 0 -or $fileOnly.Count -gt 0) { exit 2 }
 exit 0
