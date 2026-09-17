@@ -325,6 +325,20 @@
       Run As              : System (MSI install/uninstall requires it)
     -DryRun to preview. Exit: 0 ok / 3010 reboot recommended / 1 failure.
 
+    CSPC-004 (2026-09-17): Phase 1c logged '[SDK 0.0 x86]' and fetched
+    https://aka.ms/dotnet/0.0/dotnet-sdk-win-x86.exe (0.2 MB, no MZ header).
+    Get-DotNetSdkEntries read $matches[1] for Major AFTER running the
+    architecture checks, and $matches is replaced by every SUCCESSFUL -match.
+    '\(x86\)' has no capture groups, so $matches[1] was $null and [int]$null
+    became 0. x64 escaped it only because both of its arch checks FAIL, and a
+    failed match leaves $matches untouched. Consequences on that host: the
+    current x86 SDK was never installed, so the stale x86 SDK 8.0.420 was
+    grouped as '0|x86' alone and judged "not superseded"; it kept its WiX hold
+    on the orphaned x86 8.0.26 runtime registrations; and Phase 2's orphan
+    removal no-op'd (exit 0, entry survived), leaving plugin 326863 open.
+    Parsing now captures the version groups into locals before any other
+    regex runs, and Install-Sdk refuses an implausible major outright.
+
     CSPRLT-94 (2026-09-16): 'dotnet --list-runtimes' failed outright with
     "the required library hostfxr.dll could not be found in
     [C:\Program Files\dotnet\host\fxr\8.0.21]". dotnet.exe resolves the
@@ -559,6 +573,15 @@ function Install-Sdk {
     # group; the removal path is unchanged and still respects the global.json
     # pin guard and -RemoveSupersededSdks gating.
     param([string]$Major, [string]$Arch)
+    # CSPC-004: a mis-parsed major reached this as 0 and burned a download on
+    # an error page. Refuse the request instead of building a dead URL.
+    $majInt = 0
+    [void][int]::TryParse(('' + $Major), [ref]$majInt)
+    if (-not (Test-PlausibleDotNetMajor -Major $majInt)) {
+        Write-Log ('  [SDK ' + $Major + ' ' + $Arch + '] implausible major -- refusing to build a download URL.') -Level ERROR
+        Write-Log '    This means the SDK DisplayName did not parse. Report the ARP DisplayName.' -Level ERROR
+        return $false
+    }
     $url  = 'https://aka.ms/dotnet/' + $Major + '.0/dotnet-sdk-win-' + $Arch + '.exe'
     $dest = Join-Path $TempDir ('dotnet-sdk-win-' + $Arch + '-' + $Major + '.exe')
     Write-Log ('  [SDK ' + $Major + '.0 ' + $Arch + '] ' + $url)
@@ -653,6 +676,41 @@ function Get-ArpRuntimeMajors {
     return $map
 }
 
+function Test-PlausibleDotNetMajor {
+    # Defence in depth for the URL builder: a major of 0 (or anything absurd)
+    # must never reach aka.ms. CSPC-004 fetched
+    # https://aka.ms/dotnet/0.0/dotnet-sdk-win-x86.exe and got a 0.2 MB
+    # non-MZ error page.
+    param([int]$Major)
+    return ($Major -ge 1 -and $Major -le 20)
+}
+
+function Get-SdkEntryFromDisplayName {
+    # CSPC-004 (2026-09-17): this parsing used to read $matches[1] for Major
+    # AFTER running the architecture checks. $matches is replaced by every
+    # SUCCESSFUL -match, and '\(x86\)' has no capture groups, so for an x86
+    # (or arm64) SDK $matches[1] was $null and [int]$null became 0. x64 was
+    # unaffected only because its arch checks both FAIL, and a failed match
+    # leaves $matches untouched. Result: 'SDK 0.0 x86' and a dead URL.
+    # The version groups are now captured into locals immediately, before any
+    # other regex runs.
+    param([string]$DisplayName)
+    if ([string]::IsNullOrWhiteSpace($DisplayName)) { return $null }
+    if ($DisplayName -notmatch '^Microsoft \.NET SDK\s+(\d+)\.(\d+)\.(\d+)') { return $null }
+    $vMajor = [int]$matches[1]
+    $vMinor = [int]$matches[2]
+    $vPatch = [int]$matches[3]
+    $arch = 'x64'
+    if ($DisplayName -match '\(x86\)')        { $arch = 'x86' }
+    elseif ($DisplayName -match '\(arm64\)')  { $arch = 'arm64' }
+    return [pscustomobject]@{
+        Name    = $DisplayName
+        Version = [version]('' + $vMajor + '.' + $vMinor + '.' + $vPatch)
+        Major   = $vMajor
+        Arch    = $arch
+    }
+}
+
 function Get-DotNetSdkEntries {
     # Full ARP entries for .NET SDKs, with parsed version and architecture.
     $paths = @(
@@ -660,16 +718,12 @@ function Get-DotNetSdkEntries {
         'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
     )
     $out = @()
-    Get-ItemProperty -Path $paths -ErrorAction SilentlyContinue |
-      Where-Object { $_.DisplayName -match '^Microsoft \.NET SDK\s+(\d+)\.(\d+)\.(\d+)' } | ForEach-Object {
-        $null = $_.DisplayName -match '^Microsoft \.NET SDK\s+(\d+)\.(\d+)\.(\d+)'
-        $ver = [version]($matches[1] + '.' + $matches[2] + '.' + $matches[3])
-        $arch = 'x64'
-        if ($_.DisplayName -match '\(x86\)') { $arch = 'x86' }
-        elseif ($_.DisplayName -match '\(arm64\)') { $arch = 'arm64' }
+    Get-ItemProperty -Path $paths -ErrorAction SilentlyContinue | ForEach-Object {
+        $parsed = Get-SdkEntryFromDisplayName -DisplayName $_.DisplayName
+        if (-not $parsed) { return }
         $out += [pscustomobject]@{
-            Name = $_.DisplayName; Version = $ver; Major = [int]$matches[1]
-            Arch = $arch; Entry = $_
+            Name = $parsed.Name; Version = $parsed.Version; Major = $parsed.Major
+            Arch = $parsed.Arch; Entry = $_
         }
     }
     return $out

@@ -84,6 +84,46 @@ try {
     Remove-Item -LiteralPath $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+# --- SDK DisplayName parsing (CSPC-004) -------------------------------------
+# The arch check used to run BETWEEN capturing the version groups and reading
+# $matches[1] for Major. A successful '\(x86\)' match replaces $matches with a
+# group-less collection, so Major came out 0 for x86/arm64 -- which built the
+# URL https://aka.ms/dotnet/0.0/dotnet-sdk-win-x86.exe.
+$x64 = Get-SdkEntryFromDisplayName -DisplayName 'Microsoft .NET SDK 8.0.425 (x64)'
+Assert-Eq $x64.Major 8 'x64 SDK major'
+Assert-Eq $x64.Arch 'x64' 'x64 SDK arch'
+Assert-Eq $x64.Version '8.0.425' 'x64 SDK version'
+
+$x86 = Get-SdkEntryFromDisplayName -DisplayName 'Microsoft .NET SDK 8.0.420 (x86)'
+Assert-Eq $x86.Major 8 'x86 SDK major is 8, not 0 (the CSPC-004 bug)'
+Assert-Eq $x86.Arch 'x86' 'x86 SDK arch'
+Assert-Eq $x86.Version '8.0.420' 'x86 SDK version'
+
+$arm = Get-SdkEntryFromDisplayName -DisplayName 'Microsoft .NET SDK 10.0.101 (arm64)'
+Assert-Eq $arm.Major 10 'arm64 SDK major is 10, not 0'
+Assert-Eq $arm.Arch 'arm64' 'arm64 SDK arch'
+Assert-Eq $arm.Version '10.0.101' 'arm64 SDK version'
+
+# No arch suffix at all defaults to x64 and must still parse the major.
+$bare = Get-SdkEntryFromDisplayName -DisplayName 'Microsoft .NET SDK 9.0.304'
+Assert-Eq $bare.Major 9 'bare SDK major'
+Assert-Eq $bare.Arch 'x64' 'bare SDK defaults to x64'
+
+Assert-Eq (Get-SdkEntryFromDisplayName -DisplayName 'Microsoft .NET Runtime - 8.0.31 (x86)') $null `
+    'a runtime entry is not an SDK'
+Assert-Eq (Get-SdkEntryFromDisplayName -DisplayName '') $null 'empty DisplayName'
+
+# Grouping key must put both 8.x SDKs in comparable groups by arch.
+Assert-Eq ('' + $x86.Major + '|' + $x86.Arch) '8|x86' 'x86 grouping key is 8|x86, not 0|x86'
+
+# --- Install-Sdk must refuse an implausible major ---------------------------
+# Defence in depth: even if a parse regresses, never request a 0.0 URL.
+Assert-True (-not (Test-PlausibleDotNetMajor -Major 0)) 'major 0 rejected'
+Assert-True (-not (Test-PlausibleDotNetMajor -Major -1)) 'negative major rejected'
+Assert-True (-not (Test-PlausibleDotNetMajor -Major 99)) 'absurd major rejected'
+Assert-True (Test-PlausibleDotNetMajor -Major 8) 'major 8 accepted'
+Assert-True (Test-PlausibleDotNetMajor -Major 10) 'major 10 accepted'
+
 # --- Integration: Get-InstalledMap against a muxer that cannot load hostfxr --
 # Before this change the map came back EMPTY for such a root, which every
 # later phase reads as "no .NET installed here".
