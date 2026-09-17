@@ -106,6 +106,14 @@ Downloads and installs the latest Chrome enterprise MSI.
 ## Get-DriveInventory.ps1
 Read-only drive/storage inventory. **No arguments.**
 
+## Test-ScriptIntegrity.ps1
+Read-only: verifies a PowerShell script file is intact and parseable. Run it against the Endpoint Central agent's cached copy when a deployed script fails with parse errors the repository copy does not have (CSPC-004: the deployed `Update-DotNetRuntimes.ps1` contained a second copy of itself, so its header documentation was parsed as code). Reports `PARSE`, `UNBALANCED` (block-comment delimiter counts differ) and `DUPLICATE` (more than one `.SYNOPSIS` or `[CmdletBinding]`).
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `-Path` | string | folder holding the script | File or directory to check. For a suspect deployment pass the agent's `...\UEMS_Agent\Computer\startup\<id>` folder. |
+| `-Recurse` | switch | off | Recurse into subdirectories when `-Path` is a directory. |
+
 ## Stop-NessusAgentService.ps1
 Pre-install helper that stops the Nessus Agent service before an MSI upgrade. **No arguments.** Requires administrator.
 
