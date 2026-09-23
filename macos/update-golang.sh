@@ -1,16 +1,25 @@
 #!/bin/bash
 # =============================================================================
-# update-golang.sh  (v1)
-# Remediates : Golang 1.25.x < 1.25.10 / 1.26.x < 1.26.3
-# Nessus Plugin ID : 314962
-# CVEs       : CVE-2026-33811, CVE-2026-39819, CVE-2026-39836,
-#              CVE-2026-42499, CVE-2026-39820, CVE-2026-39826
+# update-golang.sh  (v2)
+# Remediates : Golang N.M.x below the latest STABLE patch on that same N.M
+#              branch (plugin 327411: 1.25.x < 1.25.12 / 1.26.x < 1.26.5;
+#              also covers the older 314962 floor of 1.25.10 / 1.26.3).
 # Platform   : macOS (bash 3.2 compatible) | Deploy: Mosyle (runs as root)
 #
 # Written for CSMB-011 (2026-08-20 Tenable group export):
 #   Path              : /usr/local/go/bin/go
 #   Installed version : 1.25.9
 #   Fixed version     : 1.25.10
+#
+# v2 (CSMB-011, 2026-09-22 / plugin 327411):
+#   * v1 hardcoded FIX_125=1.25.10. After that patch landed, Tenable raised
+#     the floor to 1.25.12 and the script logged "Already >= 1.25.10" on a
+#     still-vulnerable 1.25.10 tree. Targets and tarball SHA-256s now come
+#     from https://go.dev/dl/?mode=json&include=all at run time: latest
+#     STABLE patch on the installed N.M line only (1.25.x stays on 1.25.x;
+#     never jumps to 1.26/1.27). Homebrew formula `go` (unversioned) is
+#     NOT brew-upgraded -- it tracks latest stable and would jump minors;
+#     go@N.M formulae are upgraded in place.
 #
 # Handles THREE install methods (same lesson as update-nodejs.sh v2 -- looking
 # at only Homebrew produced a false pass while /usr/local stayed vulnerable):
@@ -19,8 +28,8 @@
 #   C. gvm / asdf / per-user GOPATH toolchains     (REPORTED, never modified)
 #
 # Design:
-#   * Stays on the installed major line (1.25 -> 1.25.10, 1.26 -> 1.26.3).
-#     Never jumps a developer across majors.
+#   * Stays on the installed N.M line (1.25.x -> latest stable 1.25.y from
+#     the go.dev catalog). Never jumps a developer across minors/majors.
 #   * Official tree is replaced the way go.dev documents it: download the
 #     darwin tarball, verify SHA-256, extract to a staging dir, swap
 #     /usr/local/go. The tarball's exit code is not evidence -- `go version`
@@ -33,6 +42,7 @@
 #
 # CONFIG -- Mosyle passes no environment variables. Edit the block below
 # before paste, or pass DRY_RUN=1 / FORCE_CLOSE=1 from a terminal.
+# A terminal-set GO_DL_JSON points at a cached go.dev catalog (tests).
 # =============================================================================
 
 set -uo pipefail
@@ -42,9 +52,12 @@ export HOME
 # =============================================================================
 CFG_DRY_RUN="0"
 CFG_FORCE_CLOSE="0"
+CFG_GO_DL_URL="https://go.dev/dl/?mode=json&include=all"
 # =============================================================================
 DRY_RUN="${DRY_RUN:-$CFG_DRY_RUN}"
 FORCE_CLOSE="${FORCE_CLOSE:-$CFG_FORCE_CLOSE}"
+GO_DL_URL="${GO_DL_URL:-$CFG_GO_DL_URL}"
+GO_DL_JSON="${GO_DL_JSON:-}"
 
 LOG_DIR="/var/log/composecure"
 LOG_FILE="$LOG_DIR/golang_update.log"
@@ -52,33 +65,114 @@ WORK_DIR="/tmp/go_update_$$"
 OFFICIAL_ROOT="/usr/local/go"
 MIN_TGZ_BYTES=$((40 * 1024 * 1024))   # official darwin tarball is ~55-65 MB
 
-FIX_125="1.25.10"
-FIX_126="1.26.3"
-
-mkdir -p "$LOG_DIR"
-log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"; }
+log() {
+    line="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    if [ -d "$LOG_DIR" ]; then
+        echo "$line" | tee -a "$LOG_FILE"
+    else
+        echo "$line"
+    fi
+}
 cleanup() { rm -rf "$WORK_DIR"; }
-trap cleanup EXIT
+
+go_python() {
+    if [ -x /usr/bin/python3 ]; then
+        echo /usr/bin/python3
+    else
+        command -v python3
+    fi
+}
 
 version_ge() { [ "$(printf '%s\n' "$2" "$1" | sort -V | head -n1)" = "$2" ]; }
 
+go_branch_of() {
+    # 1.25.10 -> 1.25
+    echo "$1" | awk -F. '{ if (NF >= 2) print $1 "." $2 }'
+}
+
+ensure_go_catalog() {
+    if [ -n "$GO_DL_JSON" ] && [ -f "$GO_DL_JSON" ]; then
+        return 0
+    fi
+    mkdir -p "$WORK_DIR"
+    GO_DL_JSON="$WORK_DIR/go-dl.json"
+    if [ -f "$GO_DL_JSON" ] && [ -s "$GO_DL_JSON" ]; then
+        return 0
+    fi
+    log "  Fetching Go release catalog: $GO_DL_URL"
+    if ! curl -fL --retry 3 --retry-delay 5 -o "$GO_DL_JSON" "$GO_DL_URL" 2>>"$LOG_FILE"; then
+        log "  ERROR: could not download the go.dev catalog. If Zscaler blocks go.dev,"
+        log "         stage it and set GO_DL_JSON to the file, or use an internal mirror."
+        return 1
+    fi
+    # Proxy block pages are HTML, not JSON.
+    if ! grep -q '"version"' "$GO_DL_JSON" 2>/dev/null; then
+        log "  ERROR: catalog is not JSON (proxy block page?). Aborting."
+        return 1
+    fi
+    return 0
+}
+
+go_catalog_query() {
+    # $1 = latest  $2 = branch like 1.25
+    # $1 = sha     $2 = filename
+    op="$1"
+    arg="$2"
+    "$(go_python)" - "$op" "$arg" "$GO_DL_JSON" <<'PY'
+import json, sys
+op, arg, path = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    data = json.load(open(path))
+except Exception:
+    sys.exit(1)
+if not isinstance(data, list):
+    sys.exit(1)
+if op == 'latest':
+    prefix = 'go' + arg + '.'
+    best_n = -1
+    best = ''
+    for rel in data:
+        if not rel.get('stable'):
+            continue
+        ver = rel.get('version') or ''
+        if not ver.startswith(prefix):
+            continue
+        rest = ver[len(prefix):]
+        if not rest.isdigit():
+            continue
+        n = int(rest)
+        if n > best_n:
+            best_n = n
+            best = ver[2:]  # strip leading "go"
+    if not best:
+        sys.exit(1)
+    sys.stdout.write(best)
+    sys.exit(0)
+if op == 'sha':
+    for rel in data:
+        for f in rel.get('files') or []:
+            if f.get('filename') == arg and f.get('sha256'):
+                sys.stdout.write(f.get('sha256'))
+                sys.exit(0)
+    sys.exit(1)
+sys.exit(1)
+PY
+}
+
 required_fixed_for() {
-    case "$1" in
-        1.25.*) echo "$FIX_125" ;;
-        1.26.*) echo "$FIX_126" ;;
-        *)      echo "" ;;
-    esac
+    ver="$1"
+    [ -n "$ver" ] || { echo ""; return 0; }
+    branch=$(go_branch_of "$ver")
+    [ -n "$branch" ] || { echo ""; return 0; }
+    ensure_go_catalog || { echo ""; return 0; }
+    go_catalog_query latest "$branch" 2>/dev/null || echo ""
 }
 
 go_tarball_sha256() {
-    # Official hashes from https://go.dev/dl/ (go1.25.10 / go1.26.3).
-    case "$1" in
-        go1.25.10.darwin-arm64.tar.gz) echo "795691a425de7e7cdba3544f354dcd2cebcf52e87dc6898193878f34eb6d634f" ;;
-        go1.25.10.darwin-amd64.tar.gz) echo "52321165a3146cd91865ef98371506a846ed4dc4f9f1c9323e5ad90d2a411e06" ;;
-        go1.26.3.darwin-arm64.tar.gz)  echo "875cf54a15311eee2c99b9dd67c68c4a49351d489ab622bf2cfd28c8f2078d3c" ;;
-        go1.26.3.darwin-amd64.tar.gz)  echo "278d580b32e299fe4a9c990fcf2d02acfe538c7e551a6ee18f9c7164573d2c63" ;;
-        *) echo "" ;;
-    esac
+    name="$1"
+    [ -n "$name" ] || { echo ""; return 0; }
+    ensure_go_catalog || { echo ""; return 0; }
+    go_catalog_query sha "$name" 2>/dev/null || echo ""
 }
 
 read_go_version() {
@@ -87,16 +181,37 @@ read_go_version() {
 }
 
 realpath_of() {
-    /usr/bin/python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1" 2>/dev/null || echo "$1"
+    py=$(go_python)
+    if [ -n "$py" ]; then
+        "$py" -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1" 2>/dev/null || echo "$1"
+    else
+        echo "$1"
+    fi
 }
+
+if [ "${GO_SELFTEST:-0}" = "1" ]; then
+    return 0 2>/dev/null || exit 0
+fi
+
+mkdir -p "$LOG_DIR"
+trap cleanup EXIT
 
 VULN_SEEN=0
 VULN_REMAINING=0
 UNMANAGED_NOTE=0
 
 log "===== update-golang.sh START ====="
-log "Host: $(hostname -s 2>/dev/null || hostname)   plugin 314962"
+log "Host: $(hostname -s 2>/dev/null || hostname)   plugin 327411 (also 314962)"
 log "DryRun=$DRY_RUN  ForceClose=$FORCE_CLOSE"
+
+if [ -z "$(go_python)" ]; then
+    log "ERROR: python3 is required to parse the go.dev catalog."
+    exit 1
+fi
+if ! ensure_go_catalog; then
+    log "ERROR: cannot continue without a Go release catalog."
+    exit 1
+fi
 
 # -----------------------------------------------------------------------
 # Arch + Homebrew prefix
@@ -323,11 +438,16 @@ else
     done < <(find "$CELLAR" -mindepth 2 -maxdepth 2 -type d \( -path '*/go/*' -o -path '*/go@*/*' \) 2>/dev/null | sort)
 
     if [ "$DRY_RUN" = "1" ]; then
-        log "  [DRY_RUN] Would brew update + upgrade + cleanup for:$GO_FORMULAE"
+        log "  [DRY_RUN] Would brew update + upgrade + cleanup for versioned go@N.M formulae (not unversioned go):$GO_FORMULAE"
     elif [ -n "$BREW_USER" ]; then
         log "  brew update..."
         OUT=$(run_brew update 2>&1); log "  $OUT"
         for f in $GO_FORMULAE; do
+            if [ "$f" = "go" ]; then
+                log "  Skipping brew upgrade of unversioned formula 'go' -- it tracks latest stable and would jump N.M."
+                log "  Use go@N.M or the official /usr/local/go tree to stay on the installed branch."
+                continue
+            fi
             log "  brew upgrade $f ..."
             OUT=$(run_brew upgrade "$f" 2>&1); log "  $OUT"
             OUT=$(run_brew cleanup "$f" 2>&1); log "  cleanup $f: $OUT"
@@ -480,6 +600,6 @@ if [ "$VULN_SEEN" -eq 1 ]; then
 else
     log "RESULT: no vulnerable Go found on this host."
 fi
-log "Re-run a Nessus scan to confirm plugin 314962 clears."
+log "Re-run a Nessus scan to confirm plugin 327411 (and 314962) clears."
 log "===== update-golang.sh END ====="
 exit 0
