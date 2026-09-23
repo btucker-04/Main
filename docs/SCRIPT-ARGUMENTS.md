@@ -309,12 +309,14 @@ Updates per-user Claude Code installs under `/Users/*/.local/bin/claude` (plugin
 | `DRY_RUN` | `CFG_DRY_RUN="0"` | Set `1` to report only and change nothing. |
 
 ## update-golang.sh
-Updates Go (official tree + Homebrew; per-user managers report-only). Reads **environment variables**, with an in-script `CONFIG` block for Mosyle.
+Updates Go (official tree + Homebrew; per-user managers report-only). Each install stays on its current **N.M** line and is raised to the latest **stable** patch for that line from `https://go.dev/dl/?mode=json&include=all` (plugin 327411: 1.25.x stays 1.25.x). Unversioned Homebrew `go` is not `brew upgrade`d (it would jump minors). Reads **environment variables**, with an in-script `CONFIG` block for Mosyle.
 
 | Environment variable | CONFIG default | Description |
 |----------------------|----------------|-------------|
 | `DRY_RUN` | `CFG_DRY_RUN="0"` | Set `1` to report only; change nothing. |
 | `FORCE_CLOSE` | `CFG_FORCE_CLOSE="0"` | Set `1` to terminate running Go toolchain processes before swapping `/usr/local/go`. Default refuses to swap under a running compile. |
+| `GO_DL_URL` | `CFG_GO_DL_URL` (`include=all` catalog) | Catalog URL. Override only for an internal mirror. |
+| `GO_DL_JSON` | empty | Path to a cached catalog JSON (tests / air-gapped). When set to an existing file, the network fetch is skipped. |
 
 ## update-gstreamer.sh
 Upgrades Homebrew GStreamer to >= 1.28.5 and removes leftover Cellar kegs (plugins 326245 / 326246). Reads **environment variables**, with an in-script `CONFIG` block for Mosyle.
