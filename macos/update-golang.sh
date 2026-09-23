@@ -67,10 +67,9 @@ MIN_TGZ_BYTES=$((40 * 1024 * 1024))   # official darwin tarball is ~55-65 MB
 
 log() {
     line="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
-    if [ -d "$LOG_DIR" ]; then
-        echo "$line" | tee -a "$LOG_FILE"
-    else
-        echo "$line"
+    echo "$line"
+    if [ -d "$LOG_DIR" ] && { [ -w "$LOG_FILE" ] || [ -w "$LOG_DIR" ]; }; then
+        echo "$line" >> "$LOG_FILE" 2>/dev/null || true
     fi
 }
 cleanup() { rm -rf "$WORK_DIR"; }
@@ -100,7 +99,7 @@ ensure_go_catalog() {
         return 0
     fi
     log "  Fetching Go release catalog: $GO_DL_URL"
-    if ! curl -fL --retry 3 --retry-delay 5 -o "$GO_DL_JSON" "$GO_DL_URL" 2>>"$LOG_FILE"; then
+    if ! curl -fL --retry 3 --retry-delay 5 -o "$GO_DL_JSON" "$GO_DL_URL" 2>"$WORK_DIR/curl-catalog.err"; then
         log "  ERROR: could not download the go.dev catalog. If Zscaler blocks go.dev,"
         log "         stage it and set GO_DL_JSON to the file, or use an internal mirror."
         return 1
