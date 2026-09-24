@@ -119,7 +119,11 @@ Full teardown + reinstall of a broken Nessus Agent, with optional relink.
 | `-LinkGroups` | string | `''` | Agent group(s) for relink. If empty, groups are resolved per-host from the embedded prefix-rule/override map. |
 | `-LinkHost` | string | `sensor.cloud.tenable.com` | Tenable manager host. |
 | `-NoLink` | switch | off | Install without linking (skip the relink step). |
+| `-WaitForInstallerMinutes` | int | `0` | How long to wait for a concurrent Windows Installer operation (`Global\_MSIExecute` held) to finish before giving up with exit 2. `0` checks once. Nothing is torn down while waiting, so raising this is safe; keep it under the EC script timeout. |
+| `-IgnoreConcurrentMsi` | switch | off | Tear down even though another install holds the installer mutex. **Dangerous:** the teardown is destructive, so a reinstall that then fails with 1618 leaves the host with no agent. Use only when the mutex holder is known to be stuck. |
 | `-DryRun` | switch | off | Log every action without changing anything. |
+
+The pre-flight tests whether the installer mutex is *held*, not merely whether it exists — an idle `msiexec` service process keeps the object alive, which previously made the check report "install in progress" permanently (CSLT-192).
 
 ## Repair-NessusAgent.ps1
 Checks agent state and fixes only what is broken (installs if missing, ensures service running, links/relinks).
