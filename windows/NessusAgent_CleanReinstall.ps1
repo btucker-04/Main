@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Clean teardown + reinstall of a broken Nessus Agent install (v4.2).
+    Clean teardown + reinstall of a broken Nessus Agent install (v4.3).
     Handles every broken state catalogued so far: dual product codes,
     orphaned Installer-DB registrations (1612), orphaned processes
     holding DB locks, and stale ARP entries.
@@ -27,6 +27,27 @@
     five installed 11.2.2 and linked successfully, EC reported Succeeded, and
     Tenable still showed 11.1.0 days later. Exit 0 must mean "installed, linked,
     and able to report".
+
+    v4.3 (from the 2026-09-24 CSLT-192 run): the v4.1 pre-flight refused to
+    start on a host where nothing was actually installing.
+      * FALSE POSITIVE. Test-MsiInProgress called Mutex::OpenExisting and
+        treated "the handle opened" as "an install is running". The
+        Global\_MSIExecute OBJECT exists for as long as ANY process holds a
+        handle to it -- including the long-lived msiexec /V service process --
+        so on a busy host the check could never return false, and the script
+        exited 2 on every attempt. Windows Installer signals contention by
+        OWNING the mutex, so the check now acquires it with WaitOne(0):
+        acquired (or abandoned by a dead owner) means nothing is executing.
+        The mutex is released immediately; it is only ever probed.
+      * -WaitForInstallerMinutes <n> waits for a genuine concurrent install to
+        finish instead of failing the deployment. Nothing is torn down while
+        waiting, so a timeout is still a safe exit 2.
+      * -IgnoreConcurrentMsi overrides the guard outright. This is the
+        dangerous option and is never the default: if the install then hits
+        1618, the teardown has already run and the host has NO AGENT.
+      * The process list in the log is labelled as informational. An idle
+        msiexec service process and a running TrustedInstaller are normal and
+        do not by themselves mean an install is in progress.
 
     v4.1 (from the 2026-08-07 CSLT-215 runs):
       * PRE-FLIGHT MUTEX CHECK. The teardown is destructive -- it purges both
@@ -74,6 +95,18 @@
 .PARAMETER LinkHost
     Manager host. Default sensor.cloud.tenable.com (Tenable VM cloud).
 
+.PARAMETER WaitForInstallerMinutes
+    How long to wait for a concurrent Windows Installer operation to finish
+    before giving up. 0 (default) checks once and exits 2 if busy. Nothing is
+    torn down while waiting, so this is safe to raise; keep it below the
+    Endpoint Central script timeout.
+
+.PARAMETER IgnoreConcurrentMsi
+    Run the teardown even though another install holds the Windows Installer
+    mutex. DANGEROUS: the teardown is destructive and the reinstall can then
+    fail with 1618, leaving the host with no agent at all. Use only when the
+    mutex holder is known to be stuck and the guard is the only blocker.
+
 .PARAMETER DryRun
     Log every action without changing anything.
 
@@ -98,6 +131,8 @@ param(
     [string]$LinkGroups = '',
     [string]$LinkHost   = 'sensor.cloud.tenable.com',
     [switch]$NoLink,
+    [int]$WaitForInstallerMinutes = 0,
+    [switch]$IgnoreConcurrentMsi,
     [switch]$DryRun
 )
 
@@ -194,8 +229,7 @@ function Resolve-AgentGroups {
 $ErrorActionPreference = 'Stop'
 
 $LogDir  = 'C:\Logs\CompoSecure'
-$LogFile = Join-Path $LogDir ('NessusAgent_CleanReinstall_' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '.log')
-if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
+$LogFile = $LogDir + '\NessusAgent_CleanReinstall_' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '.log'
 
 function Write-Log {
     param([string]$Msg, [string]$Level = 'INFO')
@@ -204,17 +238,65 @@ function Write-Log {
     Add-Content -Path $LogFile -Value $line -ErrorAction SilentlyContinue
 }
 function Test-MsiInProgress {
-    # Canonical check: Windows Installer holds Global\_MSIExecute for the
-    # duration of an install or uninstall. If it can be opened, something is busy.
+    # Windows Installer signals "an install or uninstall is executing" by
+    # OWNING Global\_MSIExecute, not by the object existing: the object stays
+    # alive as long as any process holds a handle, and the msiexec /V service
+    # process is always running on a live host. CSLT-192 exited 2 on every
+    # attempt because an existence check can never go false there. Acquire it
+    # with a zero timeout instead, then release it straight away -- this only
+    # probes the mutex, it never holds it against a real installer.
+    param([string]$MutexName = 'Global\_MSIExecute')
     try {
-        $m = [System.Threading.Mutex]::OpenExisting('Global\_MSIExecute')
-        $m.Dispose()
-        return $true
+        $m = [System.Threading.Mutex]::OpenExisting($MutexName)
     } catch [System.Threading.WaitHandleCannotBeOpenedException] {
         return $false
+    } catch [System.UnauthorizedAccessException] {
+        # It exists but this context cannot probe it. Cannot prove it is free.
+        return $true
     } catch {
         return $false
     }
+    try {
+        $owned = $false
+        try {
+            $owned = $m.WaitOne(0, $false)
+        } catch [System.Threading.AbandonedMutexException] {
+            # The previous owner died without releasing: nothing is executing,
+            # and the wait handed ownership to us.
+            $owned = $true
+        }
+        if ($owned) {
+            $m.ReleaseMutex()
+            return $false
+        }
+        return $true
+    } finally {
+        $m.Dispose()
+    }
+}
+
+function Wait-MsiAvailable {
+    # Poll until the concurrent installer finishes. Returns $true if the
+    # installer mutex came free within the budget. Waiting is safe: the
+    # destructive teardown has not started yet.
+    param(
+        [double]$TimeoutMinutes,
+        [int]$PollSeconds = 30,
+        [string]$MutexName = 'Global\_MSIExecute'
+    )
+    if (-not (Test-MsiInProgress -MutexName $MutexName)) { return $true }
+    if ($TimeoutMinutes -le 0) { return $false }
+    $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds $PollSeconds
+        if (-not (Test-MsiInProgress -MutexName $MutexName)) {
+            Write-Log '  Concurrent installer finished.'
+            return $true
+        }
+        $left = [math]::Round(($deadline - (Get-Date)).TotalMinutes, 1)
+        if ($left -gt 0) { Write-Log ('    still busy; ' + $left + ' minute(s) of wait budget left...') }
+    }
+    return (-not (Test-MsiInProgress -MutexName $MutexName))
 }
 
 function Get-OtherInstallerProcesses {
@@ -304,6 +386,11 @@ function Convert-CompressedGuid {
     return '{' + $p1 + '-' + $p2 + '-' + $p3 + '-' + $p4 + '-' + $p5 + '}'
 }
 
+# Unit tests dot-source this file for the helpers above; stop before the run.
+if ($env:NESSUS_CLEANREINSTALL_DOTSOURCE -eq '1') { return }
+
+if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
+
 $ServiceNames = @('Nessus Agent', 'Tenable Nessus Agent')
 $ProcNames    = @('nessusd', 'nessus-service', 'nessusagent')
 $ProgramDir   = 'C:\Program Files\Tenable\Nessus Agent'
@@ -312,7 +399,7 @@ $RebootNeeded = $false
 $NoGroup      = $false
 
 Write-Log '=============================================='
-Write-Log ' Nessus Agent Clean Reinstall (v4.2)'
+Write-Log ' Nessus Agent Clean Reinstall (v4.3)'
 Write-Log (' Host   : ' + $env:COMPUTERNAME)
 Write-Log (' DryRun : ' + $DryRun)
 Write-Log (' Relink : ' + ((-not $NoLink) -and ($LinkKey -ne '')))
@@ -339,17 +426,33 @@ Write-Log ('  Target MSI : ' + $MsiPath)
 # ==============================================================
 Write-Log ''
 Write-Log '[0b] Pre-flight: checking for a concurrent MSI operation...'
-if (Test-MsiInProgress) {
-    Write-Log '  Another Windows Installer operation is IN PROGRESS (Global\_MSIExecute held).' -Level WARN
+$MsiBusy = Test-MsiInProgress
+if ($MsiBusy -and $WaitForInstallerMinutes -gt 0) {
+    Write-Log ('  Installer busy. Waiting up to ' + $WaitForInstallerMinutes + ' minute(s) before giving up...') -Level WARN
+    if (Wait-MsiAvailable -TimeoutMinutes $WaitForInstallerMinutes) { $MsiBusy = $false }
+}
+if ($MsiBusy) {
+    Write-Log '  Another Windows Installer operation is IN PROGRESS (Global\_MSIExecute is held).' -Level WARN
+    Write-Log '  Installer-ish processes (informational -- an idle msiexec service process' -Level WARN
+    Write-Log '  and a running TrustedInstaller are normal and prove nothing on their own):' -Level WARN
     foreach ($o in (Get-OtherInstallerProcesses)) { Write-Log ('    installer process: ' + $o) -Level WARN }
     Write-Log '  This script purges the agent directories and registrations BEFORE it' -Level WARN
     Write-Log '  installs. If that install then fails with 1618, the host is left with no' -Level WARN
-    Write-Log '  agent. Refusing to start; re-run once the other install finishes.' -Level WARN
+    Write-Log '  agent.' -Level WARN
     Write-Log '  (CSLT-215, 2026-08-07: SentinelOne was mid-install and held the mutex.)' -Level WARN
-    Write-Log '=============================================='
-    exit 2
+    if ($IgnoreConcurrentMsi) {
+        Write-Log '  -IgnoreConcurrentMsi set: tearing down anyway. If the reinstall hits 1618,' -Level WARN
+        Write-Log '  THIS HOST WILL BE LEFT WITH NO NESSUS AGENT until the script is re-run.' -Level WARN
+    } else {
+        Write-Log '  Refusing to start. Re-run once the other install finishes, raise' -Level WARN
+        Write-Log '  -WaitForInstallerMinutes to wait it out, or pass -IgnoreConcurrentMsi' -Level WARN
+        Write-Log '  if the holder is known to be stuck.' -Level WARN
+        Write-Log '=============================================='
+        exit 2
+    }
+} else {
+    Write-Log '  No concurrent MSI operation detected.'
 }
-Write-Log '  No concurrent MSI operation detected.'
 
 # ==============================================================
 # 1. Kill orphaned Nessus processes
