@@ -263,6 +263,8 @@ Relinks the Nessus Agent with per-host group preservation. Configuration is via 
 ## get-nessus-agent-version.sh
 Read-only. Reports every Nessus Agent version the Mac can self-report (running binaries, `pkgutil` receipts, bundle plists, leftover trees) and names whichever source disagrees. Written for CSPRIM-08 (plugin 326953 / TNS-2026-18), where the finding said 11.2.0 at `/Library/NessusAgent` while Sensors > Agents showed 11.2.3. Reads **environment variables**, with an in-script `CFG_*` block for Mosyle. Changes nothing.
 
+**Do not paste this file into a Mosyle Unix Command.** That field truncates; the "output" is the source, not a run. Deploy as a Custom Script file, or paste `macos/get-nessus-agent-version-oneshot.sh` instead.
+
 | Environment variable | CONFIG default | Description |
 |----------------------|----------------|-------------|
 | `FIXED_VERSION` | `CFG_FIXED_VERSION="11.2.1"` | Version floor each source is judged against. |
@@ -270,6 +272,9 @@ Read-only. Reports every Nessus Agent version the Mac can self-report (running b
 | `DEEP_SCAN` | `CFG_DEEP_SCAN="0"` | Set `1` to also search `/Applications`, `/opt` and `/usr/local` for stray agent binaries (slower). |
 
 Exit codes: `0` PATCHED (every source current — a finding is stale Tenable-side data) / `1` VULNERABLE (running binary below the floor) / `2` STALE_METADATA (binaries current, another source still reports old) / `3` NOT_INSTALLED. The last line is machine-parseable: `NESSUS_AGENT_VERSION|host=..|running=..|floor=..|verdict=..|stale_sources=..`.
+
+## get-nessus-agent-version-oneshot.sh
+Same check, paste-safe for a Mosyle Unix Command or a Terminal one-liner. **No arguments.** Prints `nessuscli -v`, `nessusd -v`, every Nessus `pkgutil` receipt, Info.plist versions, `*version*` files under `/Library/NessusAgent`, `nessuscli agent status`, and any extra agent binaries on disk.
 
 ## repair-nessus-agent.sh
 Checks agent state and fixes only what is broken. Reads **environment variables** (usable from a terminal).

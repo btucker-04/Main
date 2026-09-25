@@ -7,8 +7,13 @@
 #           pinned on a specific source instead of guessed at. Changes nothing.
 # Platform: macOS (bash 3.2 compatible) | Deploy: Mosyle (runs as root)
 #
+# Deploy as a FILE (Mosyle Custom Script / copy then `bash /path/to/this.sh`).
+# Do NOT paste this file into a Mosyle Unix Command -- that field truncates
+# and the "output" you get back is the source, not a run. Use
+# macos/get-nessus-agent-version-oneshot.sh for a paste-safe command.
+#
 # Written for CSPRIM-08 (2026-09-25):
-#   Finding : plugin 326953 "Tenable Nessus Agent < 11.2.1 (TNS-2026-18)"
+#   Finding : plugin 326953 "Tenable Nessus Agent older than 11.2.1 (TNS-2026-18)"
 #             CVE-2026-15265, severity 4
 #             Path              : /Library/NessusAgent
 #             Installed version : 11.2.0
@@ -108,7 +113,7 @@ parse_version() {
 }
 
 pkgutil_version_from_text() {
-    # `pkgutil --pkg-info <id>` prints a "version: x.y.z" line among others.
+    # `pkgutil --pkg-info PACKAGE_ID` prints a "version: x.y.z" line among others.
     printf '%s\n' "$1" | awk -F': *' '/^version:/ { print $2; exit }'
 }
 
@@ -153,7 +158,7 @@ judge() {
         JUDGE_NOTE="OK (>= $FIXED_VERSION)"
     else
         note_stale "$1" "$2"
-        JUDGE_NOTE="BELOW $FIXED_VERSION  <-- a check reading this source reports vulnerable"
+        JUDGE_NOTE="BELOW $FIXED_VERSION  -- a check reading this source reports vulnerable"
     fi
 }
 
