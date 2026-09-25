@@ -264,6 +264,17 @@ Relinks the Nessus Agent with per-host group preservation. Configuration is via 
 | `LINK_HOST` | `sensor.cloud.tenable.com` | Tenable manager host. |
 | `FALLBACK_GROUPS` | `''` | Groups for a host not matched by the prefix map. If empty, such a host is skipped (exit 2) rather than linked with no group. |
 
+## get-nessus-agent-version.sh
+Read-only. Reports every Nessus Agent version the Mac can self-report (running binaries, `pkgutil` receipts, bundle plists, leftover trees) and names whichever source disagrees. Written for CSPRIM-08 (plugin 326953 / TNS-2026-18), where the finding said 11.2.0 at `/Library/NessusAgent` while Sensors > Agents showed 11.2.3. Reads **environment variables**, with an in-script `CFG_*` block for Mosyle. Changes nothing.
+
+| Environment variable | CONFIG default | Description |
+|----------------------|----------------|-------------|
+| `FIXED_VERSION` | `CFG_FIXED_VERSION="11.2.1"` | Version floor each source is judged against. |
+| `AGENT_ROOT` | `CFG_AGENT_ROOT="/Library/NessusAgent"` | Agent install root. |
+| `DEEP_SCAN` | `CFG_DEEP_SCAN="0"` | Set `1` to also search `/Applications`, `/opt` and `/usr/local` for stray agent binaries (slower). |
+
+Exit codes: `0` PATCHED (every source current — a finding is stale Tenable-side data) / `1` VULNERABLE (running binary below the floor) / `2` STALE_METADATA (binaries current, another source still reports old) / `3` NOT_INSTALLED. The last line is machine-parseable: `NESSUS_AGENT_VERSION|host=..|running=..|floor=..|verdict=..|stale_sources=..`.
+
 ## repair-nessus-agent.sh
 Checks agent state and fixes only what is broken. Reads **environment variables** (usable from a terminal).
 
