@@ -134,6 +134,7 @@ Checks agent state and fixes only what is broken (installs if missing, ensures s
 | `-LinkHost` | string | `sensor.cloud.tenable.com` | Tenable manager host. |
 | `-LinkGroups` | string | `''` | Agent group(s) to join. If empty, resolved from the prefix-rule/override map; a host that resolves to no group exits 2. |
 | `-ForceRelink` | switch | off | Unlink and relink even if the agent reports healthy. |
+| `-ResetTenableTag` | switch | off | On HTTP 409 duplicate-identity, delete `HKLM:\SOFTWARE\Tenable\TAG` and link as a new agent. Off by default: a 409 exits 2 with the diagnosis instead of probing DNS/TCP/TLS. The stale Tenable record keeps a license seat until deleted (Sensors > Agents). |
 
 ## Set-NessusAgentLink.ps1
 Relinks the agent with group preservation (Windows).

@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Nessus Agent link repair (v5). Checks the agent's actual state and only
+    Nessus Agent link repair (v6). Checks the agent's actual state and only
     fixes what is broken -- healthy linked agents are left untouched.
 
 .DESCRIPTION
@@ -13,6 +13,18 @@
         YES -> ensure service is running (either service name)
                -> already linked to the right host? exit 0, touch nothing
                -> not linked / wrong host? link (unlink first only if needed)
+
+    v6 (from the 2026-09-24 CSPRLT-124 run): the link was rejected with
+    HTTP 409 -- "another agent in container ... with different token already
+    exists" -- and v5 fell through to the generic "not one this script
+    recognises" path, which then probed DNS/TCP/TLS. That probe succeeded
+    (Cloudflare addresses, Google Trust Services WE1 on the Tenable name),
+    which looks like a network diagnosis. 409 is a duplicate host-identity
+    rejection on the controller: this host's UUID is already registered
+    under a different linking token (clone, reimage, or reinstall without
+    unlinking). Re-running cannot help. The 409 now has its own branch,
+    the connectivity probe is skipped, and -ResetTenableTag is the opt-in
+    to delete HKLM:\SOFTWARE\Tenable\TAG and link as a new agent.
 
     v5 (from the CSPRPC-76 run, 2026-09-03): the link failed with
     'Link fail: Connection to sensor.cloud.tenable.com:443 failed.' and the
@@ -103,6 +115,14 @@
     Unlink and relink even if the agent reports healthy. Use only when an
     agent is misbehaving despite showing linked.
 
+.PARAMETER ResetTenableTag
+    On an HTTP 409 duplicate-identity rejection, delete HKLM:\SOFTWARE\Tenable\TAG
+    so the agent regenerates an identity and links as a NEW agent. Off by
+    default: the host then leaves a stale record in Tenable holding a license
+    seat until a human deletes it (Sensors > Agents). Without this, a 409
+    exits 2 with the diagnosis. Do not use this as a first reaction -- delete
+    the stale console record and re-run first when that record is obvious.
+
 .PARAMETER MsiPath
     Explicit path to a staged Nessus Agent MSI, used only if the Tenable
     bootstrap install fails. If omitted (the normal EC deployment case),
@@ -127,6 +147,7 @@ param(
     [string]$LinkHost   = 'sensor.cloud.tenable.com',
     [string]$LinkGroups = '',
     [switch]$ForceRelink,
+    [switch]$ResetTenableTag,
     # Manual override only. Leave empty for a normal EC deployment -- see
     # .PARAMETER MsiPath above.
     [string]$MsiPath    = ''
@@ -136,15 +157,16 @@ $ErrorActionPreference = 'Stop'
 $NoGroup      = $false
 $FipsWarning  = $false
 $RebootNeeded = $false
-$LogDir  = 'C:\Logs\CompoSecure'
-$LogFile = Join-Path $LogDir ('NessusAgentRepair_' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '.log')
-if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
+$LogDir  = $null
+$LogFile = $null
 
 function Write-Log {
     param([string]$Msg, [string]$Level = 'INFO')
     $line = '[' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '] [' + $Level + '] ' + $Msg
     Write-Host $line
-    Add-Content -Path $LogFile -Value $line -ErrorAction SilentlyContinue
+    if ($LogFile) {
+        Add-Content -Path $LogFile -Value $line -ErrorAction SilentlyContinue
+    }
 }
 
 # Exact-hostname overrides -- checked FIRST, win over any prefix rule.
@@ -313,6 +335,14 @@ function Test-ManagerReachability {
     $tcp.Close()
 }
 
+function Test-LinkDuplicateIdentity {
+    # HTTP 409 from the controller: this host's UUID is already registered
+    # under a different linking token. Not a network failure.
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
+    return ($Text -match '\[409\]' -or $Text -match 'with different token already exists')
+}
+
 function Get-StagedNessusMsi {
     # Same search + architecture-matching logic as NessusAgent_CleanReinstall.ps1's
     # MSI resolution. $PSScriptRoot -- not $MyInvocation.MyCommand.Path, which
@@ -379,7 +409,14 @@ function Invoke-Msi {
     }
 }
 
-Write-Log '=== Nessus Agent Repair (v5) ==='
+# Unit tests dot-source this file for the helpers above; stop before the run.
+if ($env:NESSUS_REPAIR_DOTSOURCE -eq '1') { return }
+
+$LogDir  = 'C:\Logs\CompoSecure'
+$LogFile = Join-Path $LogDir ('NessusAgentRepair_' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '.log')
+if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
+
+Write-Log '=== Nessus Agent Repair (v6) ==='
 Write-Log ('Host: ' + $env:COMPUTERNAME)
 
 # ------------------------------------------------------------------
@@ -537,6 +574,63 @@ if ($groups) { $linkArgs += ('--groups=' + $groups) }
 
 $linkOut = Invoke-NessusCli $linkArgs
 foreach ($line in ($linkOut -split "`n")) { Write-Log ('  ' + $line) }
+
+if (Test-LinkDuplicateIdentity -Text ($linkOut | Out-String)) {
+    Write-Log ''
+    Write-Log 'LINK REJECTED 409 -- duplicate host identity, not a network failure.' -Level ERROR
+    Write-Log 'Tenable already has an agent registered for this host''s UUID under a' -Level ERROR
+    Write-Log 'different linking token, so this agent cannot claim it. Usual cause:' -Level ERROR
+    Write-Log 'the machine was cloned/re-imaged, or the agent was reinstalled without' -Level ERROR
+    Write-Log 'unlinking first. The connectivity probe is skipped -- DNS/TCP/TLS are' -Level ERROR
+    Write-Log 'not involved (the controller received the request and said no).' -Level ERROR
+    Write-Log ('This host''s UUID lives in HKLM:\SOFTWARE\Tenable\TAG.') -Level ERROR
+    $tag = Get-ItemProperty 'HKLM:\SOFTWARE\Tenable\TAG' -ErrorAction SilentlyContinue
+    if ($tag) {
+        Write-Log 'TAG key is present on this host.'
+    } else {
+        Write-Log 'TAG key is not present; the collision may already be only on the controller.'
+    }
+
+    if (-not $ResetTenableTag) {
+        Write-Log '' -Level ERROR
+        Write-Log 'Re-running this script WILL NOT help. Pick one:' -Level ERROR
+        Write-Log '  a) In Tenable (Sensors > Agents) find the stale record for this hostname' -Level ERROR
+        Write-Log '     or UUID, delete it, then re-run this script; or' -Level ERROR
+        Write-Log '  b) Re-run with -ResetTenableTag to delete the local TAG and link as a' -Level ERROR
+        Write-Log '     NEW agent -- then delete the stale record in Tenable, or it keeps a' -Level ERROR
+        Write-Log '     license seat.' -Level ERROR
+        Write-Log 'Exiting 2: a human has to choose.' -Level ERROR
+        Write-Log '=== END (409 duplicate identity) ==='
+        exit 2
+    }
+
+    Write-Log ''
+    Write-Log '-ResetTenableTag set -- resetting this host''s Tenable identity and retrying.' -Level WARN
+    if ($svc) {
+        Write-Log ('  Stopping ' + $svc.Name + ' first; a running agent can rewrite the TAG.')
+        Stop-Service $svc.Name -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 3
+    }
+    if (Test-Path 'HKLM:\SOFTWARE\Tenable\TAG') {
+        Write-Log '  Removing HKLM:\SOFTWARE\Tenable\TAG'
+        Remove-Item 'HKLM:\SOFTWARE\Tenable\TAG' -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    if ($svc) {
+        Start-Service $svc.Name -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 8
+    }
+    Write-Log '  Retrying link with the new identity...'
+    $linkOut = Invoke-NessusCli $linkArgs
+    foreach ($line in ($linkOut -split "`n")) { Write-Log ('  ' + $line) }
+    if (Test-LinkDuplicateIdentity -Text ($linkOut | Out-String)) {
+        Write-Log 'ERROR: still 409 after resetting the TAG. The duplicate is held on the' -Level ERROR
+        Write-Log 'controller -- delete the stale agent record in Tenable (Sensors > Agents)' -Level ERROR
+        Write-Log 'and re-run.' -Level ERROR
+        exit 1
+    }
+    Write-Log '  REMINDER: this host is now a NEW agent record. Delete the OLD one in' -Level WARN
+    Write-Log '  Tenable (Sensors > Agents) or it keeps consuming a license seat.' -Level WARN
+}
 
 if ($linkOut -match 'empty response') {
     Write-Log 'Link failed: empty response from controller.' -Level ERROR
