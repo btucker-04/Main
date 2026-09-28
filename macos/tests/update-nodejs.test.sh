@@ -57,6 +57,24 @@ want='==> Updating Homebrew...
 Updated 1 tap.'
 check 'carriage-return progress frames are dropped' "$got" "$want"
 
+# CSMB-036 was on 26.5.0. The pinned floor was 26.3.1, so the script called
+# it done. The current 26 line in this index is 26.5.1, and the rc is ignored.
+fix=$(mktemp)
+trap 'rm -f "$fix"' EXIT
+cat > "$fix" <<'JSON'
+[
+  {"version":"v26.6.0-rc.1"},
+  {"version":"v26.5.0"},
+  {"version":"v26.3.1"},
+  {"version":"v26.5.1"},
+  {"version":"v24.17.0"},
+  {"version":"v22.23.0"}
+]
+JSON
+check '26 line latest is 26.5.1, not the old floor or the rc' "$(latest_node_release 26 "$fix")" '26.5.1'
+check '24 line latest is 24.17.0' "$(latest_node_release 24 "$fix")" '24.17.0'
+check '22 line latest is 22.23.0' "$(latest_node_release 22 "$fix")" '22.23.0'
+
 if [ "$fail" -ne 0 ]; then
   echo "tests failed"
   exit 1

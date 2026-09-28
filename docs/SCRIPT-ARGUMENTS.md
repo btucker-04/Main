@@ -376,7 +376,7 @@ Prompts the logged-in user to install pending macOS updates. **No arguments.**
 Updates IntelliJ IDEA to the fixed version (force-closes a running IDE). **No runtime arguments** (target version is an in-script constant `TARGET_VERSION`).
 
 ## update-nodejs.sh
-Updates Node.js across Homebrew / official pkg (per-user managers report-only). **No runtime arguments** (fixed versions are in-script constants `FIX_22`/`FIX_24`/`FIX_26`). `brew update`/`upgrade` runs only when a Homebrew keg is below its floor. Brew's download bar and the new/deleted formula and cask catalogs are omitted from the log.
+Updates Node.js across Homebrew / official pkg (per-user managers report-only). **No runtime arguments and no pinned target version.** Installed Homebrew `node` / `node@N` formulae are `brew upgrade`d to the current formula. An official `/usr/local` pkg is raised to the latest stable release of its installed major from `https://nodejs.org/dist/index.json` (a test can point `NODE_DIST_JSON` at a cached index). Brew's download bar and the new/deleted formula and cask catalogs are omitted from the log.
 
 ## update-powershell.sh
 Updates PowerShell to the fixed version. **No arguments** (self-escalates via `sudo`; target is the in-script constant `FIXED_VERSION`).
