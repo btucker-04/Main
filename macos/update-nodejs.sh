@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# update-nodejs-322793.sh  (v2)
+# update-nodejs-322793.sh  (v3)
 # Remediates : Node.js 22.x < 22.23.0 / 24.x < 24.17.0 / 26.x < 26.3.1
 #              (June 18 2026 security releases)
 # Nessus Plugin ID : 322793
@@ -10,6 +10,15 @@
 #   A. Homebrew        -> <prefix>/Cellar/node*/<ver>            (csmb-010/-023/-033/-036)
 #   B. Official .pkg   -> /usr/local/bin/node                    (csmb-067)
 #   C. nvm / fnm / asdf-> per-user toolchains  (REPORTED, never modified)
+#
+# v3 (CSMB-036, 2026-09-28): the host was already on Node 26.5.0 and the
+#   script still ran `brew update`, which logged the full "New Formulae" /
+#   "New Casks" catalog plus the portable-ruby download bar. Two changes:
+#   * brew update/upgrade/cleanup runs only when a Homebrew keg is actually
+#     below its branch floor. An already-clean Cellar does not refresh taps.
+#   * When brew does run, progress bars and the new/deleted formula and cask
+#     catalogs are omitted. Errors, "Updated N taps", pours, and outdated
+#     formulae stay in the log.
 #
 # v2 fixes, from the 2026-08-03 CSMB-067 run:
 #   * v1 only understood Homebrew. On a machine with the official pkg install
@@ -47,6 +56,42 @@ MIN_PKG_BYTES=$((20 * 1024 * 1024))   # official macOS pkg is ~60-90MB
 mkdir -p "$LOG_DIR"
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"; }
 cleanup() { rm -rf "$WORK_DIR"; }
+
+# Drop brew's download bar and the new/deleted formula+cask catalogs.
+# Progress updates arrive as carriage-return frames; callers translate those
+# to newlines before this function sees them.
+filter_brew_output() {
+    skip=0
+    noted=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        [ -n "$line" ] || continue
+        case "$line" in
+            "==> New Formulae"*|"==> New Casks"*|"==> Deleted Formulae"*|"==> Deleted Casks"*)
+                skip=1
+                if [ "$noted" -eq 0 ]; then
+                    echo "(omitted brew catalog: new and deleted formulae/casks)"
+                    noted=1
+                fi
+                continue
+                ;;
+            "==>"*)
+                skip=0
+                ;;
+        esac
+        [ "$skip" -eq 1 ] && continue
+        if printf '%s\n' "$line" | grep -qE '^[#=O. -]*[0-9]+([.][0-9]+)?%$'; then
+            continue
+        fi
+        if printf '%s\n' "$line" | grep -qE '^[#=O. -]+$'; then
+            continue
+        fi
+        printf '%s\n' "$line"
+    done
+}
+
+if [ "${NODE_SELFTEST:-0}" = "1" ]; then
+    return 0 2>/dev/null || exit 0
+fi
 trap cleanup EXIT
 
 version_ge() { [ "$(printf '%s\n' "$2" "$1" | sort -V | head -n1)" = "$2" ]; }
@@ -64,7 +109,7 @@ VULN_SEEN=0        # a vulnerable Node was found somewhere
 VULN_REMAINING=0   # ...and is still vulnerable at the end
 UNMANAGED_NOTE=0   # something needs a human (nvm/fnm/odd branch)
 
-log "===== update-nodejs-322793.sh (v2) START ====="
+log "===== update-nodejs-322793.sh (v3) START ====="
 log "Host: $(hostname)"
 
 # -----------------------------------------------------------------------
@@ -131,7 +176,7 @@ fi
 if [ -z "$NODE_FORMULAE" ]; then
     log "  No Homebrew node formulae installed."
 else
-    # inventory
+    HOMEBREW_VULN=0
     while IFS= read -r vdir; do
         [ -d "$vdir" ] || continue
         ver=$(basename "$vdir")
@@ -144,16 +189,27 @@ else
         else
             log "  $vdir  [VULNERABLE < $need]"
             VULN_SEEN=1
+            HOMEBREW_VULN=1
         fi
     done < <(find "$CELLAR" -mindepth 2 -maxdepth 2 -type d -path '*/node*' 2>/dev/null | sort)
 
-    if [ -n "$BREW_USER" ]; then
+    if [ "$HOMEBREW_VULN" -eq 0 ]; then
+        log "  Every Homebrew Node keg is already at or above its floor."
+        log "  Skipping brew update (it would only list the new-formula catalog)."
+    elif [ -n "$BREW_USER" ]; then
         log "  brew update..."
-        OUT=$(run_brew update 2>&1); log "  $OUT"
+        run_brew update 2>&1 | tr '\r' '\n' | filter_brew_output | while IFS= read -r line; do
+            [ -n "$line" ] && log "  $line"
+        done
         for f in $NODE_FORMULAE; do
             log "  brew upgrade $f ..."
-            OUT=$(run_brew upgrade "$f" 2>&1); log "  $OUT"
-            OUT=$(run_brew cleanup "$f" 2>&1); log "  cleanup $f: $OUT"
+            run_brew upgrade "$f" 2>&1 | tr '\r' '\n' | filter_brew_output | while IFS= read -r line; do
+                [ -n "$line" ] && log "  $line"
+            done
+            log "  brew cleanup $f ..."
+            run_brew cleanup "$f" 2>&1 | tr '\r' '\n' | filter_brew_output | while IFS= read -r line; do
+                [ -n "$line" ] && log "  $line"
+            done
         done
     else
         log "  Cannot run brew -- skipping Homebrew upgrade."
