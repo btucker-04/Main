@@ -307,13 +307,15 @@ Generic vulnerable-gem remediator. Accepts, in precedence order, **positional ar
 
 | Positional | Environment | CONFIG default | Description |
 |-----------|-------------|----------------|-------------|
-| `$1` | `GEM` | `CFG_GEM="rexml"` | Gem name (required). |
-| `$2` | `THRESHOLDS` | `CFG_THRESHOLDS="3.4.2"` | Either a single minimum (`3.4.2`) or per-branch `prefix:minimum` pairs (`0.4:0.4.24;0.5:0.5.14;0.6:0.6.4`) (required). |
-| `$3` | `PLUGIN` | `CFG_PLUGIN="265895"` | Plugin ID, for the log header only. |
+| `$1` | `GEM` | `CFG_GEM="net-imap"` | Gem name (required). |
+| `$2` | `THRESHOLDS` | `CFG_THRESHOLDS="0.4:0.4.24;0.5:0.5.15;0.6:0.6.4.1"` | Either a single minimum (`3.4.2`) or per-branch `prefix:minimum` pairs (required). Plugin 321503 floors: 0.5.15 and 0.6.4.1. The older 313278 floor of `0.6.4` treats the installed 0.6.4 spec as already fixed. |
+| `$3` | `PLUGIN` | `CFG_PLUGIN="321503"` | Plugin ID, for the log header only. |
 | — | `NO_INSTALL` | `CFG_NO_INSTALL="0"` | Set `1` to clean up only; never install a patched gem. |
 | — | `DRY_RUN` | `CFG_DRY_RUN="0"` | Set `1` to report only, delete nothing. |
 
-Example (terminal): `./remediate-ruby-gem.sh net-imap "0.4:0.4.24;0.5:0.5.14;0.6:0.6.4" 313278`
+Example (terminal): `./remediate-ruby-gem.sh net-imap "0.4:0.4.24;0.5:0.5.15;0.6:0.6.4.1" 321503`
+
+A stock Mosyle paste uses the CONFIG block. To remediate rexml instead, set `CFG_GEM="rexml"`, `CFG_THRESHOLDS="3.4.2"`, `CFG_PLUGIN="265895"` before deploying.
 
 ## update-claude-code.sh
 Updates per-user Claude Code installs under `/Users/*/.local/bin/claude` (plugin 322792 / CVE-2026-54316). Runs `claude update` as each owning user via `sudo -u`, which works even when that user is not logged in. Reads **environment variables**, with an in-script `CONFIG` block for Mosyle.
