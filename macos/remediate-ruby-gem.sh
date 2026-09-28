@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# remediate-ruby-gem.sh  (v3.2)
+# remediate-ruby-gem.sh  (v3.3)
 # Generic remediation for a vulnerable Ruby gem on macOS.
 # Platform : macOS (bash 3.2 compatible) | Deploy: Mosyle (runs as root)
 #
@@ -75,7 +75,7 @@
 #   (Configure via the CONFIG block below, or positional args, or environment.)
 #   GEM=rexml                       (required) gem name
 #   THRESHOLDS="3.4.2"              (required) either a single minimum, or
-#   THRESHOLDS="0.4:0.4.24;0.5:0.5.14;0.6:0.6.4"
+#   THRESHOLDS="0.4:0.4.24;0.5:0.5.15;0.6:0.6.4.1"
 #                                   per-branch "prefix:minimum" pairs.
 #                                   A spec whose version matches no branch
 #                                   prefix is REPORTED and never deleted.
@@ -85,7 +85,7 @@
 #
 # Examples:
 #   GEM=rexml    THRESHOLDS="3.4.2"                                    PLUGIN=265895
-#   GEM=net-imap THRESHOLDS="0.4:0.4.24;0.5:0.5.14;0.6:0.6.4"          PLUGIN=313278
+#   GEM=net-imap THRESHOLDS="0.4:0.4.24;0.5:0.5.15;0.6:0.6.4.1"        PLUGIN=321503
 #   GEM=webrick  THRESHOLDS="1.8.2"                                    PLUGIN=240854  (system Ruby: report only)
 #
 # HOMEBREW PORTABLE RUBY: Homebrew ships its own Ruby under
@@ -122,14 +122,23 @@ export HOME
 # in-script config is the deployable path (same constraint as EC stripping
 # parameters). Precedence: command-line args > environment > these defaults.
 #
+# v3.3 (ARMB-09, 2026-09-28): a stock Mosyle paste logged
+#   GEM=rexml THRESHOLDS=3.4.2 PLUGIN=265895
+# and never looked at net-imap. Plugin 321503 (CVE-2026-47240/47241/47242)
+# is net-imap < 0.5.15 or 0.6.x < 0.6.4.1. ARMB-09 and CSMB-017 both have
+# net-imap-0.6.4.gemspec. The old 313278 floor of 0.6.4 treats that spec as
+# already fixed, so the finding would not clear. Default CONFIG is now this
+# advisory. Switch the three CFG_* lines back to rexml / 3.4.2 / 265895
+# when that is the finding being deployed.
+#
 #   rexml    : CFG_GEM="rexml"    CFG_THRESHOLDS="3.4.2"                 PLUGIN 265895
-#   net-imap : CFG_GEM="net-imap" CFG_THRESHOLDS="0.4:0.4.24;0.5:0.5.14;0.6:0.6.4"
+#   net-imap : CFG_GEM="net-imap" CFG_THRESHOLDS="0.4:0.4.24;0.5:0.5.15;0.6:0.6.4.1"
 #   webrick  : CFG_GEM="webrick"  CFG_THRESHOLDS="1.8.2"                  PLUGIN 240854
 #              (CSMB-017 webrick is SYSTEM Ruby -- this job will exit 2)
 # =============================================================================
-CFG_GEM="rexml"
-CFG_THRESHOLDS="3.4.2"
-CFG_PLUGIN="265895"
+CFG_GEM="net-imap"
+CFG_THRESHOLDS="0.4:0.4.24;0.5:0.5.15;0.6:0.6.4.1"
+CFG_PLUGIN="321503"
 CFG_NO_INSTALL="0"
 CFG_DRY_RUN="0"
 
@@ -221,6 +230,11 @@ THRESH_PER_BRANCH=0
 case "$THRESHOLDS" in *:*) THRESH_PER_BRANCH=1 ;; esac
 
 spec_version() { echo "$1" | sed -E "s/^${GEM}-([0-9][0-9A-Za-z.]*)\.gemspec$/\1/"; }
+
+# Unit tests source this file for required_for / version_ge; stop before the run.
+if [ "${RUBY_GEM_SELFTEST:-0}" = "1" ]; then
+    return 0 2>/dev/null || exit 0
+fi
 
 WORK="/tmp/rubygem_$$"; mkdir -p "$WORK"
 trap 'rm -rf "$WORK"' EXIT
