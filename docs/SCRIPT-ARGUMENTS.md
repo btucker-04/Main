@@ -317,6 +317,8 @@ Example (terminal): `./remediate-ruby-gem.sh net-imap "0.4:0.4.24;0.5:0.5.15;0.6
 
 A stock Mosyle paste uses the CONFIG block. To remediate rexml instead, set `CFG_GEM="rexml"`, `CFG_THRESHOLDS="3.4.2"`, `CFG_PLUGIN="265895"` before deploying.
 
+Cleanup is gated on a patched sibling in the **same Ruby tree and ABI** (`gem install` writes only to the current Ruby). A Homebrew gem dir whose ABI no longer has any `Cellar/ruby*` keg (e.g. `lib/ruby/gems/3.3.0` left behind after ruby moved to 4.0) is logged `ORPHAN` and its vulnerable spec removed: nothing can load it and no patched sibling can ever appear there (ARMB-09). A gem dir whose interpreter still exists is left alone (`KEEP`).
+
 ## update-claude-code.sh
 Updates per-user Claude Code installs under `/Users/*/.local/bin/claude` (plugin 322792 / CVE-2026-54316). Runs `claude update` as each owning user via `sudo -u`, which works even when that user is not logged in. Reads **environment variables**, with an in-script `CONFIG` block for Mosyle.
 

@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# remediate-ruby-gem.sh  (v3.3)
+# remediate-ruby-gem.sh  (v3.4)
 # Generic remediation for a vulnerable Ruby gem on macOS.
 # Platform : macOS (bash 3.2 compatible) | Deploy: Mosyle (runs as root)
 #
@@ -64,6 +64,19 @@
 #     FORMULA:<name>, brew-upgrades the formula, removes SUPERSEDED kegs, and
 #     leaves the CURRENT keg alone if it still vendors a vulnerable spec
 #     (upstream formula pin -- recast, same as current portable-ruby).
+#
+# v3.4 (ARMB-09, 2026-09-28, plugin 321503): gem install succeeded (net-imap
+#   0.6.7 into lib/ruby/gems/4.0.0) but the vulnerable spec was in
+#   lib/ruby/gems/3.3.0 and the run ended "not remediated". The same-tree guard
+#   also requires the same ABI, and that is correct -- Ruby 4.0 cannot load a
+#   3.3.0 gem dir and vice versa. But the only Homebrew Ruby on the host was
+#   4.0.5: the 3.3.0 gem dir was left behind when ruby was upgraded, and
+#   `gem install` only ever writes to the CURRENT Ruby, so no patched sibling
+#   could ever appear there. A HOMEBREW-scope spec whose ABI has no Cellar
+#   ruby*/... keg is now classified ORPHAN and removed: nothing can require
+#   from it, so deleting it cannot break a Ruby. A gem dir whose interpreter
+#   still exists is unchanged -- the guard still refuses to strip the only
+#   copy on that branch.
 #
 # PER-BRANCH THRESHOLDS: gems are commonly fixed independently per minor line.
 # A flat "greater than X" test is wrong and has caused a real bug here -- a
@@ -211,6 +224,25 @@ scope_of() {
     echo "OTHER:$(dirname "$(dirname "$s")")"
 }
 is_default_gem() { case "$1" in */specifications/default/*) return 0 ;; *) return 1 ;; esac; }
+
+# Does any Homebrew Ruby keg (ruby, ruby@3.3, ...) still ship stdlib for this
+# ABI? <prefix>/lib/ruby/gems/<abi> is only loadable by an interpreter of that
+# ABI; when the keg is gone the gem dir is an orphan nothing can require from.
+homebrew_abi_has_interpreter() {
+    abi="$1"
+    [ -n "${BREW_PREFIX:-}" ] && [ -n "$abi" ] || return 1
+    for d in "$BREW_PREFIX"/Cellar/ruby*/*/lib/ruby/"$abi"; do
+        [ -d "$d" ] && return 0
+    done
+    return 1
+}
+homebrew_current_abi() {
+    [ -n "${BREW_PREFIX:-}" ] || { echo ""; return; }
+    for d in "$BREW_PREFIX"/opt/ruby/lib/ruby/[0-9]*; do
+        [ -d "$d" ] && { basename "$d"; return; }
+    done
+    echo ""
+}
 
 formula_keg_of() {
     echo "$1" | sed -nE "s|^$BREW_PREFIX/Cellar/[^/]+/([^/]+)/.*|\\1|p"
@@ -500,6 +532,34 @@ while IFS= read -r spec; do
     done < "$WORK/specs2"
 
     if [ "$patched_here" -eq 0 ]; then
+        # ARMB-09 (2026-09-28): the vulnerable spec sat in lib/ruby/gems/3.3.0
+        # but the only Homebrew Ruby was 4.0.5. `gem install` writes to the
+        # CURRENT Ruby's gem dir (4.0.0), so a patched 0.6.x sibling can never
+        # appear beside a 3.3.0 spec and the guard above is unsatisfiable. A
+        # gem dir whose interpreter is gone cannot be loaded by anything;
+        # removing the spec there breaks nothing.
+        if [ "$sc" = "HOMEBREW" ] && [ -n "$myabi" ] && ! homebrew_abi_has_interpreter "$myabi"; then
+            curabi=$(homebrew_current_abi)
+            if [ "$DRY_RUN" = "1" ]; then
+                log "  [DRY_RUN] Would remove $spec (orphaned gem dir: no Homebrew Ruby with ABI $myabi; current is ${curabi:-unknown})"
+                continue
+            fi
+            log "  ORPHAN   $spec ($ver < $need)"
+            log "           Gem dir is for Ruby ABI $myabi but no Homebrew Ruby keg ships that"
+            log "           ABI any more (current: ${curabi:-unknown}). Nothing can load it, and"
+            log "           gem install only ever writes to the current Ruby, so a patched"
+            log "           sibling cannot appear here. Removing the dead spec."
+            if rm -f "$spec"; then
+                REMOVED=$((REMOVED+1))
+                specdir=$(dirname "$spec")
+                gemdir="$(dirname "$specdir")/gems/${GEM}-${ver}"
+                [ -d "$gemdir" ] && rm -rf "$gemdir" && log "           removed payload: $gemdir"
+            else
+                log "           rm failed (permissions?). Leaving it for a human."
+                KEPT=$((KEPT+1))
+            fi
+            continue
+        fi
         if [ "$sc" = "SYSTEM" ]; then
             log "  SYSTEM   $spec ($ver < $need) -- macOS system Ruby, no patched $GEM"
             log "           sibling in /Library/Ruby (including default gems). Recast/accept,"
