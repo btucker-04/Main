@@ -23,7 +23,7 @@ Updates every installed Visual Studio instance to the latest build of its channe
 | `-DryRun` | switch | off | Report the instances found and the intended actions without changing anything. |
 
 ## Update-Wsl2.ps1
-Updates WSL2 via `wsl --update --web-download`. **No arguments.**
+Updates WSL to the current release via `wsl --update --web-download`. **No arguments and no minimum version.** A completed update is success. The version `wsl` prints (`Updating ... to version: 2.7.14`) is logged when present. An unreadable Appx version after exit 0 is a warning, not a failure — under SYSTEM that read often comes back empty and must not be treated as `0.0.0`.
 
 ## Update-WinGet.ps1
 Updates WinGet / App Installer (Microsoft.DesktopAppInstaller) via the AppX/DISM layer.
