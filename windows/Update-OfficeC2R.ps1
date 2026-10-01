@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Universal Office Click-to-Run updater (v2). Channel-agnostic: updates the
+    Universal Office Click-to-Run updater (v3). Channel-agnostic: updates the
     machine to the newest build of ITS OWN channel, so it works where
     EC's channel-specific M365 patches report Not Applicable.
 
@@ -33,6 +33,11 @@
        finalize immediately instead of waiting on the user. Pass
        -ForceAppShutdown:$false to fall back to the old non-disruptive
        behavior (stage in background, finalize when the user closes Office).
+       -NotifyMinutes N (v3) warns the signed-in user first: if any Office
+       app is open, a message box (msg.exe, all sessions) says the apps will
+       close in N minutes, the script waits N minutes, then triggers the
+       update. With no Office apps open there is nothing to close, so no
+       message is sent and there is no wait.
     3. Optionally polls VersionToReport for up to -WaitMinutes to report
        whether the version advanced before exiting (default 0 = fire and
        exit; EC re-run or rescan verifies later).
@@ -46,6 +51,14 @@
     If UpdatesEnabled is False, do NOT override it -- just report the
     blocker and exit (2). Use this where disabled updates are a deliberate,
     known decision for this host.
+
+.PARAMETER NotifyMinutes
+    Minutes of warning to give the user before open Office apps are
+    force-closed. 0 (default) = no warning. Ignored with
+    -ForceAppShutdown:$false (nothing is closed then).
+
+.PARAMETER NotifyMessage
+    Overrides the warning text. Default names the open apps and the delay.
 
 .PARAMETER WaitMinutes
     Minutes to poll for the version to advance. 0 (default) = do not wait.
@@ -67,8 +80,53 @@ param(
     # If UpdatesEnabled is False, do NOT override it -- just report the
     # blocker and exit. Use this where disabled updates are a deliberate,
     # known decision for this host.
-    [switch]$LeaveUpdatesDisabled
+    [switch]$LeaveUpdatesDisabled,
+    [int]$NotifyMinutes = 0,
+    [string]$NotifyMessage = ''
 )
+
+$OfficeAppNames = [ordered]@{
+    'WINWORD'  = 'Word'
+    'EXCEL'    = 'Excel'
+    'POWERPNT' = 'PowerPoint'
+    'OUTLOOK'  = 'Outlook'
+    'ONENOTE'  = 'OneNote'
+    'MSACCESS' = 'Access'
+    'MSPUB'    = 'Publisher'
+    'VISIO'    = 'Visio'
+    'WINPROJ'  = 'Project'
+    'lync'     = 'Skype for Business'
+}
+
+function Get-OpenOfficeApps {
+    param([string[]]$ProcessNames)
+    $open = @()
+    foreach ($key in $OfficeAppNames.Keys) {
+        foreach ($p in $ProcessNames) {
+            if ($p -ieq $key) { $open += $OfficeAppNames[$key]; break }
+        }
+    }
+    return ,$open
+}
+
+function Get-MsgExePath {
+    # A 32-bit PowerShell (EC's agent can launch one) sees System32 redirected
+    # to SysWOW64, which has no msg.exe; Sysnative reaches the real System32.
+    param([string]$WinDir, [bool]$Is64BitOS, [bool]$Is64BitProcess)
+    $root = $WinDir.TrimEnd('\')
+    if ($Is64BitOS -and -not $Is64BitProcess) { return ($root + '\Sysnative\msg.exe') }
+    return ($root + '\System32\msg.exe')
+}
+
+function Get-NotifyText {
+    param([string[]]$Apps, [int]$Minutes, [string]$Custom = '')
+    if ($Custom) { return $Custom }
+    $unit = if ($Minutes -eq 1) { 'minute' } else { 'minutes' }
+    return ('IT is updating Microsoft Office. In ' + $Minutes + ' ' + $unit + ', these apps will close automatically: ' +
+        ($Apps -join ', ') + '. Please save your work now. You can reopen them once the update finishes.')
+}
+
+if ($env:OFFICE_C2R_DOTSOURCE -eq '1') { return }
 
 $ErrorActionPreference = 'Stop'
 $LogDir  = 'C:\Logs\CompoSecure'
@@ -95,7 +153,7 @@ $ChannelMap = @{
 }
 
 Write-Log '=============================================='
-Write-Log ' Office C2R Universal Update (v2)'
+Write-Log ' Office C2R Universal Update (v3)'
 Write-Log (' Host : ' + $env:COMPUTERNAME)
 Write-Log '=============================================='
 
@@ -150,6 +208,36 @@ Write-Log ('Platform : ' + $cfg.Platform)
 
 $forceFlag = if ($ForceAppShutdown) { 'true' } else { 'false' }
 $c2rArgs = '/update user displaylevel=false forceappshutdown=' + $forceFlag + ' updatepromptuser=false'
+
+if ($ForceAppShutdown -and $NotifyMinutes -gt 0) {
+    Write-Log ''
+    $openApps = Get-OpenOfficeApps -ProcessNames @(Get-Process -ErrorAction SilentlyContinue | ForEach-Object { $_.ProcessName })
+    if ($openApps.Count -eq 0) {
+        Write-Log 'No Office apps open -- nothing to close, skipping the user warning.'
+    } else {
+        Write-Log ('Open Office apps: ' + ($openApps -join ', '))
+        $msgExe = Get-MsgExePath -WinDir $env:WINDIR -Is64BitOS ([Environment]::Is64BitOperatingSystem) -Is64BitProcess ([Environment]::Is64BitProcess)
+        $text = Get-NotifyText -Apps $openApps -Minutes $NotifyMinutes -Custom $NotifyMessage
+        if (Test-Path -LiteralPath $msgExe) {
+            $msgExit = 1
+            try {
+                & $msgExe '*' ('/TIME:' + ($NotifyMinutes * 60)) $text 2>&1 | Out-Null
+                $msgExit = $LASTEXITCODE
+            } catch {
+                Write-Log ('msg.exe error: ' + $_) -Level WARN
+            }
+            if ($msgExit -eq 0) {
+                Write-Log ('User warned (msg.exe): ' + $text)
+            } else {
+                Write-Log ('msg.exe exited ' + $msgExit + ' -- the warning may not have been shown (no signed-in session?).') -Level WARN
+            }
+        } else {
+            Write-Log ('msg.exe not found at ' + $msgExe + ' (Windows Home editions lack it) -- no warning shown.') -Level WARN
+        }
+        Write-Log ('Waiting ' + $NotifyMinutes + ' min before closing Office apps...')
+        Start-Sleep -Seconds ($NotifyMinutes * 60)
+    }
+}
 
 Write-Log ''
 if ($ForceAppShutdown) {
