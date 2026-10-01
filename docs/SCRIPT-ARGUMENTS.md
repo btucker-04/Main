@@ -62,6 +62,9 @@ Channel-agnostic Office Click-to-Run updater.
 |----------|------|---------|-------------|
 | `-WaitMinutes` | int | `0` | Minutes to poll for the reported version to advance. `0` = fire and exit without waiting. |
 | `-ForceAppShutdown` | bool | `$true` | Force-close open Office apps so the update finalizes immediately. Pass `-ForceAppShutdown:$false` to stage in the background and finalize only when the user closes Office. |
+| `-LeaveUpdatesDisabled` | switch | off | If `UpdatesEnabled` is False, report it and exit `2` instead of temporarily overriding it. |
+| `-NotifyMinutes` | int | `0` | Warn the signed-in user N minutes before open Office apps are force-closed: a message box (`msg.exe`) lists the open apps, then the script waits N minutes before triggering the update. Skipped when no Office app is open, and ignored with `-ForceAppShutdown:$false`. `0` = no warning. |
+| `-NotifyMessage` | string | (built-in) | Custom warning text. Default names the open apps and the delay. |
 
 ## Update-DellBios.ps1
 Stages a model-appropriate Dell BIOS update via Dell Command | Update, with firmware safety guards.
