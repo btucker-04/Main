@@ -17,10 +17,18 @@
 #   * node / go / git etc.: plain `brew upgrade`.
 # So the order here is upgrade THEN cleanup, every week.
 #
-# Not covered (keep using the dedicated scripts): gems installed into a Ruby
-# gem dir by `gem install` (remediate-ruby-gem.sh), official .pkg installs
-# outside Homebrew (update-nodejs.sh, update-golang.sh), and apps that are not
-# Homebrew casks.
+# Step 5b then handles the gems that ship inside Homebrew Ruby (net-imap,
+# rexml -- CFG_RUBY_GEMS). brew never updates those: the copy in the Ruby keg
+# is whatever that Ruby release bundled, and lib/ruby/gems/<abi> is not
+# brew's at all, so they came back every scan cycle. For each Homebrew Ruby
+# the step installs the newest gem release and deletes older copies, and it
+# clears gem dirs whose Ruby is gone. It needs no fixed-version list, so
+# new advisories for the same gems are covered without editing the script.
+#
+# Not covered (keep using the dedicated scripts): official .pkg installs
+# outside Homebrew (update-nodejs.sh, update-golang.sh), per-user Ruby/Node
+# managers (rbenv, asdf, nvm), macOS system Ruby (/Library/Ruby), and apps
+# that are not Homebrew casks.
 #
 # Lessons carried over from the other brew scripts:
 #   * brew refuses to run as root -> every brew call runs as the user who OWNS
@@ -57,10 +65,10 @@ export HOME
 
 # =============================================================================
 CFG_DRY_RUN="0"
-# Also upgrade casks that update themselves (Chrome, Slack, Zoom, ...). brew
-# skips those by default, but Tenable reports whatever is on disk, and a user
-# who never relaunches the app never gets the self-update.
-CFG_GREEDY="1"
+# Also upgrade casks that update themselves (Chrome, Slack, Zoom, ...). Off:
+# those apps keep themselves current and rarely show up in Tenable; brew
+# skips them by default. Set "1" to force them too.
+CFG_GREEDY="0"
 # Grant the brew user passwordless sudo while this script runs, so casks with
 # .pkg installers can upgrade unattended. See the header before enabling.
 CFG_CASK_SUDO="0"
@@ -73,6 +81,14 @@ CFG_SKIP_CASKS=""
 # Per-brew-step wall-clock limit, seconds. 0 = no limit.
 CFG_BREW_TIMEOUT="3600"
 CFG_CASK_TIMEOUT="900"
+# Gems bundled with Homebrew Ruby that Tenable keeps reporting. For each
+# Homebrew Ruby: install the newest release, then delete older copies of the
+# gem wherever that Ruby loads from (its keg and lib/ruby/gems/<abi>), plus
+# copies in gem dirs whose Ruby is gone. ":branch" = keep the newest of EACH
+# installed major.minor (net-imap backports fixes to 0.4 / 0.5 / 0.6);
+# ":latest" = keep only the newest (rexml fixes ship on 3.4 only).
+# Empty = skip this step. macOS system Ruby (/Library/Ruby) is never touched.
+CFG_RUBY_GEMS="net-imap:branch rexml:latest"
 # =============================================================================
 DRY_RUN="${DRY_RUN:-$CFG_DRY_RUN}"
 GREEDY="${GREEDY:-$CFG_GREEDY}"
@@ -82,6 +98,7 @@ SKIP_FORMULAE="${SKIP_FORMULAE:-$CFG_SKIP_FORMULAE}"
 SKIP_CASKS="${SKIP_CASKS:-$CFG_SKIP_CASKS}"
 BREW_TIMEOUT="${BREW_TIMEOUT:-$CFG_BREW_TIMEOUT}"
 CASK_TIMEOUT="${CASK_TIMEOUT:-$CFG_CASK_TIMEOUT}"
+RUBY_GEMS="${RUBY_GEMS-$CFG_RUBY_GEMS}"
 
 LOG_DIR="${LOG_DIR:-/var/log/composecure}"
 LOG_FILE="$LOG_DIR/homebrew_update.log"
@@ -157,6 +174,45 @@ cask_failure_reason() {
 
 sudoers_line() { printf '%s ALL=(ALL) NOPASSWD: ALL\n' "$1"; }
 
+# --- Ruby gem helpers (step 5b) ---------------------------------------------
+# "net-imap:branch" -> branch, anything else -> latest.
+gem_mode() { case "$1" in *:branch) echo branch ;; *) echo latest ;; esac; }
+
+# Release versions from one `gem list NAME --exact --local` line, e.g.
+# "net-imap (0.6.7, default: 0.4.9.1)" -> 0.6.7 / 0.4.9.1. Prereleases dropped.
+gem_list_versions() {
+    echo "$1" | sed -n 's/^[^(]*(\(.*\))[[:space:]]*$/\1/p' | tr ',' '\n' \
+        | sed 's/default://; s/^[[:space:]]*//; s/[[:space:]]*$//' \
+        | grep -E '^[0-9]+(\.[0-9]+)*$' || true
+}
+
+# $1 = gem name, $2 = path to NAME-VERSION.gemspec -> VERSION (release only).
+gem_spec_version() {
+    basename "$2" | sed -n "s/^$1-\([0-9][0-9.]*[0-9]\)\.gemspec$/\1/p"
+}
+
+# Requirements to `gem install`, one per line. branch: newest of each
+# installed major.minor ("~> 0.4.0" = newest 0.4.x), because net-imap ships
+# fixes on every maintained branch and an app pinned to 0.4 cannot use 0.6.
+# latest: one empty line = plain `gem install` (newest release).
+gem_install_requirements() {
+    if [ "$1" = "branch" ]; then
+        printf '%s\n' $2 | cut -d. -f1,2 | sort -u | sed 's/^\(.*\)$/~> \1.0/'
+    else
+        echo ""
+    fi
+}
+
+# Version that should remain for a spec at $3, given installed versions $2.
+gem_keep_version() {
+    if [ "$1" = "branch" ]; then
+        br=$(echo "$3" | cut -d. -f1,2)
+        printf '%s\n' $2 | awk -F. -v b="$br" '($1"."$2)==b' | sort -V | tail -n 1
+    else
+        printf '%s\n' $2 | sort -V | tail -n 1
+    fi
+}
+
 if [ "${HOMEBREW_UPDATE_SELFTEST:-0}" = "1" ]; then
     return 0 2>/dev/null || exit 0
 fi
@@ -169,6 +225,7 @@ FAILED=""
 NEEDS_HUMAN=0
 FATAL=0
 TIMED_OUT=0
+GEMS_REMOVED=0
 
 remove_sudoers() {
     if [ -f "$SUDOERS_FILE" ]; then
@@ -199,17 +256,18 @@ if [ -z "$PREFIXES" ]; then
     exit 0
 fi
 
-# Run brew for the current prefix. $1 = step label, $2 = timeout seconds,
-# rest = brew arguments. Output streams to $STEP_LOG; the filtered tail is
-# copied into the main log.
-run_brew() {
-    step="$1"; limit="$2"; shift 2
+# Run a Homebrew tool (brew, or a Homebrew Ruby's gem) as the prefix owner.
+# $1 = step label, $2 = timeout seconds, $3 = binary, rest = arguments.
+# Output streams to $STEP_LOG; the filtered tail is copied into the main log.
+run_step() {
+    step="$1"; limit="$2"; bin="$3"; shift 3
+    tool=$(basename "$bin")
     STEP_LOG="$LOG_DIR/homebrew_${PREFIX_TAG}_${step}.log"
     if [ "$TIMED_OUT" -eq 1 ]; then
-        log "  brew $* -- skipped (an earlier step hit its time limit)"
+        log "  $tool $* -- skipped (an earlier step hit its time limit)"
         return 124
     fi
-    log "  brew $*"
+    log "  $tool $*"
     : > "$STEP_LOG"
     start=$(date +%s)
     # The redirect is the root shell's on purpose: root owns $LOG_DIR.
@@ -222,7 +280,7 @@ run_brew() {
         HOMEBREW_NO_ANALYTICS=1 \
         HOMEBREW_NO_ENV_HINTS=1 \
         HOMEBREW_NO_INSTALL_CLEANUP=1 \
-        $ARCH_CMD "$PREFIX/bin/brew" "$@" >>"$STEP_LOG" 2>&1 &
+        $ARCH_CMD "$bin" "$@" >>"$STEP_LOG" 2>&1 &
     pid=$!
     waited=0
     while kill -0 "$pid" 2>/dev/null; do
@@ -232,7 +290,7 @@ run_brew() {
             log "    ...still running (${waited}s): $(tail -n 1 "$STEP_LOG" 2>/dev/null)"
         fi
         if [ "$limit" -gt 0 ] && [ "$waited" -ge "$limit" ]; then
-            log "    TIME LIMIT (${limit}s) reached -- stopping brew."
+            log "    TIME LIMIT (${limit}s) reached -- stopping $tool."
             kill "$pid" 2>/dev/null || true
             sleep 5
             kill -9 "$pid" 2>/dev/null || true
@@ -250,13 +308,123 @@ run_brew() {
     return "$rc"
 }
 
-# Quiet query (no step log): prints brew's stdout.
-brew_query() {
+run_brew() {
+    step="$1"; limit="$2"; shift 2
+    run_step "$step" "$limit" "$PREFIX/bin/brew" "$@"
+}
+
+# Quiet query (no step log): prints the tool's stdout. $1 = binary.
+tool_query() {
+    qbin="$1"; shift
     sudo -u "$BREW_USER" \
         HOME="$BREW_HOME" \
-        PATH="$PREFIX/bin:$PREFIX/sbin:/usr/bin:/bin:/usr/sbin:/sbin" \
+        PATH="$(dirname "$qbin"):$PREFIX/bin:$PREFIX/sbin:/usr/bin:/bin:/usr/sbin:/sbin" \
         NONINTERACTIVE=1 HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ANALYTICS=1 HOMEBREW_NO_ENV_HINTS=1 \
-        $ARCH_CMD "$PREFIX/bin/brew" "$@" 2>/dev/null
+        $ARCH_CMD "$qbin" "$@" 2>/dev/null
+}
+brew_query() { tool_query "$PREFIX/bin/brew" "$@"; }
+
+# Delete a gemspec and its unpacked payload (root; Cellar kegs are user-owned).
+remove_gem_spec() {
+    rs_spec="$1"; rs_gem="$2"; rs_ver="$3"; rs_why="$4"
+    log "  REMOVE   $rs_spec  ($rs_why)"
+    if rm -f "$rs_spec"; then
+        rs_payload="$(dirname "$(dirname "$rs_spec")")/gems/${rs_gem}-${rs_ver}"
+        [ -d "$rs_payload" ] && rm -rf "$rs_payload"
+        GEMS_REMOVED=$((GEMS_REMOVED + 1))
+    else
+        log "           rm failed -- leaving it."
+        NEEDS_HUMAN=1
+    fi
+}
+
+# Ruby gems that ship INSIDE Homebrew's Ruby (net-imap, rexml, ...). brew
+# upgrades the interpreter, but the copy bundled in the keg is whatever that
+# Ruby release shipped, and gems in <prefix>/lib/ruby/gems/<abi> are never
+# touched by brew at all. Tenable reads every .gemspec on disk, so a stale
+# copy anywhere a Ruby can load from re-raises the finding (CSPRMB-28,
+# ARMB-02, ARMB-09, CSPRMB-21-A).
+maintain_ruby_gems() {
+    [ -n "$RUBY_GEMS" ] || return 0
+    log ""
+    log "[5b] Ruby gems bundled with Homebrew Ruby: $RUBY_GEMS"
+    found_ruby=0
+    for gembin in "$PREFIX"/opt/ruby/bin/gem "$PREFIX"/opt/ruby@*/bin/gem; do
+        [ -x "$gembin" ] || continue
+        found_ruby=1
+        rlabel=$(basename "$(dirname "$(dirname "$gembin")")")
+        gpath=$(tool_query "$gembin" environment gempath)
+        log "  $rlabel  gem path: $gpath"
+        for entry in $RUBY_GEMS; do
+            g="${entry%%:*}"
+            mode=$(gem_mode "$entry")
+            vers=$(gem_list_versions "$(tool_query "$gembin" list "$g" --exact --local)")
+            if [ -z "$vers" ]; then
+                log "  $rlabel  $g: not installed"
+                continue
+            fi
+            log "  $rlabel  $g: $(echo $vers) (mode: $mode)"
+            if [ "$DRY_RUN" = "1" ]; then
+                log "  [DRY_RUN] would install the newest $g $( [ "$mode" = branch ] && echo 'per branch') and remove older specs"
+                continue
+            fi
+            while IFS= read -r req; do
+                if [ -n "$req" ]; then
+                    run_step "gem_${rlabel}_${g}" "$CASK_TIMEOUT" "$gembin" install "$g" -v "$req" --no-document || true
+                else
+                    run_step "gem_${rlabel}_${g}" "$CASK_TIMEOUT" "$gembin" install "$g" --no-document || true
+                fi
+                TIMED_OUT=0
+            done <<EOF
+$(gem_install_requirements "$mode" "$vers")
+EOF
+            vers=$(gem_list_versions "$(tool_query "$gembin" list "$g" --exact --local)")
+            OLDIFS=$IFS; IFS=':'
+            for gdir in $gpath; do
+                IFS=$OLDIFS
+                for spec in "$gdir"/specifications/"$g"-*.gemspec "$gdir"/specifications/default/"$g"-*.gemspec; do
+                    [ -f "$spec" ] || continue
+                    v=$(gem_spec_version "$g" "$spec")
+                    [ -n "$v" ] || continue
+                    keep=$(gem_keep_version "$mode" "$vers" "$v")
+                    [ "$v" = "$keep" ] && continue
+                    [ -n "$keep" ] || continue
+                    case "$spec" in
+                        */specifications/default/*)
+                            log "  DEFAULT  $spec ($v; $keep installed) -- ships with $rlabel, never deleted."
+                            log "           Fixed only by a newer Ruby; brew upgrade already ran."
+                            continue ;;
+                    esac
+                    remove_gem_spec "$spec" "$g" "$v" "$keep installed in $rlabel"
+                done
+            done
+            IFS=$OLDIFS
+        done
+    done
+    [ "$found_ruby" -eq 0 ] && log "  No Homebrew Ruby (opt/ruby, opt/ruby@*) in $PREFIX."
+
+    # Gem dirs left by a Ruby that brew has since upgraded away (ARMB-09):
+    # no interpreter can load them, and gem install never writes there again.
+    for adir in "$PREFIX"/lib/ruby/gems/*; do
+        [ -d "$adir/specifications" ] || continue
+        abi=$(basename "$adir")
+        live=0
+        for k in "$PREFIX"/Cellar/ruby*/*/lib/ruby/"$abi"; do [ -d "$k" ] && live=1 && break; done
+        [ "$live" -eq 1 ] && continue
+        for entry in $RUBY_GEMS; do
+            g="${entry%%:*}"
+            for spec in "$adir"/specifications/"$g"-*.gemspec; do
+                [ -f "$spec" ] || continue
+                v=$(gem_spec_version "$g" "$spec")
+                [ -n "$v" ] || continue
+                if [ "$DRY_RUN" = "1" ]; then
+                    log "  [DRY_RUN] would remove orphaned $spec (no Ruby $abi left)"
+                    continue
+                fi
+                remove_gem_spec "$spec" "$g" "$v" "orphaned: no Homebrew Ruby with ABI $abi"
+            done
+        done
+    done
 }
 
 GREEDY_FLAG=""
@@ -322,6 +490,7 @@ for PREFIX in $PREFIXES; do
         log "[DRY_RUN] Would upgrade formulae: $(echo $DO_F)"
         log "[DRY_RUN] Would upgrade casks:    $(echo $DO_C)"
         log "[DRY_RUN] Would run brew cleanup"
+        maintain_ruby_gems
         REMAINING="$REMAINING $(echo $DO_F $DO_C)"
         continue
     fi
@@ -385,6 +554,8 @@ for PREFIX in $PREFIXES; do
         [ "${n:-0}" -gt 1 ] && log "  NOTE     $f still has $n kegs in $PREFIX/Cellar (pinned, or in use by a dependent)"
     done
 
+    maintain_ruby_gems
+
     log ""
     log "[6] Still outdated"
     LEFT=$(printf '%s\n%s\n' "$(brew_query outdated --formula --quiet)" "$(brew_query outdated --cask --quiet $GREEDY_FLAG)")
@@ -402,6 +573,7 @@ FAILED=$(echo $FAILED)
 
 log ""
 log "================ SUMMARY ================"
+[ "$GEMS_REMOVED" -gt 0 ] && log "Ruby gem specs removed: $GEMS_REMOVED"
 [ -n "$FAILED" ] && log "Failed casks : $FAILED  (reasons above; logs: $LOG_DIR/homebrew_*_cask_<name>.log)"
 if [ -n "$REMAINING" ]; then
     log "Still outdated: $REMAINING"
