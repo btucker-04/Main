@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# remediate-ruby-gem.sh  (v3.4)
+# remediate-ruby-gem.sh  (v3.5)
 # Generic remediation for a vulnerable Ruby gem on macOS.
 # Platform : macOS (bash 3.2 compatible) | Deploy: Mosyle (runs as root)
 #
@@ -77,6 +77,16 @@
 #   from it, so deleting it cannot break a Ruby. A gem dir whose interpreter
 #   still exists is unchanged -- the guard still refuses to strip the only
 #   copy on that branch.
+#
+# v3.5 (ARMB-02, 2026-10-06, plugin 313278): Cellar/ruby/3.3.5 bundles
+#   net-imap 0.4.9.1. `gem install net-imap` installed 0.6.7 into the same
+#   3.3.0 tree, but per-branch thresholds require a patched 0.4.x before the
+#   0.4.9.1 spec may go, and plain `gem install` only ever fetches the newest
+#   release -- so that guard could never be satisfied and the spec was KEPT.
+#   Step 2a now installs the patched release ON THE VULNERABLE BRANCH
+#   (gem install net-imap -v '>= 0.4.24, < 0.5') into the current Ruby, after
+#   `gem cleanup` so cleanup cannot remove it again. Step 3 then finds the
+#   same-branch sibling and removes the old spec.
 #
 # PER-BRANCH THRESHOLDS: gems are commonly fixed independently per minor line.
 # A flat "greater than X" test is wrong and has caused a real bug here -- a
@@ -263,6 +273,52 @@ case "$THRESHOLDS" in *:*) THRESH_PER_BRANCH=1 ;; esac
 
 spec_version() { echo "$1" | sed -E "s/^${GEM}-([0-9][0-9A-Za-z.]*)\.gemspec$/\1/"; }
 
+# gem install -v requirement for the patched release on VER's own major.minor
+# branch, e.g. 0.4.9.1 -> ">= 0.4.24, < 0.5". Empty unless thresholds are
+# per-branch (with a global minimum, plain `gem install` already satisfies it).
+branch_requirement() {
+    [ "$THRESH_PER_BRANCH" -eq 1 ] || { echo ""; return; }
+    need=$(required_for "$1")
+    [ -n "$need" ] || { echo ""; return; }
+    major=$(echo "$1" | cut -d. -f1)
+    minor=$(echo "$1" | cut -d. -f2)
+    case "$major$minor" in *[!0-9]*|"") echo ""; return ;; esac
+    echo ">= $need, < $major.$((minor + 1))"
+}
+
+# Newest patched version in LIST that Ruby could load in place of SPEC: same
+# scope, same ABI, and (per-branch thresholds) same major.minor. Empty if none.
+patched_sibling_of() {
+    ps_spec="$1"; ps_list="$2"; ps_found=""
+    ps_sc=$(scope_of "$ps_spec")
+    ps_abi=$(abi_of "$ps_spec")
+    ps_branch=$(spec_version "$(basename "$ps_spec")" | cut -d. -f1,2)
+    while IFS= read -r ps_other; do
+        [ -f "$ps_other" ] || continue
+        ps_ov=$(spec_version "$(basename "$ps_other")")
+        [ "$ps_ov" = "$(basename "$ps_other")" ] && continue
+        [ "$(scope_of "$ps_other")" = "$ps_sc" ] || continue
+        ps_oabi=$(abi_of "$ps_other")
+        [ -n "$ps_abi" ] && [ -n "$ps_oabi" ] && [ "$ps_abi" != "$ps_oabi" ] && continue
+        if [ "$THRESH_PER_BRANCH" -eq 1 ]; then
+            [ "$(echo "$ps_ov" | cut -d. -f1,2)" = "$ps_branch" ] || continue
+        fi
+        ps_oneed=$(required_for "$ps_ov")
+        [ -z "$ps_oneed" ] && continue
+        version_ge "$ps_ov" "$ps_oneed" && ps_found="$ps_ov"
+    done < "$ps_list"
+    echo "$ps_found"
+}
+
+collect_specs() {
+    : > "$1"
+    for root in $SEARCH_ROOTS; do
+        [ -d "$root" ] || continue
+        find "$root" -name "${GEM}-*.gemspec" -type f 2>/dev/null >> "$1" || true
+    done
+    sort -u "$1" -o "$1"
+}
+
 # Unit tests source this file for required_for / version_ge; stop before the run.
 if [ "${RUBY_GEM_SELFTEST:-0}" = "1" ]; then
     return 0 2>/dev/null || exit 0
@@ -392,6 +448,7 @@ elif [ -z "$BREW_USER" ] || [ -z "$BREW_PREFIX" ]; then
     log "  Cannot install (no Homebrew and/or no non-root user)."
 elif [ "$DRY_RUN" = "1" ]; then
     log "  [DRY_RUN] Would run: gem install $GEM ; gem cleanup $GEM"
+    [ "$THRESH_PER_BRANCH" -eq 1 ] && log "  [DRY_RUN] ...then gem install $GEM -v '>= <floor>, < <next minor>' for each vulnerable branch with no patched copy"
 else
     GEMBIN="$BREW_PREFIX/opt/ruby/bin/gem"
     [ -x "$GEMBIN" ] || GEMBIN=$(command -v gem 2>/dev/null || true)
@@ -399,6 +456,39 @@ else
         log "  Using $GEMBIN"
         OUT=$(run_as_user "$GEMBIN" install "$GEM" 2>&1); log "  $OUT"
         OUT=$(run_as_user "$GEMBIN" cleanup "$GEM" 2>&1); log "  cleanup: $OUT"
+
+        # 2a. Per-branch thresholds: a vulnerable spec is only removed once a
+        # patched spec on ITS branch is loadable beside it, and `gem install`
+        # above fetched only the newest release. Install the patched release
+        # for each such branch -- after cleanup, which would remove it again.
+        if [ "$THRESH_PER_BRANCH" -eq 1 ]; then
+            collect_specs "$WORK/specs_after"
+            CUR_ABI=$(homebrew_current_abi)
+            BRANCH_REQS=""
+            while IFS= read -r spec; do
+                [ -f "$spec" ] || continue
+                is_default_gem "$spec" && continue
+                [ "$(scope_of "$spec")" = "HOMEBREW" ] || continue
+                [ -n "$CUR_ABI" ] && [ "$(abi_of "$spec")" = "$CUR_ABI" ] || continue
+                ver=$(spec_version "$(basename "$spec")")
+                need=$(required_for "$ver")
+                [ -n "$need" ] || continue
+                version_ge "$ver" "$need" && continue
+                [ -n "$(patched_sibling_of "$spec" "$WORK/specs_after")" ] && continue
+                req=$(branch_requirement "$ver")
+                [ -n "$req" ] || continue
+                case "|$BRANCH_REQS|" in *"|$req|"*) ;; *) BRANCH_REQS="${BRANCH_REQS:+$BRANCH_REQS|}$req" ;; esac
+            done < "$WORK/specs_after"
+            if [ -n "$BRANCH_REQS" ]; then
+                OLDIFS=$IFS; IFS='|'
+                for req in $BRANCH_REQS; do
+                    IFS=$OLDIFS
+                    log "  Branch install: $GEM -v '$req' (patched release on the vulnerable branch)"
+                    OUT=$(run_as_user "$GEMBIN" install "$GEM" -v "$req" 2>&1); log "  $OUT"
+                done
+                IFS=$OLDIFS
+            fi
+        fi
     else
         log "  No usable gem binary found."
     fi
@@ -441,12 +531,7 @@ fi
 # -----------------------------------------------------------------------
 log ""
 log "[3] Removing vulnerable specs (newest patched copy per Ruby tree is kept)..."
-: > "$WORK/specs2"
-for root in $SEARCH_ROOTS; do
-    [ -d "$root" ] || continue
-    find "$root" -name "${GEM}-*.gemspec" -type f 2>/dev/null >> "$WORK/specs2" || true
-done
-sort -u "$WORK/specs2" -o "$WORK/specs2"
+collect_specs "$WORK/specs2"
 [ "$THRESH_PER_BRANCH" -eq 1 ] && log "  (per-branch thresholds: a patched spec must match the branch too)"
 
 REMOVED=0; KEPT=0
@@ -514,22 +599,9 @@ while IFS= read -r spec; do
     # --- normal tree: is a patched copy loadable by THIS Ruby? ---
     myabi=$(abi_of "$spec")
     mybranch=$(echo "$ver" | cut -d. -f1,2)
+    patched_what=$(patched_sibling_of "$spec" "$WORK/specs2")
     patched_here=0
-    patched_what=""
-    while IFS= read -r other; do
-        [ -f "$other" ] || continue
-        overs=$(spec_version "$(basename "$other")")
-        [ "$overs" = "$(basename "$other")" ] && continue
-        [ "$(scope_of "$other")" = "$sc" ] || continue
-        oabi=$(abi_of "$other")
-        [ -n "$myabi" ] && [ -n "$oabi" ] && [ "$myabi" != "$oabi" ] && continue
-        if [ "$THRESH_PER_BRANCH" -eq 1 ]; then
-            [ "$(echo "$overs" | cut -d. -f1,2)" = "$mybranch" ] || continue
-        fi
-        oneed=$(required_for "$overs")
-        [ -z "$oneed" ] && continue
-        if version_ge "$overs" "$oneed"; then patched_here=1; patched_what="$overs"; fi
-    done < "$WORK/specs2"
+    [ -n "$patched_what" ] && patched_here=1
 
     if [ "$patched_here" -eq 0 ]; then
         # ARMB-09 (2026-09-28): the vulnerable spec sat in lib/ruby/gems/3.3.0
