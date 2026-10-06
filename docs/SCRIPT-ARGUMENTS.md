@@ -378,6 +378,20 @@ Prompts the logged-in user to install pending macOS updates. **No arguments.**
 ## update-intellij.sh
 Updates IntelliJ IDEA to the fixed version (force-closes a running IDE). **No runtime arguments** (target version is an in-script constant `TARGET_VERSION`).
 
+## update-homebrew.sh
+Weekly Homebrew maintenance: `brew update`, upgrade every outdated formula and cask, then `brew cleanup` to remove superseded `Cellar/<formula>/<version>` kegs and old portable-ruby trees (the leftovers Tenable keeps reporting after an upgrade). Maintains both `/opt/homebrew` and an Intel `/usr/local` prefix (under Rosetta). brew runs as the owner of each prefix. Casks upgrade one at a time and failures are named with a reason. Reads **environment variables**, with an in-script `CONFIG` block for Mosyle. Exit `0` = all current, `2` = something still outdated (failed / pinned / skipped / timed out), `1` = a prefix could not be maintained.
+
+| Environment variable | CONFIG default | Description |
+|----------------------|----------------|-------------|
+| `DRY_RUN` | `CFG_DRY_RUN="0"` | Set `1` to list what is outdated and change nothing. |
+| `GREEDY` | `CFG_GREEDY="1"` | Also upgrade casks that auto-update themselves (Chrome, Slack, Zoom...). brew skips them by default. |
+| `CASK_SUDO` | `CFG_CASK_SUDO="0"` | Set `1` to give the brew user passwordless sudo for the duration of the run (a `/etc/sudoers.d` drop-in, validated with `visudo`, removed on exit and at the start of the next run). Without it, casks with a `.pkg` installer fail and are listed as "needs sudo". |
+| `AUTOREMOVE` | `CFG_AUTOREMOVE="0"` | Set `1` to run `brew autoremove` (uninstall dependencies nothing needs any more). |
+| `SKIP_FORMULAE` | `CFG_SKIP_FORMULAE=""` | Space-separated formulae to leave alone. Reported as still outdated. |
+| `SKIP_CASKS` | `CFG_SKIP_CASKS=""` | Space-separated casks to leave alone. Reported as still outdated. |
+| `BREW_TIMEOUT` | `CFG_BREW_TIMEOUT="3600"` | Limit in seconds for `update`, the formula upgrade and `cleanup`. Once one hits it, the remaining steps are skipped. `0` = no limit. |
+| `CASK_TIMEOUT` | `CFG_CASK_TIMEOUT="900"` | Limit in seconds per cask. A slow cask fails alone and the rest still run. |
+
 ## update-nodejs.sh
 Updates Node.js across Homebrew / official pkg (per-user managers report-only). **No runtime arguments and no pinned target version.** Installed Homebrew `node` / `node@N` formulae are `brew upgrade`d to the current formula. An official `/usr/local` pkg is raised to the latest stable release of its installed major from `https://nodejs.org/dist/index.json` (a test can point `NODE_DIST_JSON` at a cached index). Brew's download bar and the new/deleted formula and cask catalogs are omitted from the log.
 
