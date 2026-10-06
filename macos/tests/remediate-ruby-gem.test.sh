@@ -71,6 +71,39 @@ check_rc 'ruby@3.3 keg makes ABI 3.3.0 live again' 0 homebrew_abi_has_interprete
 check 'abi_of ARMB-09 spec path' \
   "$(abi_of /opt/homebrew/lib/ruby/gems/3.3.0/specifications/net-imap-0.6.4.gemspec)" '3.3.0'
 
+# --- ARMB-02: bundled 0.4.9.1 in the Cellar keg, 0.6.7 in the shared dir ---
+# Per-branch thresholds need a patched 0.4.x beside 0.4.9.1 before it may go.
+# gem install alone only fetches 0.6.7, so step 2a installs '>= 0.4.24, < 0.5'.
+check 'branch requirement 0.4' "$(branch_requirement 0.4.9.1)" '>= 0.4.24, < 0.5'
+check 'branch requirement 0.5' "$(branch_requirement 0.5.10)" '>= 0.5.15, < 0.6'
+check 'branch requirement 0.6' "$(branch_requirement 0.6.4)" '>= 0.6.4.1, < 0.7'
+check 'branch requirement uncovered' "$(branch_requirement 0.7.1)" ''
+
+b2="$fix/armb02/opt/homebrew"
+BREW_PREFIX="$b2"
+PORTABLE_ROOT=""
+cellar_spec="$b2/Cellar/ruby/3.3.5/lib/ruby/gems/3.3.0/specifications/net-imap-0.4.9.1.gemspec"
+shared="$b2/lib/ruby/gems/3.3.0/specifications"
+mkdir -p "$(dirname "$cellar_spec")" "$shared"
+: > "$cellar_spec"
+: > "$shared/net-imap-0.6.7.gemspec"
+SEARCH_ROOTS="$b2/lib/ruby/gems $b2/Cellar"
+list="$fix/armb02.list"
+collect_specs "$list"
+check 'collect_specs finds both specs' "$(wc -l < "$list" | tr -d ' ')" '2'
+check 'Cellar and shared dir are one tree' "$(scope_of "$cellar_spec")" "$(scope_of "$shared/net-imap-0.6.7.gemspec")"
+check '0.6.7 does not cover the 0.4 branch' "$(patched_sibling_of "$cellar_spec" "$list")" ''
+
+: > "$shared/net-imap-0.4.24.gemspec"
+collect_specs "$list"
+check 'patched 0.4.24 now covers 0.4.9.1' "$(patched_sibling_of "$cellar_spec" "$list")" '0.4.24'
+
+mkdir -p "$b2/lib/ruby/gems/4.0.0/specifications"
+other_abi="$fix/armb02.other"
+printf '%s\n' "$cellar_spec" "$b2/lib/ruby/gems/4.0.0/specifications/net-imap-0.4.24.gemspec" > "$other_abi"
+: > "$b2/lib/ruby/gems/4.0.0/specifications/net-imap-0.4.24.gemspec"
+check 'a different ABI never counts' "$(patched_sibling_of "$cellar_spec" "$other_abi")" ''
+
 if [ "$fail" -ne 0 ]; then
   echo "tests failed"
   exit 1
