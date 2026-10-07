@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Remediation: Microsoft .NET Core security updates (v3.6)
+    Remediation: Microsoft .NET Core security updates (v3.7)
     Nessus Plugin IDs : 302122, 307353 (+ 314679, 320854, 326863 -- same fix)
 
 .DESCRIPTION
@@ -13,6 +13,15 @@
          cleanup removed it (or anything else went sideways), reinstalls
          and re-verifies. Exits 1 if the machine does not end in a
          strictly better state than it started.
+
+    v3.7 (from the CSPC-004 run, 2026-10-06, plugin 326863): every x86 and
+    arm64 SDK parsed as major 0. Get-DotNetSdkEntries read the major from
+    $matches AFTER the '(x86)' arch -match had replaced it, so Phase 1c
+    fetched https://aka.ms/dotnet/0.0/dotnet-sdk-win-x86.exe (a 0.2 MB
+    non-installer), never gave the lone SDK 8.0.420 (x86) a newer sibling,
+    and so never superseded it. That SDK is what holds the 8.0.26 x86
+    runtimes, so their uninstalls kept no-op'ing. Parsing now lives in
+    ConvertTo-SdkEntryInfo, which captures the major first.
 
     v3.6 (from the CSLT-020 run, 2026-09-02): v3.5's -InstallSuccessorMajor
     was SELF-DEFEATING and destructive. Phase 1a installed .NET 10, and
@@ -653,6 +662,19 @@ function Get-ArpRuntimeMajors {
     return $map
 }
 
+function ConvertTo-SdkEntryInfo {
+    # Parses 'Microsoft .NET SDK 8.0.420 (x86)'. Major must be captured before
+    # the arch -match, which replaces $matches.
+    param([string]$DisplayName)
+    if ($DisplayName -notmatch '^Microsoft \.NET SDK\s+(\d+)\.(\d+)\.(\d+)') { return $null }
+    $major = [int]$matches[1]
+    $ver = [version]($matches[1] + '.' + $matches[2] + '.' + $matches[3])
+    $arch = 'x64'
+    if ($DisplayName -match '\(x86\)') { $arch = 'x86' }
+    elseif ($DisplayName -match '\(arm64\)') { $arch = 'arm64' }
+    return [pscustomobject]@{ Version = $ver; Major = $major; Arch = $arch }
+}
+
 function Get-DotNetSdkEntries {
     # Full ARP entries for .NET SDKs, with parsed version and architecture.
     $paths = @(
@@ -660,16 +682,13 @@ function Get-DotNetSdkEntries {
         'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
     )
     $out = @()
-    Get-ItemProperty -Path $paths -ErrorAction SilentlyContinue |
-      Where-Object { $_.DisplayName -match '^Microsoft \.NET SDK\s+(\d+)\.(\d+)\.(\d+)' } | ForEach-Object {
-        $null = $_.DisplayName -match '^Microsoft \.NET SDK\s+(\d+)\.(\d+)\.(\d+)'
-        $ver = [version]($matches[1] + '.' + $matches[2] + '.' + $matches[3])
-        $arch = 'x64'
-        if ($_.DisplayName -match '\(x86\)') { $arch = 'x86' }
-        elseif ($_.DisplayName -match '\(arm64\)') { $arch = 'arm64' }
-        $out += [pscustomobject]@{
-            Name = $_.DisplayName; Version = $ver; Major = [int]$matches[1]
-            Arch = $arch; Entry = $_
+    Get-ItemProperty -Path $paths -ErrorAction SilentlyContinue | ForEach-Object {
+        $info = ConvertTo-SdkEntryInfo -DisplayName $_.DisplayName
+        if ($info) {
+            $out += [pscustomobject]@{
+                Name = $_.DisplayName; Version = $info.Version; Major = $info.Major
+                Arch = $info.Arch; Entry = $_
+            }
         }
     }
     return $out

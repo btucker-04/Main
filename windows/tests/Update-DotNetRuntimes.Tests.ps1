@@ -118,6 +118,21 @@ exit 1
     Remove-Item -LiteralPath $tmp2 -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+# --- SDK DisplayName parsing (CSPC-004, 2026-10-06) --------------------------
+# The x86 SDK parsed as major 0 because the '(x86)' arch match overwrote
+# $matches, so Phase 1c fetched https://aka.ms/dotnet/0.0/dotnet-sdk-win-x86.exe.
+$x86 = ConvertTo-SdkEntryInfo -DisplayName 'Microsoft .NET SDK 8.0.420 (x86)'
+Assert-Eq $x86.Major 8 'x86 SDK major is 8, not 0'
+Assert-Eq $x86.Arch 'x86' 'x86 SDK arch'
+Assert-Eq $x86.Version '8.0.420' 'x86 SDK version'
+$x64 = ConvertTo-SdkEntryInfo -DisplayName 'Microsoft .NET SDK 8.0.420 (x64)'
+Assert-Eq $x64.Major 8 'x64 SDK major'
+Assert-Eq $x64.Arch 'x64' 'x64 SDK arch'
+$arm = ConvertTo-SdkEntryInfo -DisplayName 'Microsoft .NET SDK 10.0.100 (arm64)'
+Assert-Eq $arm.Major 10 'arm64 SDK major'
+Assert-Eq $arm.Arch 'arm64' 'arm64 SDK arch'
+Assert-True ($null -eq (ConvertTo-SdkEntryInfo -DisplayName 'Microsoft .NET Runtime - 8.0.27 (x86)')) 'non-SDK name is rejected'
+
 if ($failed -gt 0) {
     Write-Host "`n$failed test(s) failed"
     exit 1
