@@ -1,30 +1,39 @@
 <#
 .SYNOPSIS
-    Updates Node.js to the fixed release of ITS OWN major line
-    (Nessus Plugin 330668 -- July 29 2026 security releases; supersedes
-    322793 / June 18 2026):
-        22.x -> 22.23.2   24.x -> 24.18.1   26.x -> 26.5.1
+    Updates the Program Files Node.js MSI install to the LATEST release of
+    ITS OWN major line. No pinned target version.
 
 .DESCRIPTION
     Targets the MSI install flagged by Tenable (C:\Program Files\nodejs\).
 
+    v2 (CSRZ-002, 2026-10-07): v1 carried a fixed-version map per major. A
+    stale copy still read 22.x -> 22.23.0, so a host on 22.23.0 logged
+    "Already at or above target. Nothing to do." while Tenable (plugin
+    330668) wanted 22.23.2 -- the same silent no-op already seen on CSLT-136
+    when the map lagged an advisory. The map is gone. The target is looked up
+    at run time from https://nodejs.org/dist/index.json: the newest release
+    on the installed major that ships a Windows MSI for this architecture.
+
     Stays on the installed major line by design -- a developer on 22.x is
-    moved to 22.23.2, NOT jumped to 26.x, because a major bump can break
-    their projects. Override with -TargetVersion for a deliberate jump.
+    moved to the newest 22.x, NOT jumped to 26.x, because a major bump can
+    break their projects. Override with -TargetVersion for a deliberate jump.
 
     Installer sourcing (in order):
       1. -InstallerPath if given
-      2. A staged node-v*-<arch>.msi beside this script, then in C:\
+      2. A staged node-v<target>-<arch>.msi beside this script, then in C:\
       3. Download from https://nodejs.org/dist/v<ver>/node-v<ver>-<arch>.msi
+    If nodejs.org cannot be reached for the version lookup, the newest staged
+    node-v<major>.*-<arch>.msi is used instead.
     Downloads are validated by SIZE and by the MSI/OLE magic header
     (D0 CF 11 E0) so a Zscaler block page can never be handed to msiexec.
 
     Running node.exe ABORTS the run (exit 2) rather than interrupting a
-    developer's dev server / build, unless -ForceCloseNode is passed.
+    developer's dev server / build, unless -ForceCloseNode is passed. This is
+    also what makes EC's own Node patch fail with "application in use".
 
 .PARAMETER TargetVersion
-    Explicit version to install (e.g. '22.23.2'). Default: resolved from the
-    installed major line using the advisory's fixed-version map.
+    Explicit version to install (e.g. '22.23.3'). Default: the latest release
+    of the installed major line.
 
 .PARAMETER InstallerPath
     Full path to a staged node MSI.
@@ -39,7 +48,7 @@
     Deploy via Endpoint Central (SYSTEM). Logs: C:\Logs\CompoSecure.
     The MSI upgrade replaces the install in place (no side-by-side folder to
     clean up, unlike the Homebrew/Cellar case on macOS).
-    Exit: 0 = updated/already current / 2 = skipped (node running) / 1 = failure.
+    Exit: 0 = updated/already latest / 2 = skipped (node running) / 1 = failure.
 #>
 
 [CmdletBinding()]
@@ -49,6 +58,46 @@ param(
     [switch]$ForceCloseNode,
     [switch]$DryRun
 )
+
+$NodeIndexUrl = 'https://nodejs.org/dist/index.json'
+
+# Newest release on major line $Major with a Windows build for $Arch, from the
+# text of nodejs.org/dist/index.json. '' when the line has none. The index
+# never lists 'win-arm64-msi' even though node-v<ver>-arm64.msi is published
+# beside the arm64 zip, so arm64 keys on the zip.
+function Get-LatestNodeRelease {
+    param([string]$IndexJson, [string]$Major, [string]$Arch)
+    $releases = @($IndexJson | ConvertFrom-Json)
+    $msiFile = 'win-' + $Arch + '-msi'
+    if ($Arch -eq 'arm64') { $msiFile = 'win-arm64-zip' }
+    $best = $null
+    foreach ($r in $releases) {
+        $v = ('' + $r.version) -replace '^v', ''
+        if ($v -notmatch '^\d+\.\d+\.\d+$') { continue }
+        if ($v.Split('.')[0] -ne $Major) { continue }
+        if (@($r.files) -notcontains $msiFile) { continue }
+        $vo = [version]$v
+        if ($null -eq $best -or $vo -gt $best) { $best = $vo }
+    }
+    if ($null -eq $best) { return '' }
+    return $best.ToString()
+}
+
+# Newest staged node-v<Major>.x.y-<Arch>.msi among $Names (file names).
+function Select-StagedNodeMsi {
+    param([string[]]$Names, [string]$Major, [string]$Arch)
+    $best = $null; $bestName = ''
+    $pattern = '^node-v(' + $Major + '\.\d+\.\d+)-' + $Arch + '\.msi$'
+    foreach ($n in $Names) {
+        if ($n -match $pattern) {
+            $vo = [version]$Matches[1]
+            if ($null -eq $best -or $vo -gt $best) { $best = $vo; $bestName = $n }
+        }
+    }
+    return $bestName
+}
+
+if ($env:NODEJS_UPDATE_DOTSOURCE -eq '1') { return }
 
 $ErrorActionPreference = 'Stop'
 $LogDir  = 'C:\Logs\CompoSecure'
@@ -62,20 +111,8 @@ function Write-Log {
     Add-Content -Path $LogFile -Value $line -ErrorAction SilentlyContinue
 }
 
-# Fixed versions per major line, from the July 29 2026 advisory (plugin
-# 330668). KEEP THIS MAP CURRENT: the "already at or above target" check
-# EXITS 0, so a stale entry makes this script silently do nothing on a host
-# that is genuinely vulnerable. Observed on CSLT-136 (2026-08-26): Node
-# 24.17.0 installed against a 24.18.1 requirement, while this map still read
-# 24.17.0 -- the run would have reported "already current" and changed nothing.
-$FixedFor = @{
-    '22' = '22.23.2'
-    '24' = '24.18.1'
-    '26' = '26.5.1'
-}
-
 Write-Log '=============================================='
-Write-Log ' Node.js Update -- Plugin 330668 (supersedes 322793)'
+Write-Log ' Node.js Update (v2) -- latest release of the installed major'
 Write-Log (' Host   : ' + $env:COMPUTERNAME)
 Write-Log (' DryRun : ' + $DryRun)
 Write-Log '=============================================='
@@ -108,16 +145,56 @@ $major = $curVer.Major.ToString()
 Write-Log ('  Path      : ' + $nodeExe)
 Write-Log ('  Installed : ' + $curVer + '  (major line ' + $major + '.x)')
 
+$arch = 'x64'
+if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { $arch = 'arm64' }
+
+$searchDirs = @()
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+if ($scriptDir) { $searchDirs += $scriptDir }
+$searchDirs += 'C:\'
+
 # Resolve the target
 if ([string]::IsNullOrWhiteSpace($TargetVersion)) {
-    if ($FixedFor.ContainsKey($major)) {
-        $TargetVersion = $FixedFor[$major]
-        Write-Log ('  Target    : ' + $TargetVersion + '  (fixed release for ' + $major + '.x)')
-    } else {
-        Write-Log ('  Major line ' + $major + '.x is not named in the advisory.') -Level WARN
-        Write-Log '  It may be an EOL/odd-numbered line with no fix in-branch --' -Level WARN
-        Write-Log '  migrate to a supported LTS line, or pass -TargetVersion explicitly.' -Level WARN
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $indexJson = ''
+    try {
+        $indexJson = (Invoke-WebRequest -Uri $NodeIndexUrl -UseBasicParsing -TimeoutSec 60).Content
+    } catch {
+        Write-Log ('  Could not read ' + $NodeIndexUrl + ': ' + $_) -Level WARN
+    }
+    if ($indexJson) {
+        try {
+            $TargetVersion = Get-LatestNodeRelease -IndexJson $indexJson -Major $major -Arch $arch
+        } catch {
+            Write-Log ('  Release index was not valid JSON (block page?): ' + $_) -Level WARN
+        }
+        if ($TargetVersion) {
+            Write-Log ('  Target    : ' + $TargetVersion + '  (latest ' + $major + '.x on nodejs.org)')
+        } else {
+            Write-Log ('  nodejs.org lists no ' + $major + '.x release with a ' + $arch + ' MSI.') -Level WARN
+        }
+    }
+    if (-not $TargetVersion) {
+        foreach ($dir in $searchDirs) {
+            $names = @(Get-ChildItem -Path $dir -Filter ('node-v' + $major + '.*-' + $arch + '.msi') -File -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+            $pick = Select-StagedNodeMsi -Names $names -Major $major -Arch $arch
+            if ($pick) {
+                $InstallerPath = Join-Path $dir $pick
+                $TargetVersion = ($pick -replace '^node-v', '') -replace ('-' + $arch + '\.msi$'), ''
+                Write-Log ('  Target    : ' + $TargetVersion + '  (newest staged MSI: ' + $InstallerPath + ')')
+                break
+            }
+        }
+    }
+    if (-not $TargetVersion) {
+        Write-Log '  No target version: nodejs.org unreachable and no staged MSI for this line.' -Level ERROR
+        Write-Log ('  Stage node-v' + $major + '.x.y-' + $arch + '.msi beside this script or in C:\,') -Level ERROR
+        Write-Log '  or pass -TargetVersion.' -Level ERROR
         exit 1
+    }
+    if (($curVer.Major % 2) -eq 1) {
+        Write-Log ('  ' + $major + '.x is an odd-numbered (non-LTS) line. Updating within it, but it') -Level WARN
+        Write-Log '  goes end-of-life quickly -- plan a move to an even-numbered LTS line.' -Level WARN
     }
 } else {
     Write-Log ('  Target    : ' + $TargetVersion + '  (explicit -TargetVersion)')
@@ -125,7 +202,7 @@ if ([string]::IsNullOrWhiteSpace($TargetVersion)) {
 
 $targetVerObj = [version]$TargetVersion
 if ($curVer -ge $targetVerObj) {
-    Write-Log '  Already at or above target. Nothing to do.'
+    Write-Log '  Already on the latest release of this line. Nothing to do.'
     Write-Log '=============================================='
     exit 0
 }
@@ -159,18 +236,11 @@ if ($nodeProcs) {
 # ==============================================================
 Write-Log ''
 Write-Log '[3/5] Resolving installer...'
-
-$arch = 'x64'
-if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { $arch = 'arm64' }
 Write-Log ('  Architecture: ' + $arch)
 
 $msiName = 'node-v' + $TargetVersion + '-' + $arch + '.msi'
 
 if ([string]::IsNullOrWhiteSpace($InstallerPath)) {
-    $searchDirs = @()
-    $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-    if ($scriptDir) { $searchDirs += $scriptDir }
-    $searchDirs += 'C:\'
     foreach ($dir in $searchDirs) {
         $cand = Join-Path $dir $msiName
         if (Test-Path $cand) { $InstallerPath = $cand; Write-Log ('  Found staged installer: ' + $cand); break }
@@ -263,7 +333,7 @@ if ($newVer -lt $targetVerObj) {
 }
 
 Write-Log ('  SUCCESS: Node.js ' + $curVer + ' -> ' + $newVer)
-Write-Log '  Re-run a Nessus scan to confirm plugin 330668 clears.'
+Write-Log '  Re-run a Nessus scan to confirm the Node.js finding clears.'
 Write-Log '=============================================='
 if ($rebootNeeded) { exit 3010 }
 exit 0
