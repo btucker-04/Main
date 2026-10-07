@@ -89,11 +89,11 @@ Patches every installed .NET runtime channel to its latest build and prunes supe
 | `-InstallSuccessorMajor` | switch | off | For each EOL major found installed, also install the mapped successor major (`$EolSuccessorMajor`; currently only 9 → 10) alongside it — purely additive, never removes or retargets anything. Does not clear the SEoL finding by itself; apps must still be recompiled or opt into `"rollForward": "LatestMajor"` before they use the new major. |
 
 ## Update-NodeJS.ps1
-Updates the Program Files Node.js MSI install, staying on its major line.
+Updates the Program Files Node.js MSI install to the latest release of its installed major line, looked up at run time from `https://nodejs.org/dist/index.json`. No pinned target version; if nodejs.org is unreachable, the newest staged `node-v<major>.x.y-<arch>.msi` is used.
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
-| `-TargetVersion` | string | `''` | Explicit version to install (e.g. `22.23.0`). Default is resolved from the installed major line via the advisory's fixed-version map. |
+| `-TargetVersion` | string | `''` | Explicit version to install (e.g. `22.23.3`), for a deliberate pin or major jump. Default: the latest release of the installed major line. |
 | `-InstallerPath` | string | `''` | Full path to a staged Node MSI. If empty, searches beside the script then `C:\`, then downloads from nodejs.org. |
 | `-ForceCloseNode` | switch | off | Kill running `node.exe` before installing. Default aborts (exit 2) if Node is running. |
 | `-DryRun` | switch | off | Report what would happen without changing anything. |
