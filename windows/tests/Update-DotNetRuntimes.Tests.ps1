@@ -133,6 +133,30 @@ Assert-Eq $arm.Major 10 'arm64 SDK major'
 Assert-Eq $arm.Arch 'arm64' 'arm64 SDK arch'
 Assert-True ($null -eq (ConvertTo-SdkEntryInfo -DisplayName 'Microsoft .NET Runtime - 8.0.27 (x86)')) 'non-SDK name is rejected'
 
+# --- Support status and -InstallSuccessorMajor targets (CSPC-072, 2026-10-12) --
+# .NET 8 was 29 days from end of support; v3.7 only treated $EolMajors (9) as
+# EOL, so -InstallSuccessorMajor did nothing on an 8-only host.
+$dates = @{ 8 = '2026-11-10'; 10 = '2028-11-14' }
+$oct12 = [datetime]'2026-10-12'
+$st = { param($m, $now) Get-MajorSupportStatus -Major $m -EolMajors @(9) -MinSupported 8 -EolDates $dates -WarnDays 180 -Now $now }
+Assert-Eq (& $st 8 $oct12) 'SOON' '.NET 8 on 2026-10-12 is near EOL'
+Assert-Eq (& $st 8 ([datetime]'2026-11-11')) 'EOL' '.NET 8 after its end date is EOL without editing $EolMajors'
+Assert-Eq (& $st 8 ([datetime]'2026-01-01')) 'OK' '.NET 8 outside the warn window is OK'
+Assert-Eq (& $st 9 $oct12) 'EOL' '.NET 9 listed in EolMajors is EOL'
+Assert-Eq (& $st 6 $oct12) 'EOL' '.NET 6 below MinSupported is EOL'
+Assert-Eq (& $st 10 $oct12) 'OK' '.NET 10 is OK'
+
+$map = @{ 8 = 10; 9 = 10 }
+$t = @(Get-SuccessorTargets -EolSeen @() -EolSoonSeen @(8) -Map $map)
+Assert-Eq $t.Count 1 'near-EOL 8 yields one successor target'
+Assert-Eq ('' + $t[0].From + '->' + $t[0].To) '8->10' 'near-EOL 8 maps to 10'
+$t = @(Get-SuccessorTargets -EolSeen @(9) -EolSoonSeen @(8) -Map $map)
+Assert-Eq (($t | ForEach-Object { '' + $_.From + '->' + $_.To }) -join ',') '8->10,9->10' 'EOL and near-EOL majors both targeted, sorted'
+$t = @(Get-SuccessorTargets -EolSeen @(7) -EolSoonSeen @() -Map $map)
+Assert-Eq $t.Count 0 'major with no mapping yields nothing'
+$t = @(Get-SuccessorTargets -EolSeen @(8) -EolSoonSeen @(8) -Map $map)
+Assert-Eq $t.Count 1 'duplicate major targeted once'
+
 if ($failed -gt 0) {
     Write-Host "`n$failed test(s) failed"
     exit 1

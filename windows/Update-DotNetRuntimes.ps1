@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Remediation: Microsoft .NET Core security updates (v3.7)
+    Remediation: Microsoft .NET Core security updates (v3.8)
     Nessus Plugin IDs : 302122, 307353 (+ 314679, 320854, 326863 -- same fix)
 
 .DESCRIPTION
@@ -13,6 +13,19 @@
          cleanup removed it (or anything else went sideways), reinstalls
          and re-verifies. Exits 1 if the machine does not end in a
          strictly better state than it started.
+
+    v3.8 (from the CSPC-072 run, 2026-10-12): -InstallSuccessorMajor did
+    nothing on a .NET 8-only host 29 days before .NET 8's end of support.
+    Phase 1a only considered majors in $EolMajors (9), and $EolSuccessorMajor
+    only mapped 9 -> 10.
+      * Phase 1a now also stages a successor for majors inside the
+        end-of-support warning window ($EolWarnDays), so .NET 10 can be in
+        place before the SEoL findings start. $EolSuccessorMajor adds 8 -> 10.
+      * A major past its $EolDates entry is now EOL automatically. Before,
+        .NET 8 would have dropped out of the warning on 2026-11-10 and not
+        been reported as EOL until someone edited $EolMajors.
+      * A successor shared by two retiring majors (8 and 9 -> 10) is
+        installed once per flavor/arch.
 
     v3.7 (from the CSPC-004 run, 2026-10-06, plugin 326863): every x86 and
     arm64 SDK parsed as major 0. Get-DotNetSdkEntries read the major from
@@ -406,6 +419,30 @@ function Write-Log {
     $line = '[' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '] [' + $Level + '] ' + $Msg
     Write-Host $line
     Add-Content -Path $LogFile -Value $line -ErrorAction SilentlyContinue
+}
+
+function Get-MajorSupportStatus {
+    # 'EOL', 'SOON' (within WarnDays of its end date) or 'OK'. A major past its
+    # $EolDates entry is EOL even if nobody has added it to $EolMajors yet.
+    param([int]$Major, [int[]]$EolMajors, [int]$MinSupported, [hashtable]$EolDates, [int]$WarnDays, [datetime]$Now)
+    if (($EolMajors -contains $Major) -or ($Major -lt $MinSupported)) { return 'EOL' }
+    if ($EolDates.ContainsKey($Major)) {
+        $days = ([datetime]$EolDates[$Major] - $Now).TotalDays
+        if ($days -le 0) { return 'EOL' }
+        if ($days -le $WarnDays) { return 'SOON' }
+    }
+    return 'OK'
+}
+
+function Get-SuccessorTargets {
+    # -InstallSuccessorMajor work list: one { From; To } per EOL or near-EOL
+    # major that has a configured successor, ascending by From.
+    param([int[]]$EolSeen, [int[]]$EolSoonSeen, [hashtable]$Map)
+    $out = @()
+    foreach ($m in (@($EolSeen) + @($EolSoonSeen) | Sort-Object -Unique)) {
+        if ($Map.ContainsKey([int]$m)) { $out += [pscustomobject]@{ From = [int]$m; To = $Map[[int]$m] } }
+    }
+    return $out
 }
 
 function Test-HostFxrLoadFailure {
@@ -975,12 +1012,12 @@ $EolDates        = @{ 8 = '2026-11-10'; 10 = '2028-11-14' }
 $EolWarnDays     = 180
 $EolSoonSeen     = @()
 
-# -InstallSuccessorMajor mapping: EOL major -> the next major to stage
-# alongside it. Microsoft alternates yearly LTS (even)/STS (odd) releases,
-# so an EOL'd STS major's natural migration target is the next LTS. Add an
-# entry here (not a "+1" formula) so a mapping is a deliberate, reviewed
-# decision rather than an assumption baked into the math.
-$EolSuccessorMajor = @{ 9 = 10 }
+# -InstallSuccessorMajor mapping: EOL or near-EOL major -> the next major to
+# stage alongside it. Microsoft alternates yearly LTS (even)/STS (odd)
+# releases, so the natural migration target is the next LTS. Add an entry
+# here (not a "+1" formula) so a mapping is a deliberate, reviewed decision
+# rather than an assumption baked into the math.
+$EolSuccessorMajor = @{ 8 = 10; 9 = 10 }
 
 # Unit tests dot-source this file for the helpers above; stop before the run.
 if ($env:UPDATE_DOTNET_DOTSOURCE -eq '1') { return }
@@ -1075,9 +1112,9 @@ foreach ($key in ($before.Keys | Sort-Object)) {
     Write-Log ('  ' + $key + ' : ' + (($before[$key] | Sort-Object) -join ', '))
     $majorsHere = $before[$key] | ForEach-Object { $_.Major } | Sort-Object -Unique
     foreach ($m in $majorsHere) {
-        if (($EolMajors -contains $m) -or ($m -lt $MinSupported)) {
-            if ($script:EolSeen -notcontains $m) { $script:EolSeen += $m }
-        }
+        $status = Get-MajorSupportStatus -Major $m -EolMajors $EolMajors -MinSupported $MinSupported -EolDates $EolDates -WarnDays $EolWarnDays -Now (Get-Date)
+        if ($status -eq 'EOL' -and $script:EolSeen -notcontains $m) { $script:EolSeen += $m }
+        if ($status -eq 'SOON' -and $script:EolSoonSeen -notcontains $m) { $script:EolSoonSeen += $m }
     }
 }
 $sdks = Get-DotNetSdks
@@ -1160,16 +1197,6 @@ if ($redundantTotal -gt 0) {
 }
 
 # --- majors approaching end of support
-foreach ($key in $before.Keys) {
-    foreach ($m in ($before[$key] | ForEach-Object { $_.Major } | Sort-Object -Unique)) {
-        if (-not $EolDates.ContainsKey([int]$m)) { continue }
-        $eol = [datetime]$EolDates[[int]$m]
-        $days = [math]::Round(($eol - (Get-Date)).TotalDays)
-        if ($days -gt 0 -and $days -le $EolWarnDays -and ($EolSoonSeen -notcontains $m)) {
-            $script:EolSoonSeen += $m
-        }
-    }
-}
 if ($EolSoonSeen.Count -gt 0) {
     Write-Log ''
     foreach ($m in ($EolSoonSeen | Sort-Object)) {
@@ -1225,25 +1252,32 @@ foreach ($key in $before.Keys) {
 # retarget, so migration does not need a second EC deployment round.
 Write-Log ''
 Write-Log '=== Phase 1a: EOL successor major (opt-in, additive only) ==='
-if ($EolSeen.Count -eq 0) {
-    Write-Log '  No EOL majors present -- nothing to do.'
+$retiring = @(@($EolSeen) + @($EolSoonSeen) | Sort-Object -Unique)
+if ($retiring.Count -eq 0) {
+    Write-Log '  No EOL or near-EOL majors present -- nothing to do.'
 } elseif (-not $InstallSuccessorMajor) {
-    Write-Log ('  EOL major(s) present (.NET ' + (($EolSeen | Sort-Object) -join ', .NET ') + ') -- not') -Level WARN
+    Write-Log ('  EOL or near-EOL major(s) present (.NET ' + ($retiring -join ', .NET ') + ') -- not') -Level WARN
     Write-Log '  installing a successor (pass -InstallSuccessorMajor). This only adds a' -Level WARN
     Write-Log '  runtime side by side; it never removes or retargets anything on its own.' -Level WARN
 } else {
-    foreach ($eolMajor in ($EolSeen | Sort-Object)) {
-        if (-not $EolSuccessorMajor.ContainsKey([int]$eolMajor)) {
-            Write-Log ('  .NET ' + $eolMajor + ' has no configured successor in $EolSuccessorMajor -- skipping.') -Level WARN
-            continue
+    $targets = @(Get-SuccessorTargets -EolSeen $EolSeen -EolSoonSeen $EolSoonSeen -Map $EolSuccessorMajor)
+    foreach ($m in $retiring) {
+        if (-not $EolSuccessorMajor.ContainsKey([int]$m)) {
+            Write-Log ('  .NET ' + $m + ' has no configured successor in $EolSuccessorMajor -- skipping.') -Level WARN
         }
-        $successor = $EolSuccessorMajor[[int]$eolMajor]
+    }
+    $staged = @()
+    foreach ($target in $targets) {
+        $eolMajor  = $target.From
+        $successor = $target.To
         Write-Log ('  .NET ' + $eolMajor + ' -> staging .NET ' + $successor + ' alongside it (NOT removing .NET ' + $eolMajor + '):')
         foreach ($key in $before.Keys) {
             $arch        = ($key -split '\|')[0]
             $flavor      = ($key -split '\|')[1]
             $hasEolMajor = [bool]($before[$key] | Where-Object { $_.Major -eq $eolMajor })
             if (-not $hasEolMajor) { continue }
+            if ($staged -contains ($key + '|' + $successor)) { continue }
+            $staged += ($key + '|' + $successor)
             if (Install-Runtime -Flavor $flavor -Major $successor -Arch $arch) {
                 # v3.6: recorded so Phase 3 can prove it SURVIVED the run.
                 # Phase 3's own checklist is built from $before, which can
