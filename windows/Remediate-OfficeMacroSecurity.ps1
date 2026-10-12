@@ -41,6 +41,9 @@
     Components\CompoSecure-OfficeMacroSecurity). At each user's next sign-in,
     Windows runs the same fix once, as that user, against their own HKCU, before
     the desktop loads. The run still exits 2, because that user is not fixed yet.
+    hivelist is checked again after a failed reg load, because another process
+    can mount the hive in between (CSPRLT-68: HKU\{GUID}); if it has, the fix
+    is written through that key instead.
 
     64-BIT. The EC agent runs scripts in 32-bit PowerShell, which sees
     HKLM\SOFTWARE redirected to WOW6432Node. The script relaunches itself in
@@ -177,7 +180,15 @@ function Invoke-NativeCommand {
     } finally {
         $ErrorActionPreference = $prev
     }
-    return [pscustomobject]@{ ExitCode = $code; Output = ($out -join ' ').Trim() }
+    return [pscustomobject]@{ ExitCode = $code; Output = (Format-NativeOutput -Lines $out) }
+}
+
+function Format-NativeOutput {
+    # 5.1 wraps each stderr line in an ErrorRecord and can add a bare
+    # RemoteException record whose text is just the type name.
+    param([string[]]$Lines)
+    $keep = @($Lines | Where-Object { $_ -and $_.Trim() -and ($_.Trim() -ne 'System.Management.Automation.RemoteException') } | ForEach-Object { $_.Trim() })
+    return ($keep -join ' ')
 }
 
 function Test-Needs64BitRelaunch {
@@ -367,9 +378,17 @@ function Invoke-UserHive {
     $load = Invoke-NativeCommand -FilePath 'reg.exe' -Arguments @('load', ('HKU\' + $mount), $ntuser)
     if ($load.ExitCode -ne 0) {
         Write-Log ('  Could not load ' + $ntuser + ': ' + $load.Output) -Level WARN
+        # Another process can mount the hive between the first hivelist check and
+        # reg load (CSPRLT-68: HKU\{GUID}, loaded by something else). Look again.
+        $hl = Get-HiveList
+        $held = Find-LoadedHiveKey -HiveList $hl -NtUserPath $ntuser
+        if ($held) {
+            Write-Log ('  Another process has it loaded at ' + $held + ' -- writing through that key.')
+            Invoke-HiveRemediation -HiveRoot ('Registry::' + $held) -Label $Label -IsMachine $false
+            return
+        }
         Write-Log '  The file is locked, but not by the registry: no hivelist entry holds it.' -Level WARN
         Write-Log '  Loaded user hives right now:' -Level WARN
-        $hl = Get-HiveList
         foreach ($k in ($hl.Keys | Where-Object { $_ -like '\REGISTRY\USER\*' } | Sort-Object)) {
             Write-Log ('    ' + $k + ' = ' + $hl[$k]) -Level WARN
         }
