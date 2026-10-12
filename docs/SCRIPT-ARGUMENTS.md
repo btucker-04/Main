@@ -66,6 +66,14 @@ Channel-agnostic Office Click-to-Run updater.
 | `-NotifyMinutes` | int | `0` | Warn the signed-in user N minutes before open Office apps are force-closed: a message box (`msg.exe`) lists the open apps, then the script waits N minutes before triggering the update. Skipped when no Office app is open, and ignored with `-ForceAppShutdown:$false`. `0` = no warning. |
 | `-NotifyMessage` | string | (built-in) | Custom warning text. Default names the open apps and the delay. |
 
+## Disable-OfficeVbaProjectAccess.ps1
+Plugin 123461. Turns off Trust Center's "Trust access to the VBA project object model" (`AccessVBOM`) for every Office app and version: HKLM (both registry views), every local user profile (mounting `NTUSER.DAT` for users who are signed out), and the Default profile new accounts copy. Group Policy / Intune values (`SOFTWARE\Policies\...`) are reported, not changed, unless `-EnforcePolicy`. Exit `0` = off everywhere, `2` = still on in a policy value or a hive could not be loaded, `1` = a write failed.
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `-EnforcePolicy` | switch | off | Also write a policy value of `0` in every user hive (Office 16.0: Excel, Word, PowerPoint, Access, Outlook, Visio, Project, Publisher). Greys out the checkbox so users cannot re-enable it, and overwrites local policy values of `1`. A real GPO/Intune policy still wins at its next refresh. |
+| `-DryRun` | switch | off | Report what would change without writing anything. |
+
 ## Update-DellBios.ps1
 Stages a model-appropriate Dell BIOS update via Dell Command | Update, with firmware safety guards.
 
