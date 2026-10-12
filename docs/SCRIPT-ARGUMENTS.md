@@ -66,12 +66,14 @@ Channel-agnostic Office Click-to-Run updater.
 | `-NotifyMinutes` | int | `0` | Warn the signed-in user N minutes before open Office apps are force-closed: a message box (`msg.exe`) lists the open apps, then the script waits N minutes before triggering the update. Skipped when no Office app is open, and ignored with `-ForceAppShutdown:$false`. `0` = no warning. |
 | `-NotifyMessage` | string | (built-in) | Custom warning text. Default names the open apps and the delay. |
 
-## Disable-OfficeVbaProjectAccess.ps1
-Plugin 123461. Turns off Trust Center's "Trust access to the VBA project object model" (`AccessVBOM`) for every Office app and version: HKLM (both registry views), every local user profile (mounting `NTUSER.DAT` for users who are signed out), and the Default profile new accounts copy. Group Policy / Intune values (`SOFTWARE\Policies\...`) are reported, not changed, unless `-EnforcePolicy`. Exit `0` = off everywhere, `2` = still on in a policy value or a hive could not be loaded, `1` = a write failed.
+## Remediate-OfficeMacroSecurity.ps1
+Plugins 123459 and 123461 (replaces `Disable-OfficeVbaProjectAccess.ps1`). Fixes the Office Trust Center macro settings Tenable flags, for every Office app and version: `AccessVBOM` nonzero → `0` (VBA project access), `VBAWarnings` `1` (enable all macros) → `2` (disable with notification, the Office default), and Outlook `Level` `1` → `2`. Stricter values (`VBAWarnings` 3/4) are left alone. Covers HKLM (both registry views), every local user profile, and the Default profile new accounts copy.
+
+Users' hives that are already loaded (signed in, left mounted by an earlier script, or loaded under a different key) are found through `HKLM\SYSTEM\CurrentControlSet\Control\hivelist` and written through the key that holds them, so `reg load` never hits the "in use" error for them. `reg load` is only used for hives that are not loaded anywhere. Group Policy / Intune values (`SOFTWARE\Policies\...`) are reported, not changed, unless `-EnforcePolicy`. Exit `0` = nothing flagged remains, `2` = still flagged in a policy value or a hive could not be opened, `1` = a write failed.
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
-| `-EnforcePolicy` | switch | off | Also write a policy value of `0` in every user hive (Office 16.0: Excel, Word, PowerPoint, Access, Outlook, Visio, Project, Publisher). Greys out the checkbox so users cannot re-enable it, and overwrites local policy values of `1`. A real GPO/Intune policy still wins at its next refresh. |
+| `-EnforcePolicy` | switch | off | Also write per-user policy values (`AccessVBOM` 0, `VBAWarnings` 2, Outlook `Level` 2) for Office 16.0 (Excel, Word, PowerPoint, Access, Outlook, Visio, Project, Publisher). Greys out the options so users cannot change them back, and overwrites local policy values. A real GPO/Intune policy still wins at its next refresh. |
 | `-DryRun` | switch | off | Report what would change without writing anything. |
 
 ## Update-DellBios.ps1
