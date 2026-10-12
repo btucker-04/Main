@@ -101,6 +101,23 @@ if ($sh) {
     Assert-Eq $ErrorActionPreference 'Stop' 'caller ErrorActionPreference is restored'
 }
 
+# Windows PowerShell 5.1 appended a bare RemoteException record to reg.exe's
+# stderr in the CSPRLT-68 log; it carries no information.
+Assert-Eq (Format-NativeOutput -Lines @('ERROR: The process cannot access the file.', 'System.Management.Automation.RemoteException', '')) 'ERROR: The process cannot access the file.' 'RemoteException noise and blank lines are dropped'
+Assert-Eq (Format-NativeOutput -Lines @('The operation completed successfully.')) 'The operation completed successfully.' 'normal output is kept'
+Assert-Eq (Format-NativeOutput -Lines @()) '' 'no output is empty'
+
+# --- CSPRLT-68 (2026-10-12): hive under a {GUID} key --------------------------
+# danielmora's NTUSER.DAT was loaded at \REGISTRY\USER\{GUID} by another
+# process; it was not there when first checked, but was a moment later.
+$csprlt68 = @{
+    '\REGISTRY\USER\.DEFAULT' = '\Device\HarddiskVolume3\Windows\System32\config\DEFAULT'
+    '\REGISTRY\USER\{997E2D38-6247-4ABC-BAA8-7D591DAA8C9E}' = '\Device\HarddiskVolume3\Users\danielmora\NTUSER.DAT'
+    '\REGISTRY\USER\S-1-5-19' = '\Device\HarddiskVolume3\Windows\ServiceProfiles\LocalService\NTUSER.DAT'
+    '\REGISTRY\USER\S-1-5-21-3287030498-1702988397-1316986654-3126' = '\Device\HarddiskVolume3\Users\ssenkarik\NTUSER.DAT'
+}
+Assert-Eq (Find-LoadedHiveKey -HiveList $csprlt68 -NtUserPath 'C:\Users\danielmora\NTUSER.DAT') 'HKEY_USERS\{997E2D38-6247-4ABC-BAA8-7D591DAA8C9E}' 'hive held under a {GUID} key is found'
+
 # --- 64-bit relaunch -----------------------------------------------------------
 Assert-Eq (Test-Needs64BitRelaunch -Is64BitOS $true -Is64BitProcess $false) 'True' '32-bit PowerShell on 64-bit Windows relaunches'
 Assert-Eq (Test-Needs64BitRelaunch -Is64BitOS $true -Is64BitProcess $true) 'False' '64-bit PowerShell does not relaunch'
