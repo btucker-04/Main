@@ -85,6 +85,43 @@ Assert-Eq (Find-LoadedHiveKey -HiveList $hl -NtUserPath 'C:\Users\smith\NTUSER.D
 Assert-Eq (Find-LoadedHiveKey -HiveList $hl -NtUserPath 'C:\Users\nobody\NTUSER.DAT') '' 'unloaded hive returns nothing'
 Assert-Eq (Find-LoadedHiveKey -HiveList @{} -NtUserPath 'C:\Users\jdoe\NTUSER.DAT') '' 'empty hivelist returns nothing'
 
+# --- Invoke-NativeCommand (CSPRLT-68, 2026-10-12) -----------------------------
+# reg.exe load wrote to stderr; with $ErrorActionPreference = 'Stop' and 2>&1,
+# Windows PowerShell 5.1 turned that into a terminating NativeCommandError and
+# the run died at the second user. Failures must come back as data.
+$ErrorActionPreference = 'Stop'
+$sh = (Get-Command sh -ErrorAction SilentlyContinue).Source
+if ($sh) {
+    $r = Invoke-NativeCommand -FilePath $sh -Arguments @('-c', 'echo ERROR: in use 1>&2; exit 1')
+    Assert-Eq $r.ExitCode 1 'native failure exit code is returned'
+    Assert-Eq $r.Output 'ERROR: in use' 'native stderr is returned as text'
+    $r = Invoke-NativeCommand -FilePath $sh -Arguments @('-c', 'echo loaded; exit 0')
+    Assert-Eq $r.ExitCode 0 'native success exit code'
+    Assert-Eq $r.Output 'loaded' 'native stdout is returned'
+    Assert-Eq $ErrorActionPreference 'Stop' 'caller ErrorActionPreference is restored'
+}
+
+# --- 64-bit relaunch -----------------------------------------------------------
+Assert-Eq (Test-Needs64BitRelaunch -Is64BitOS $true -Is64BitProcess $false) 'True' '32-bit PowerShell on 64-bit Windows relaunches'
+Assert-Eq (Test-Needs64BitRelaunch -Is64BitOS $true -Is64BitProcess $true) 'False' '64-bit PowerShell does not relaunch'
+Assert-Eq (Test-Needs64BitRelaunch -Is64BitOS $false -Is64BitProcess $false) 'False' '32-bit Windows does not relaunch'
+Assert-Eq ((Get-RelaunchArguments -ScriptPath 'C:\x\s.ps1' -EnforcePolicy $true -DryRun $false) -join ' ') '-NoProfile -ExecutionPolicy Bypass -File C:\x\s.ps1 -EnforcePolicy' 'relaunch passes -EnforcePolicy'
+Assert-Eq ((Get-RelaunchArguments -ScriptPath 'C:\x\s.ps1' -EnforcePolicy $false -DryRun $true) -join ' ') '-NoProfile -ExecutionPolicy Bypass -File C:\x\s.ps1 -DryRun' 'relaunch passes -DryRun'
+
+# --- Sign-in fallback for locked hives ----------------------------------------
+$logon = Get-LogonFixScript
+$parseErrors = $null
+$null = [System.Management.Automation.Language.Parser]::ParseInput($logon, [ref]$null, [ref]$parseErrors)
+Assert-Eq @($parseErrors).Count 0 'sign-in fix script parses'
+Assert-Eq ($logon -match 'HKCU:\\Software\\Microsoft\\Office') 'True' 'sign-in fix targets the user''s own hive'
+Assert-Eq ($logon -match 'Policies') 'False' 'sign-in fix never touches policy keys'
+$stub = Get-ActiveSetupStubPath -Script $logon
+Assert-Eq ($stub -match '^powershell\.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand [A-Za-z0-9+/=]+$') 'True' 'StubPath is a single encoded PowerShell command'
+$b64 = ($stub -split ' ')[-1]
+Assert-Eq ([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($b64))) $logon 'encoded command decodes to the fix script'
+Assert-Eq ($stub.Length -lt 4000) 'True' 'StubPath stays well under the command-line limit'
+Assert-Eq (Get-ActiveSetupVersion -Now ([datetime]'2026-10-12 09:05')) '2026,1012,905,0' 'version is numeric and increases with time'
+
 if ($failed -gt 0) {
     Write-Host "`n$failed test(s) failed"
     exit 1

@@ -31,7 +31,21 @@
     file and the key it is mounted at in
     HKLM\SYSTEM\CurrentControlSet\Control\hivelist, so the script looks the
     file up there and writes through whatever key already holds it. reg load is
-    only used for hives that are not loaded anywhere.
+    only used for hives that are not loaded anywhere, and its failures are
+    logged (with the hivelist contents) instead of stopping the run.
+
+    LOCKED BY SOMETHING ELSE. If reg load still fails, the file is held open
+    by a process outside the registry (CSPRLT-68, 2026-10-12: danielmora's
+    NTUSER.DAT was locked but in no hivelist entry). The script then registers
+    an Active Setup component (HKLM\SOFTWARE\Microsoft\Active Setup\Installed
+    Components\CompoSecure-OfficeMacroSecurity). At each user's next sign-in,
+    Windows runs the same fix once, as that user, against their own HKCU, before
+    the desktop loads. The run still exits 2, because that user is not fixed yet.
+
+    64-BIT. The EC agent runs scripts in 32-bit PowerShell, which sees
+    HKLM\SOFTWARE redirected to WOW6432Node. The script relaunches itself in
+    64-bit PowerShell so it reads 64-bit Office settings and writes Active Setup
+    to the view Windows processes.
 
     Setting values are fixed. Policy values are REPORTED and left alone by
     default: Group Policy or Intune re-applies them, so the fix belongs in that
@@ -150,7 +164,81 @@ function Find-LoadedHiveKey {
     return $null
 }
 
+function Invoke-NativeCommand {
+    # Windows PowerShell 5.1 turns a native command's stderr into a terminating
+    # error under ErrorActionPreference Stop when 2>&1 is used, so run it under
+    # Continue and hand the result back as data.
+    param([string]$FilePath, [string[]]$Arguments)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = @(& $FilePath @Arguments 2>&1 | ForEach-Object { '' + $_ })
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+    return [pscustomobject]@{ ExitCode = $code; Output = ($out -join ' ').Trim() }
+}
+
+function Test-Needs64BitRelaunch {
+    # A 32-bit process (the EC agent is 32-bit) sees HKLM\SOFTWARE redirected to
+    # WOW6432Node, so it misses 64-bit Office settings and writes Active Setup
+    # entries to the wrong view.
+    param([bool]$Is64BitOS, [bool]$Is64BitProcess)
+    return ($Is64BitOS -and -not $Is64BitProcess)
+}
+
+function Get-RelaunchArguments {
+    param([string]$ScriptPath, [bool]$EnforcePolicy, [bool]$DryRun)
+    $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $ScriptPath)
+    if ($EnforcePolicy) { $a += '-EnforcePolicy' }
+    if ($DryRun) { $a += '-DryRun' }
+    return $a
+}
+
+function Get-LogonFixScript {
+    # Runs as the user at sign-in (Active Setup), against their own HKCU. Same
+    # rules as Get-MacroSettingAction for setting values; policy keys are not
+    # user-writable and are left to the SYSTEM run.
+    return @'
+$ErrorActionPreference = 'SilentlyContinue'
+$base = 'HKCU:\Software\Microsoft\Office'
+foreach ($ver in @(Get-ChildItem $base | Where-Object { $_.PSChildName -match '^\d+\.0$' })) {
+    foreach ($app in @(Get-ChildItem $ver.PSPath)) {
+        $sec = $app.PSPath + '\Security'
+        if (-not (Test-Path $sec)) { continue }
+        $p = Get-ItemProperty $sec
+        if ($null -ne $p.AccessVBOM -and ('' + $p.AccessVBOM) -ne '0') { Set-ItemProperty $sec -Name AccessVBOM -Value 0 -Type DWord }
+        if (('' + $p.VBAWarnings) -eq '1') { Set-ItemProperty $sec -Name VBAWarnings -Value 2 -Type DWord }
+        if ($app.PSChildName -eq 'Outlook' -and ('' + $p.Level) -eq '1') { Set-ItemProperty $sec -Name Level -Value 2 -Type DWord }
+    }
+}
+'@
+}
+
+function Get-ActiveSetupStubPath {
+    param([string]$Script)
+    $b64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Script))
+    return ('powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand ' + $b64)
+}
+
+function Get-ActiveSetupVersion {
+    # Active Setup re-runs a component for a user when HKLM's Version is higher
+    # than the one recorded in their HKCU, so each staging gets a newer one.
+    param([datetime]$Now)
+    return ('' + $Now.Year + ',' + ($Now.Month * 100 + $Now.Day) + ',' + ($Now.Hour * 100 + $Now.Minute) + ',0')
+}
+
 if ($env:OFFICE_MACRO_DOTSOURCE -eq '1') { return }
+
+if (Test-Needs64BitRelaunch -Is64BitOS ([Environment]::Is64BitOperatingSystem) -Is64BitProcess ([Environment]::Is64BitProcess)) {
+    $ps64 = $env:WINDIR + '\Sysnative\WindowsPowerShell\v1.0\powershell.exe'
+    if (Test-Path $ps64) {
+        $relaunchArgs = Get-RelaunchArguments -ScriptPath $PSCommandPath -EnforcePolicy $EnforcePolicy -DryRun $DryRun
+        & $ps64 @relaunchArgs
+        exit $LASTEXITCODE
+    }
+}
 
 $LogDir  = 'C:\Logs\CompoSecure'
 $LogFile = $LogDir + '\OfficeMacroSecurity_' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '.log'
@@ -167,6 +255,8 @@ $script:Fixed    = 0
 $script:Reported = 0
 $script:Failed   = 0
 $script:Skipped  = 0
+$script:SkippedUsers = @()
+$ActiveSetupKey = 'HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\CompoSecure-OfficeMacroSecurity'
 
 function Get-HiveList {
     $map = @{}
@@ -274,12 +364,17 @@ function Invoke-UserHive {
     # A private mount name, not the SID: if the user signs in while it is
     # mounted, Windows must not find its own HKU\<SID> slot taken.
     $mount = 'CompoSecure_Macro_' + [guid]::NewGuid().ToString('N').Substring(0, 8)
-    $out = & reg.exe load ('HKU\' + $mount) $ntuser 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        Write-Log ('  Could not load ' + $ntuser + ': ' + ($out -join ' ')) -Level WARN
-        Write-Log '  The file is locked but not listed in hivelist (an app or backup tool has it' -Level WARN
-        Write-Log '  open). The next run after a reboot, or while the user is signed in, will reach it.' -Level WARN
+    $load = Invoke-NativeCommand -FilePath 'reg.exe' -Arguments @('load', ('HKU\' + $mount), $ntuser)
+    if ($load.ExitCode -ne 0) {
+        Write-Log ('  Could not load ' + $ntuser + ': ' + $load.Output) -Level WARN
+        Write-Log '  The file is locked, but not by the registry: no hivelist entry holds it.' -Level WARN
+        Write-Log '  Loaded user hives right now:' -Level WARN
+        $hl = Get-HiveList
+        foreach ($k in ($hl.Keys | Where-Object { $_ -like '\REGISTRY\USER\*' } | Sort-Object)) {
+            Write-Log ('    ' + $k + ' = ' + $hl[$k]) -Level WARN
+        }
         $script:Skipped++
+        $script:SkippedUsers += $Label
         return
     }
     try {
@@ -289,8 +384,7 @@ function Invoke-UserHive {
         for ($i = 0; $i -lt 5 -and -not $unloaded; $i++) {
             [gc]::Collect()
             [gc]::WaitForPendingFinalizers()
-            $null = & reg.exe unload ('HKU\' + $mount) 2>&1
-            $unloaded = ($LASTEXITCODE -eq 0)
+            $unloaded = ((Invoke-NativeCommand -FilePath 'reg.exe' -Arguments @('unload', ('HKU\' + $mount))).ExitCode -eq 0)
             if (-not $unloaded) { Start-Sleep -Seconds 1 }
         }
         if (-not $unloaded) { Write-Log ('  WARNING: could not unload HKU\' + $mount + '; it unloads at reboot.') -Level WARN }
@@ -302,6 +396,7 @@ Write-Log '=============================================='
 Write-Log ' Office macro security -- Plugins 123459 / 123461'
 Write-Log (' Host          : ' + $env:COMPUTERNAME)
 Write-Log (' Running as    : ' + [Security.Principal.WindowsIdentity]::GetCurrent().Name)
+Write-Log (' PowerShell    : ' + $(if ([Environment]::Is64BitProcess) { '64-bit' } else { '32-bit' }))
 Write-Log (' -EnforcePolicy: ' + $EnforcePolicy)
 Write-Log (' -DryRun       : ' + $DryRun)
 Write-Log '=============================================='
@@ -330,6 +425,31 @@ if (-not $defaultProfile) { $defaultProfile = $env:SystemDrive + '\Users\Default
 $defaultProfile = [Environment]::ExpandEnvironmentVariables($defaultProfile)
 if (Test-Path -LiteralPath $defaultProfile) {
     Invoke-UserHive -Sid '' -ProfilePath $defaultProfile -Label 'Default profile (new accounts)'
+}
+
+if ($script:SkippedUsers.Count -gt 0) {
+    Write-Log ''
+    Write-Log '--- Sign-in fallback for hives that could not be opened ---'
+    foreach ($u in $script:SkippedUsers) { Write-Log ('  ' + $u) }
+    $stub = Get-ActiveSetupStubPath -Script (Get-LogonFixScript)
+    $asVer = Get-ActiveSetupVersion -Now (Get-Date)
+    if ($DryRun) {
+        Write-Log ('  [DRYRUN] would register Active Setup ' + $ActiveSetupKey + ' (Version ' + $asVer + ')')
+    } else {
+        try {
+            if (-not (Test-Path $ActiveSetupKey)) { New-Item -Path $ActiveSetupKey -Force | Out-Null }
+            Set-ItemProperty -Path $ActiveSetupKey -Name '(default)' -Value 'CompoSecure Office macro security' -ErrorAction Stop
+            Set-ItemProperty -Path $ActiveSetupKey -Name StubPath -Value $stub -ErrorAction Stop
+            Set-ItemProperty -Path $ActiveSetupKey -Name Version -Value $asVer -ErrorAction Stop
+            Set-ItemProperty -Path $ActiveSetupKey -Name IsInstalled -Value 1 -Type DWord -ErrorAction Stop
+            Write-Log ('  Registered Active Setup (Version ' + $asVer + '). At each user''s next sign-in,')
+            Write-Log '  Windows runs the fix once as that user against their own registry, before'
+            Write-Log '  the desktop loads. Re-run this script afterwards to confirm.'
+        } catch {
+            Write-Log ('  FAILED to register Active Setup: ' + $_) -Level ERROR
+            $script:Failed++
+        }
+    }
 }
 
 Write-Log ''
