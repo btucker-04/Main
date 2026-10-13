@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# update-adobe-rum.sh  (v6)
+# update-adobe-rum.sh  (v7)
 # Generic Adobe updater via Remote Update Manager (RUM).
 # Platform : macOS (bash 3.2 compatible) | Deploy: Mosyle (runs as root)
 #
@@ -19,6 +19,18 @@
 # 2026-08-07, running as root). Unfiltered is the reliable path. Set SAP_CODES to
 # target specific products; if that call fails the script falls back to
 # unfiltered unless NO_FALLBACK=1.
+#
+# v7 (from the 2026-10-13 CSMB-002 run):
+#   * On an Acrobat-only Mac, RUM 3.1 prints 'No new updates are available
+#     for Acrobat/Reader' and exits with Return Code (2). v6 counted that as
+#     a RUM failure and ended '(failed)', exit 1. When stdout says no updates,
+#     reports no failure, and every installed Adobe app is Acrobat/Reader,
+#     the call is now treated as 'nothing offered'.
+#   * The 'Failed to initialize the HDPIM module' lines on that Mac are
+#     expected: HDPIM is the Creative Cloud install engine, and Acrobat-only
+#     packages do not deploy it. When a Creative Cloud app (Bridge,
+#     Photoshop, ...) IS installed and the current run logged an HDPIM
+#     failure, that is reported as the likely blocker.
 #
 # v6 (from the 2026-09-14 ARMB-08 run):
 #   * A live RemoteUpdateManager that has been running for STALE_RUM_SECONDS
@@ -287,6 +299,13 @@ dump_rum_log() {
 # 'MM/DD/YY HH:MM:SS:mmm' log format (macOS only -- this script is macOS-only
 # throughout).
 recent_lock_message() {
+    recent_rum_log_line "Another instance of RemoteUpdateManager is already running"
+}
+
+# $1 = case-insensitive grep pattern. Prints the first log line matching it
+# with a timestamp within the last 90s; returns 1 if none.
+recent_rum_log_line() {
+    pattern="$1"
     # NOTE: matches are read via a heredoc (<<EOF2), not piped into the while
     # loop. Piping into 'while read' runs the loop in a SUBSHELL in bash, so a
     # 'return' inside it cannot propagate out of this function -- the first
@@ -301,7 +320,7 @@ recent_lock_message() {
                 "$HOME/Library/Logs/RemoteUpdateManager.log" \
                 /Users/*/Library/Logs/RemoteUpdateManager.log; do
         [ -f "$cand" ] || continue
-        matches=$(grep -i "Another instance of RemoteUpdateManager is already running" "$cand" 2>/dev/null | tail -5)
+        matches=$(grep -i "$pattern" "$cand" 2>/dev/null | tail -5)
         [ -z "$matches" ] && continue
         while IFS= read -r line; do
             [ -z "$line" ] && continue
@@ -547,11 +566,58 @@ run_rum() {
     return $rc
 }
 
+# $1 = RUM stdout. True when RUM said there was nothing to install and printed
+# no failure of its own.
+rum_said_no_updates() {
+    printf '%s\n' "$1" | grep -q "No new updates are available" || return 1
+    ! printf '%s\n' "$1" | grep -Eqi "fail|error|could not|unable"
+}
+
+# $1 = inventory file. True when every Adobe app is Acrobat/Reader, which RUM
+# updates without HDPIM. Anything else (Creative Cloud apps, the Creative
+# Cloud app itself) needs HDPIM, so its absence is a real failure there.
+only_acrobat_apps() {
+    [ -s "$1" ] || return 1
+    ! grep -v '^/Applications/Adobe Acrobat' "$1" | grep -q .
+}
+
+report_hdpim_failure() {
+    hit=$(recent_rum_log_line "Failed to initialize the HDPIM module") || return 0
+    if only_acrobat_apps "$WORK/before"; then
+        log "  NOTE: RUM could not load HDPIM. Expected here: only Acrobat/Reader is"
+        log "  installed, and HDPIM ships with Creative Cloud packages, not Acrobat."
+        return 0
+    fi
+    log "  HDPIM FAILURE: $hit"
+    log "  HDPIM is the Creative Cloud install engine RUM uses for every non-Acrobat"
+    log "  app (Bridge, Photoshop, Illustrator, ...). Without it RUM cannot update"
+    log "  them. Fix: reinstall the Creative Cloud desktop app, or redeploy the"
+    log "  Admin Console package for these apps, then re-run this script."
+}
+
+# Runs one RUM install call; sets RUM_OK=1 on success or on a 'nothing offered'
+# exit that only_acrobat_apps says can be trusted.
+rum_install_call() {
+    if run_rum "$@"; then
+        RUM_OK=1
+        return 0
+    fi
+    if rum_said_no_updates "$LAST_RUM_OUT" && only_acrobat_apps "$WORK/before"; then
+        log "    RUM offered no updates (non-zero code with 'No new updates' on an"
+        log "    Acrobat/Reader-only Mac is RUM's normal 'nothing to do' exit)."
+        RUM_OK=1
+        RUM_NOTHING=1
+        return 0
+    fi
+    return 1
+}
+
 rum_install_once() {
     RUM_OK=0
+    RUM_NOTHING=0
     if [ -n "$SAP_CODES" ]; then
-        if run_rum "install ($SAP_CODES)" --productVersions="$SAP_CODES" --action=install; then
-            RUM_OK=1
+        if rum_install_call "install ($SAP_CODES)" --productVersions="$SAP_CODES" --action=install; then
+            :
         else
             log "  Targeted install failed. --productVersions is a known cause of an"
             log "  immediate RC 1 on some RUM builds."
@@ -560,13 +626,19 @@ rum_install_once() {
                 log "  NO_FALLBACK=1 -- not retrying unfiltered."
             else
                 log "  Retrying unfiltered. NOTE: this updates EVERY Adobe product here."
-                run_rum "install (all products)" --action=install && RUM_OK=1
+                rum_install_call "install (all products)" --action=install
             fi
         fi
     else
-        run_rum "install (all products)" --action=install && RUM_OK=1
+        rum_install_call "install (all products)" --action=install
     fi
 }
+
+if [ "${RUM_SELFTEST:-0}" = "lib" ]; then
+    trap - EXIT
+    rm -rf "$WORK"
+    return 0 2>/dev/null || exit 0
+fi
 
 if [ "${RUM_SELFTEST:-0}" = "1" ] || [ "${RUM_SELFTEST:-0}" = "kill" ]; then
     fail=0
@@ -782,6 +854,7 @@ if [ "$RUM_OK" -eq 0 ]; then
 fi
 kill "$CAFFEINATE_PID" 2>/dev/null; CAFFEINATE_PID=""
 report_signature_mismatches
+report_hdpim_failure
 
 # -----------------------------------------------------------------------
 # 7. Inventory after -- the authority
@@ -868,6 +941,13 @@ else
         log "        RUM also failed. See the Adobe log tail above."
         log "===== END (failed) ====="
         exit 1
+    fi
+    if [ "$RUM_NOTHING" -eq 1 ]; then
+        log "        RUM offered no updates for the Acrobat/Reader install here, so it"
+        log "        is current from Adobe's side. If Tenable flags this host, check"
+        log "        that the finding is for this asset and for an app listed in [1]."
+        log "===== END (nothing offered) ====="
+        exit 2
     fi
     log "        RUM reported success with nothing to apply -- likely already current"
     log "        from RUM's point of view, which is itself a finding if Tenable"

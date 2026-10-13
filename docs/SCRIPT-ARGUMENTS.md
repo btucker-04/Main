@@ -315,6 +315,8 @@ Generic Adobe updater via Remote Update Manager. Reads **environment variables**
 | `DRY_RUN` | `CFG_DRY_RUN="0"` | Set `1` to inventory + run `RUM --action=list` only; install nothing. |
 | `IGNORE_HELPERS` | `CFG_IGNORE_HELPERS="1"` | Set `0` to treat Adobe background helper/XPC processes as blockers (strict behavior). |
 
+On a Mac with only Acrobat/Reader installed, RUM's `No new updates are available` with Return Code (2) is treated as nothing offered (`END (nothing offered)`, exit 2), not a failure. Its `Failed to initialize the HDPIM module` log lines are expected there. When a Creative Cloud app is installed, the same HDPIM failure is reported as the blocker. For Bridge (plugin 331360): `TARGETS="Bridge 2026=16.0.6;Bridge 2025=15.1.7"`.
+
 ## remediate-ruby-gem.sh
 Generic vulnerable-gem remediator. Accepts, in precedence order, **positional args > environment variables > in-script `CONFIG` block**.
 
