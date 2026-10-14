@@ -144,6 +144,36 @@ Dependency files: the CWA installer(s) (required), plus optionally the .NET 10 x
 | `-RemoveDotNet8` | switch | off | When nothing still needs .NET 8, run the staged `Remove-DotNetEolChannel.ps1 -DotNet8 -RemoveStaleFolders` (also removes the swidtag and Package Cache leftovers Tenable reads). Blocked (exit 2) on a CWA below 26.7, without .NET 10 x86, or when a .NET 8 app is found; skipped after a failed upgrade. |
 | `-DryRun` | switch | off | Report what would happen without changing anything (passes `-DryRun` to the remover too). |
 
+## Install-SqlExpress2022.ps1
+Installs SQL Server 2022 Express from staged offline media. Stage `SQLEXPR_x64_ENU.exe` (Express Core) or `SQLEXPRADV_x64_ENU.exe` (Express Advanced, needed for `FullText`/`PolyBase`), taken from `SQL2022-SSEI-Expr.exe` > Download Media. The script extracts the package to `C:\Windows\Temp\SQLEXPR2022`, checks that `setup.exe` is version 16.x (SQL Server 2019 Express uses the same file name), and runs setup quietly. Setup runs as SYSTEM under EC, so it adds the `-SqlSysAdmins` accounts as sysadmins rather than the current user.
+
+Stage a `SQLServer2022-KB<number>-x64.exe` cumulative update or GDR alongside the media. If several are staged, the highest KB number is used. A new install gets it slipstreamed (`/UPDATEENABLED=True /UPDATESOURCE`). An existing 2022 instance on an older build gets it with `/ACTION=Patch`. The RTM build (16.0.1000.6) is vulnerable, so always stage the current update. Without an update, setup runs with `/UPDATEENABLED=False`.
+
+An existing instance of the same name is handled as follows:
+- **SQL Server 2022:** left alone, apart from the staged update.
+- **Older (for example 2019, `MSSQL15`):** reported (exit 2) unless `-UpgradeExisting` is passed.
+- **Newer than 2022:** left alone.
+
+A pending reboot defers the run (exit 2), because setup's RebootRequiredCheck rule would fail. Setup also needs .NET Framework 4.7.2 or later.
+
+After installing, the script checks that the instance is registered as `MSSQL16.<name>`, logs its build, and checks that the service (`MSSQL$<name>`) is running. It copies the Final result and Exit message from setup's `Summary.txt` (`C:\Program Files\Microsoft SQL Server\160\Setup Bootstrap\Log`) into its own log. It relaunches as 64-bit under the 32-bit EC agent.
+
+Dependency files: the Express package (required) and optionally the update. Exit `0` = installed or already present, `3010` = done with reboot needed, `2` = deferred (pending reboot) or an older instance needs `-UpgradeExisting`, `1` = failed. Log: `C:\Logs\CompoSecure\SqlExpress2022_<timestamp>.log`.
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `-InstanceName` | string | `SQLEXPRESS` | Instance to install. `MSSQLSERVER` installs the default instance. |
+| `-Features` | string | `SQLEngine` | Comma-separated setup features. `FullText`/`PolyBase` need the Advanced package. |
+| `-SqlSysAdmins` | string | `BUILTIN\Administrators` | Comma-separated Windows accounts or groups made sysadmin. |
+| `-SaPassword` | string | `''` | Enables mixed-mode authentication with this `sa` password. Masked in the log, but visible in EC's script arguments; prefer Windows authentication. |
+| `-EnableTcp` | switch | off | Enable TCP/IP (off by default for Express). The firewall is not changed. |
+| `-TcpPort` | int | `0` | Fixed TCP port; implies `-EnableTcp`. `0` = dynamic. |
+| `-DataDir` | string | `''` | Root folder for database files (`/INSTALLSQLDATADIR`). |
+| `-MediaPath` | string | `''` | Full path to the package, an extracted media folder, or its `setup.exe`. Default: the `SQLEXPR*.exe` beside the script, then `C:\`. |
+| `-UpgradeExisting` | switch | off | Upgrade an older instance of the same name in place (`/ACTION=Upgrade`). Back up its databases first. |
+| `-IgnorePendingReboot` | switch | off | Install despite a pending reboot (`/SKIPRULES=RebootRequiredCheck`). |
+| `-DryRun` | switch | off | Report what would happen without changing anything. |
+
 ## Get-DriveInventory.ps1
 Read-only drive/storage inventory. **No arguments.**
 
