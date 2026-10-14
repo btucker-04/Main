@@ -126,6 +126,29 @@ Assert-Eq (Get-InstallOutcome -ExitCode 3010) 'REBOOT' 'exit 3010'
 Assert-Eq (Get-InstallOutcome -ExitCode 1641) 'REBOOT' 'exit 1641'
 Assert-Eq (Get-InstallOutcome -ExitCode 1603) 'FAIL' 'exit 1603'
 Assert-Eq (Get-InstallOutcome -ExitCode -1) 'FAIL' 'timeout'
+Assert-Eq (Get-InstallOutcome -ExitCode $null) 'UNKNOWN' 'CSLT-057: blank exit code is not read as 0'
+Assert-Eq (Get-InstallOutcome -ExitCode '') 'UNKNOWN' 'empty exit code'
+
+# --- CSLT-057 (2026-10-14): 2603 -> 2607 (x64), .NET 8 x86 only, Dell x64 apps --
+Assert-Eq (Get-CwaInstalledArch -DisplayName 'Citrix Workspace 2607 (x64)' -IsWow $true -InstallLocation '' -OsArch 'x64') 'x64' '(x64) in the name wins'
+Assert-Eq (Get-CwaInstalledArch -DisplayName 'Citrix Workspace 2607 (ARM64)' -IsWow $false -InstallLocation '' -OsArch 'arm64') 'arm64' '(ARM64) in the name'
+Assert-Eq (Get-CwaInstalledArch -DisplayName 'Citrix Workspace 2603' -IsWow $true -InstallLocation '' -OsArch 'x64') 'x86' 'no suffix + WOW entry is 32-bit'
+Assert-Eq (Get-InstallerArch -Name 'CitrixWorkspaceFullInstaller_x64.exe' -PeMachine 0x14c) 'x64' 'Citrix full installer x64 file name'
+Assert-Eq (ConvertTo-PeArch -Machine 0x14c) 'x86' 'PE x86'
+Assert-Eq (ConvertTo-PeArch -Machine 0x8664) 'x64' 'PE x64'
+Assert-Eq (ConvertTo-PeArch -Machine 0xAA64) 'arm64' 'PE arm64'
+Assert-Eq (ConvertTo-PeArch -Machine 0) '' 'PE unknown'
+$cslt057 = @(
+    [pscustomobject]@{ Framework = 'Microsoft.NETCore.App'; Version = '8.0.31'; Arch = 'x86' },
+    [pscustomobject]@{ Framework = 'Microsoft.WindowsDesktop.App'; Version = '8.0.31'; Arch = 'x86' }
+)
+Assert-Eq (Test-Net8AppUsesInstalled -Framework 'Microsoft.NETCore.App' -Arch 'x64' -Installed $cslt057) 'False' 'Dell x64 app cannot use x86 .NET 8 -> not a blocker'
+Assert-Eq (Test-Net8AppUsesInstalled -Framework 'Microsoft.NETCore.App' -Arch 'x86' -Installed $cslt057) 'True' 'x86 app uses x86 .NET 8'
+Assert-Eq (Test-Net8AppUsesInstalled -Framework 'Microsoft.NETCore.App' -Arch '' -Installed $cslt057) 'True' 'no apphost: any architecture counts'
+Assert-Eq (Test-Net8AppUsesInstalled -Framework 'Microsoft.AspNetCore.App' -Arch 'x86' -Installed $cslt057) 'False' 'framework not installed'
+Assert-Eq (Test-Net8AppUsesInstalled -Framework 'Microsoft.NETCore.App' -Arch 'x64' -Installed @()) 'False' 'no .NET 8 at all'
+Assert-Eq (Format-DotNet8Folders -Folders $cslt057) 'Microsoft.NETCore.App 8.0.31 (x86); Microsoft.WindowsDesktop.App 8.0.31 (x86)' 'inventory line'
+Assert-Eq (Format-DotNet8Folders -Folders @()) 'none' 'inventory none'
 
 # --- runtimeconfig.json ------------------------------------------------------
 $net8 = '{"runtimeOptions":{"tfm":"net8.0","framework":{"name":"Microsoft.WindowsDesktop.App","version":"8.0.0"}}}'

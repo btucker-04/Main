@@ -139,7 +139,7 @@ $DotNet10MinCwaVersion = [version]'26.7'
 $DotNet10MinDesktop    = [version]'10.0.9'
 $SessionProcesses = @('wfica32', 'wfica', 'CDViewer')
 $CwaProcesses     = @('wfica32', 'wfica', 'CDViewer', 'SelfService', 'SelfServicePlugin', 'Receiver', 'concentr', 'redirector', 'AuthManSvr', 'WebHelper')
-$InstallTimeoutMinutes = 30
+$InstallTimeoutMinutes = 60
 
 function ConvertTo-SafeVersion {
     param([string]$Text)
@@ -180,10 +180,13 @@ function ConvertTo-OsArch {
 }
 
 function Get-CwaInstalledArch {
-    # Install folder first (32-bit CWA lives in Program Files (x86)), then the
-    # registry view its uninstall entry is in.
-    param([bool]$IsWow, [string]$InstallLocation, [string]$OsArch)
+    # The 64-bit builds name themselves ('Citrix Workspace 2607 (x64)',
+    # CSLT-057); otherwise the install folder (32-bit CWA lives in Program
+    # Files (x86)), then the registry view its uninstall entry is in.
+    param([string]$DisplayName, [bool]$IsWow, [string]$InstallLocation, [string]$OsArch)
     if ($OsArch -eq 'x86') { return 'x86' }
+    if ($DisplayName -match '(?i)\(ARM64\)') { return 'arm64' }
+    if ($DisplayName -match '(?i)\(x64\)') { return 'x64' }
     if ($InstallLocation -match '(?i)\\Program Files \(x86\)\\') { return 'x86' }
     if ($InstallLocation -match '(?i)\\Program Files\\') { return $OsArch }
     if ($IsWow) { return 'x86' }
@@ -265,8 +268,10 @@ function Get-CwaInstallArguments {
 }
 
 function Get-InstallOutcome {
-    param([int]$ExitCode)
-    switch ($ExitCode) {
+    # UNKNOWN: no exit code was reported; the version check decides.
+    param($ExitCode)
+    if ($null -eq $ExitCode -or ('' + $ExitCode) -eq '') { return 'UNKNOWN' }
+    switch ([int]$ExitCode) {
         0       { return 'OK' }
         3010    { return 'REBOOT' }
         1641    { return 'REBOOT' }
@@ -292,6 +297,30 @@ function Get-RuntimeConfigNet8Need {
         if (('' + $fw.version) -match '^8\.') { return ('' + $fw.name + ' ' + $fw.version) }
     }
     return $null
+}
+
+function ConvertTo-PeArch {
+    param([int]$Machine)
+    switch ($Machine) {
+        0x014C  { return 'x86' }
+        0x8664  { return 'x64' }
+        0xAA64  { return 'arm64' }
+        default { return '' }
+    }
+}
+
+function Test-Net8AppUsesInstalled {
+    # True when a .NET 8 folder this app can load is installed: same shared
+    # framework, and the same architecture as its apphost (any architecture
+    # when the app has no apphost). An x64 app cannot load the x86 runtime,
+    # so removing x86 .NET 8 does not affect it (CSLT-057: Dell DTP
+    # diagnostics, x64, on a machine with only x86 .NET 8).
+    param([string]$Framework, [string]$Arch, [object[]]$Installed)
+    foreach ($i in $Installed) {
+        if ($i.Framework -ne $Framework) { continue }
+        if (-not $Arch -or $i.Arch -eq $Arch) { return $true }
+    }
+    return $false
 }
 
 function Get-DotNet8Blockers {
@@ -351,6 +380,12 @@ function Get-PeMachine {
             return [int]$br.ReadUInt16()
         } finally { $fs.Close() }
     } catch { return 0 }
+}
+
+function Format-DotNet8Folders {
+    param([object[]]$Folders)
+    if (-not $Folders -or $Folders.Count -eq 0) { return 'none' }
+    return (($Folders | ForEach-Object { $_.Framework + ' ' + $_.Version + ' (' + $_.Arch + ')' }) -join '; ')
 }
 
 if ($env:CITRIX_WORKSPACE_DOTSOURCE -eq '1') { return }
@@ -418,11 +453,12 @@ function Get-X86DesktopVersions {
 }
 
 function Get-DotNet8Folders {
+    # Objects: Framework, Version, Arch.
     $out = @()
     foreach ($r in Get-DotNetRoots) {
         foreach ($fw in @(Get-ChildItem ($r.Path + '\shared') -Directory -ErrorAction SilentlyContinue)) {
             foreach ($d in @(Get-ChildItem $fw.FullName -Directory -Filter '8.*' -ErrorAction SilentlyContinue)) {
-                $out += ($fw.Name + ' ' + $d.Name + ' (' + $r.Arch + ')')
+                $out += [pscustomobject]@{ Framework = $fw.Name; Version = $d.Name; Arch = $r.Arch }
             }
         }
     }
@@ -430,8 +466,10 @@ function Get-DotNet8Folders {
 }
 
 function Find-Net8Apps {
-    # Framework-dependent apps bound to an 8.x shared framework. The dotnet
-    # folders themselves (SDK tools) are left to Remove-DotNetEolChannel.ps1.
+    # Framework-dependent apps bound to an 8.x shared framework, as objects:
+    # Path, Framework, Arch (from the apphost .exe beside the runtimeconfig;
+    # '' when there is none). The dotnet folders themselves (SDK tools) are
+    # left to Remove-DotNetEolChannel.ps1.
     $dirs = @($env:ProgramFiles)
     if (${env:ProgramFiles(x86)}) { $dirs += ${env:ProgramFiles(x86)} }
     foreach ($u in @(Get-ChildItem 'C:\Users' -Directory -ErrorAction SilentlyContinue)) {
@@ -444,7 +482,11 @@ function Find-Net8Apps {
             if ($f.FullName -match '\\dotnet\\') { continue }
             $json = Get-Content -LiteralPath $f.FullName -Raw -ErrorAction SilentlyContinue
             $need = Get-RuntimeConfigNet8Need -Json $json
-            if ($need) { $hits += ($f.FullName + '  [' + $need + ']') }
+            if (-not $need) { continue }
+            $exe = $f.FullName -replace '\.runtimeconfig\.json$', '.exe'
+            $arch = ''
+            if (Test-Path -LiteralPath $exe) { $arch = ConvertTo-PeArch -Machine (Get-PeMachine -Path $exe) }
+            $hits += [pscustomobject]@{ Path = $f.FullName; Framework = ($need -split ' ')[0]; Need = $need; Arch = $arch }
         }
     }
     return $hits
@@ -484,14 +526,19 @@ function Test-ExeHeader {
 
 function Invoke-Installer {
     # Full path + -NoNewWindow: a bare filename goes through ShellExecute and
-    # can fail under EC's SYSTEM context. Returns the exit code, or -1 on timeout.
+    # can fail under EC's SYSTEM context. Returns the exit code, -1 on timeout,
+    # or $null if Windows did not report one.
     param([string]$Path, [string[]]$Arguments, [int]$TimeoutMinutes)
     Write-Log ('  Running: ' + $Path + ' ' + ($Arguments -join ' '))
     $p = Start-Process -FilePath $Path -ArgumentList $Arguments -NoNewWindow -PassThru
+    # Without an open handle, ExitCode is empty after WaitForExit(timeout)
+    # (CSLT-057: both installers logged 'Exit code: ' blank).
+    $null = $p.Handle
     if (-not $p.WaitForExit($TimeoutMinutes * 60 * 1000)) {
         Write-Log ('  Still running after ' + $TimeoutMinutes + ' minutes; leaving it to finish.') -Level ERROR
         return -1
     }
+    $p.WaitForExit()
     return $p.ExitCode
 }
 
@@ -527,24 +574,29 @@ function Install-DotNet10Desktop {
     $bundleLog = $LogDir + '\CitrixWorkspace_dotnet10_x86_bundle.log'
     $dq = [string][char]34
     $code = Invoke-Installer -Path $exe -Arguments @('/install', '/quiet', '/norestart', '/log', ($dq + $bundleLog + $dq)) -TimeoutMinutes 20
-    Write-Log ('  Exit code: ' + $code)
+    Write-Log ('  Exit code: ' + $(if ($null -eq $code) { '(not reported)' } else { $code }))
     if (-not $staged) { Remove-Item $exe -Force -ErrorAction SilentlyContinue }
     $outcome = Get-InstallOutcome -ExitCode $code
+    if ($outcome -eq 'UNKNOWN') {
+        $now = @(Get-X86DesktopVersions | Where-Object { $_ -ge $DotNet10MinDesktop })
+        if ($now.Count -gt 0) { $outcome = 'OK' } else { $outcome = 'FAIL' }
+        Write-Log ('  No exit code; .NET 10 x86 now present: ' + ($now.Count -gt 0))
+    }
     if ($outcome -eq 'FAIL') { Write-Log ('  Bundle log: ' + $bundleLog) -Level ERROR }
     return $outcome
 }
 
 function Write-CwaInstallLogHint {
+    # Newest across both Program Files trees: 32-bit and 64-bit CWA log to
+    # different ones, and an older run's folder can sit in the other tree.
+    $all = @()
     foreach ($base in @(${env:ProgramFiles(x86)}, $env:ProgramFiles)) {
         if (-not $base) { continue }
-        $latest = Get-ChildItem ($base + '\Citrix\Logs') -Filter 'CTXWorkspaceInstallLogs*' -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime -Descending | Select-Object -First 1
-        if ($latest) {
-            Write-Log ('  Citrix install logs: ' + $latest.FullName)
-            return
-        }
+        $all += @(Get-ChildItem ($base + '\Citrix\Logs') -Filter 'CTXWorkspaceInstallLogs*' -ErrorAction SilentlyContinue)
     }
-    Write-Log '  No CTXWorkspaceInstallLogs folder found under Program Files\Citrix\Logs.'
+    $latest = $all | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($latest) { Write-Log ('  Citrix install logs: ' + $latest.FullName + '  (' + $latest.LastWriteTime + ')') }
+    else { Write-Log '  No CTXWorkspaceInstallLogs folder found under Program Files\Citrix\Logs.' }
 }
 
 $Failed = $false
@@ -565,7 +617,7 @@ Write-Log ('  Windows architecture : ' + $osArch)
 $cwa = Select-CwaArpEntry -Entries (Get-ArpEntries)
 $cwaArch = ''
 if ($cwa) {
-    $cwaArch = Get-CwaInstalledArch -IsWow $cwa.IsWow -InstallLocation $cwa.InstallLocation -OsArch $osArch
+    $cwaArch = Get-CwaInstalledArch -DisplayName $cwa.DisplayName -IsWow $cwa.IsWow -InstallLocation $cwa.InstallLocation -OsArch $osArch
     Write-Log ('  Citrix Workspace : ' + $cwa.DisplayName + '  ' + $cwa.Version + '  (' + $cwaArch + ')')
 } else {
     Write-Log '  Citrix Workspace : not installed'
@@ -573,7 +625,7 @@ if ($cwa) {
 $desktopX86 = @(Get-X86DesktopVersions)
 Write-Log ('  .NET Desktop Runtime x86 : ' + $(if ($desktopX86.Count) { ($desktopX86 -join ', ') } else { 'none' }))
 $net8 = @(Get-DotNet8Folders)
-Write-Log ('  .NET 8 runtimes : ' + $(if ($net8.Count) { ($net8 -join '; ') } else { 'none' }))
+Write-Log ('  .NET 8 runtimes : ' + (Format-DotNet8Folders -Folders $net8))
 
 # ---- 2. Installer + decision ------------------------------------------------
 Write-Log '[2] Installer'
@@ -690,9 +742,10 @@ if ($needInstall -and -not $Failed) {
         Write-Log ('  [DRYRUN] Would run: ' + $installer.FullName + ' ' + ($cwaArgs -join ' '))
     } else {
         $code = Invoke-Installer -Path $installer.FullName -Arguments $cwaArgs -TimeoutMinutes $InstallTimeoutMinutes
-        Write-Log ('  Exit code: ' + $code)
+        Write-Log ('  Exit code: ' + $(if ($null -eq $code) { '(not reported)' } else { $code }))
         switch (Get-InstallOutcome -ExitCode $code) {
             'OK'     { }
+            'UNKNOWN' { Write-Log '  No exit code reported; the version check below decides.' -Level WARN }
             'REBOOT' { $Reboot = $true; Write-Log '  Reboot required to finish.' }
             'FAIL'   {
                 $Failed = $true
@@ -709,7 +762,7 @@ if ($needInstall -and -not $Failed) {
         Write-Log '[6] Verify'
         $cwa = Select-CwaArpEntry -Entries (Get-ArpEntries)
         $desktopX86 = @(Get-X86DesktopVersions)
-        if ($cwa) { Write-Log ('  Citrix Workspace : ' + $cwa.DisplayName + '  ' + $cwa.Version + '  (' + (Get-CwaInstalledArch -IsWow $cwa.IsWow -InstallLocation $cwa.InstallLocation -OsArch $osArch) + ')') }
+        if ($cwa) { Write-Log ('  Citrix Workspace : ' + $cwa.DisplayName + '  ' + $cwa.Version + '  (' + (Get-CwaInstalledArch -DisplayName $cwa.DisplayName -IsWow $cwa.IsWow -InstallLocation $cwa.InstallLocation -OsArch $osArch) + ')') }
         else { Write-Log '  Citrix Workspace : not found in Add/Remove Programs' -Level ERROR }
         Write-Log ('  .NET Desktop Runtime x86 : ' + $(if ($desktopX86.Count) { ($desktopX86 -join ', ') } else { 'none' }))
         if (-not $Failed -and $installer.Version -and (-not $cwa -or $cwa.Version -lt $installer.Version)) {
@@ -721,7 +774,7 @@ if ($needInstall -and -not $Failed) {
             }
         }
         if (-not $Failed -and $cwa -and -not $Reboot) {
-            $nowArch = Get-CwaInstalledArch -IsWow $cwa.IsWow -InstallLocation $cwa.InstallLocation -OsArch $osArch
+            $nowArch = Get-CwaInstalledArch -DisplayName $cwa.DisplayName -IsWow $cwa.IsWow -InstallLocation $cwa.InstallLocation -OsArch $osArch
             if ($nowArch -ne $target.Arch) {
                 Write-Log ('  Installed architecture reads as ' + $nowArch + ', expected ' + $target.Arch + '. Check') -Level WARN
                 Write-Log '  Program Files vs Program Files (x86)\Citrix\ICA Client.' -Level WARN
@@ -739,7 +792,16 @@ if ($net8.Count -eq 0) {
     Write-Log '  [DRYRUN] Readiness depends on the upgrade above; skipped.'
 } else {
     Write-Log '  Scanning installed apps for .NET 8 runtimeconfig.json files...'
-    $apps = @(Find-Net8Apps)
+    $apps = @()
+    foreach ($a in @(Find-Net8Apps)) {
+        $archText = $(if ($a.Arch) { $a.Arch } else { 'no apphost' })
+        if (Test-Net8AppUsesInstalled -Framework $a.Framework -Arch $a.Arch -Installed $net8) {
+            $apps += ($a.Path + '  [' + $a.Need + ', ' + $archText + ']')
+        } else {
+            Write-Log ('  Not a blocker: ' + $a.Path + '  [' + $a.Need + ', ' + $archText + ']')
+            Write-Log ('    No ' + $archText + ' ' + $a.Framework + ' 8.x is installed, so removing .NET 8 does not change this app.')
+        }
+    }
     $has10 = @($desktopX86 | Where-Object { $_ -ge $DotNet10MinDesktop }).Count -gt 0
     $cwaVer = $null
     if ($cwa) { $cwaVer = $cwa.Version }
