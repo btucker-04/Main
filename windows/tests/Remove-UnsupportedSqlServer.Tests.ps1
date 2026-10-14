@@ -57,6 +57,12 @@ Assert-Eq (Get-MsiProductCode -KeyName '{1B8CFC46-1F08-4DA7-9FEA-E1F523FBD67F}' 
 Assert-Eq (Get-MsiProductCode -KeyName 'Microsoft SQL Server SQL2016' -UninstallString 'C:\Program Files\Microsoft SQL Server\130\Setup Bootstrap\SQL2016\x64\SetupARP.exe') '' 'SetupARP entry is not an MSI'
 Assert-Eq (Get-MsiProductCode -KeyName 'x' -UninstallString 'MsiExec.exe /I{1B8CFC46-1F08-4DA7-9FEA-E1F523FBD67F}') '{1B8CFC46-1F08-4DA7-9FEA-E1F523FBD67F}' 'code from uninstall string'
 
+# CSLT-135 (2026-10-14): LocalDB 13.0 listed twice, once per registry view.
+$ldb = @([pscustomobject]@{ Version = '13.0'; Major = 13; Dll = 'a' }, [pscustomobject]@{ Version = '13.0'; Major = 13; Dll = 'b' }, [pscustomobject]@{ Version = '15.0'; Major = 15; Dll = 'c' })
+Assert-Eq ((Select-UniqueLocalDb -Entries $ldb | ForEach-Object { $_.Version }) -join ',') '13.0,15.0' 'LocalDB de-duplicated across registry views'
+Assert-Eq (Test-SqlLocalDbName -Name 'Microsoft SQL Server 2016 LocalDB ') 'True' 'CSLT-135 ARP name (trailing space)'
+Assert-Eq (Test-SqlLeftoverName -Name 'Microsoft SQL Server 2012 Command Line Utilities ') 'False' 'CSLT-135: 2012 command line utilities kept'
+
 # --- User databases -----------------------------------------------------------
 $data = @('master.mdf', 'mastlog.ldf', 'model.mdf', 'modellog.ldf', 'MSDBData.mdf', 'MSDBLog.ldf', 'tempdb.mdf', 'templog.ldf', 'ERRORLOG')
 Assert-Eq (@(Get-UserDatabaseFiles -FileNames $data).Count) '0' 'system databases only'
