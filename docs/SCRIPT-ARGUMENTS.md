@@ -119,11 +119,22 @@ Downloads and installs the latest Chrome enterprise MSI.
 ## Update-CitrixWorkspace.ps1
 Upgrades Citrix Workspace app (CWA) from a staged installer (target: 2607 LTSR) and moves the machine from .NET 8 to .NET 10. CWA 2409 through 2507.1 LTSR CU2 need the x86 .NET Desktop Runtime 8.x; 2607 LTSR needs 10.0.9 or later, so upgrading CWA is what lets .NET 8 (end of support 2026-11-10) be removed.
 
-The script installs the x86 .NET Desktop Runtime 10 first when it is missing. It uses a staged `windowsdesktop-runtime-10.*-win-x86.exe` if present, otherwise downloads it from `aka.ms`, so the CWA installer never needs `downloadplugins.citrix.com`. It then runs the CWA installer with `/silent AutoUpdateCheck=disabled EnableCEIP=False` and verifies the new version in Add/Remove Programs. Finally it reports what still needs .NET 8: a CWA older than 26.7, or any app whose `*.runtimeconfig.json` binds to an 8.x shared framework without `rollForward: LatestMajor`. The scan covers Program Files and per-user `AppData\Local\Programs`. It relaunches as 64-bit under the 32-bit EC agent. Dependency files: the CWA installer (required), plus optionally the .NET 10 x86 installer and `Remove-DotNetEolChannel.ps1`. Exit `0` = done, `3010` = done with reboot needed, `2` = deferred (open Citrix session) or .NET 8 still needed with `-RemoveDotNet8`, `1` = failed. Log: `C:\Logs\CompoSecure\CitrixWorkspace_<timestamp>.log`.
+The script installs the x86 .NET Desktop Runtime 10 first when it is missing. It uses a staged `windowsdesktop-runtime-10.*-win-x86.exe` if present, otherwise downloads it from `aka.ms`, so the CWA installer never needs `downloadplugins.citrix.com`. It then runs the CWA installer with `/silent AutoUpdateCheck=disabled EnableCEIP=False` and verifies the new version in Add/Remove Programs. Finally it reports what still needs .NET 8: a CWA older than 26.7, or any app whose `*.runtimeconfig.json` binds to an 8.x shared framework without `rollForward: LatestMajor`. The scan covers Program Files and per-user `AppData\Local\Programs`. It relaunches as 64-bit under the 32-bit EC agent.
+
+**Architecture selection:** stage the 32-bit and 64-bit (and optionally ARM64) installers together; the script picks one per machine.
+- 32-bit Windows always gets 32-bit.
+- An existing 64-bit or ARM64 CWA keeps its architecture, since Citrix does not support going back to 32-bit.
+- An existing 32-bit CWA stays 32-bit unless `-MigrateTo64Bit` is passed.
+- A machine without CWA gets the native build, or 32-bit if that is the only one staged.
+
+The installed architecture comes from CWA's install folder (`Program Files (x86)` means 32-bit), falling back to whether its uninstall entry is under WOW6432Node. A staged installer's architecture comes from its file name (`ARM64`, then `x64`/`amd64`/`64bit`), otherwise the executable's PE header, otherwise 32-bit; each file's detected architecture is logged. A switch to 64-bit at the same version is reported (exit 2), because Citrix's installer will not change architecture without a version change: uninstall the 32-bit build first.
+
+Dependency files: the CWA installer(s) (required), plus optionally the .NET 10 x86 installer and `Remove-DotNetEolChannel.ps1`. Exit `0` = done, `3010` = done with reboot needed, `2` = deferred (open Citrix session) or .NET 8 still needed with `-RemoveDotNet8`, `1` = failed. Log: `C:\Logs\CompoSecure\CitrixWorkspace_<timestamp>.log`.
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
-| `-InstallerPath` | string | `''` | Full path to the CWA installer. Default: the newest `CitrixWorkspace*.exe` beside the script, then `C:\`. Local use; in EC, stage the file. |
+| `-InstallerPath` | string | `''` | Full path to one CWA installer, used as-is. Default: choose among the `CitrixWorkspace*.exe` files beside the script, then `C:\` (see architecture selection). Local use; in EC, stage the files. |
+| `-MigrateTo64Bit` | switch | off | Replace a 32-bit CWA with the native 64-bit build (x64, or ARM64 on ARM devices) during the upgrade. Default keeps a 32-bit install 32-bit. Check for 32-bit third-party virtual channel add-ons first. |
 | `-InstallIfMissing` | switch | off | Install CWA where it is not installed. Default upgrades existing installs only. |
 | `-ForceClose` | switch | off | Close open Citrix sessions (`wfica32`, `CDViewer`) and CWA processes instead of deferring (exit 2). Disconnects the user. |
 | `-AutoUpdate` | switch | off | Keep Citrix auto-update on, limited to LTSR cumulative updates (`AutoUpdateCheck=auto AutoUpdateStream=LTSR`). Default turns it off so EC controls the version. |
