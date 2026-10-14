@@ -116,6 +116,23 @@ Downloads and installs the latest Chrome enterprise MSI.
 | `-DryRun` | switch | off | Report actions (download, close, install) without performing them. |
 | `-MinVersion` | string | `149.0.7827.53` | Minimum acceptable Chrome version (the higher of the two plugin thresholds); the install is verified against it. |
 
+## Update-CitrixWorkspace.ps1
+Upgrades Citrix Workspace app (CWA) from a staged installer (target: 2607 LTSR) and moves the machine from .NET 8 to .NET 10. CWA 2409 through 2507.1 LTSR CU2 need the x86 .NET Desktop Runtime 8.x; 2607 LTSR needs 10.0.9 or later, so upgrading CWA is what lets .NET 8 (end of support 2026-11-10) be removed.
+
+The script installs the x86 .NET Desktop Runtime 10 first when it is missing. It uses a staged `windowsdesktop-runtime-10.*-win-x86.exe` if present, otherwise downloads it from `aka.ms`, so the CWA installer never needs `downloadplugins.citrix.com`. It then runs the CWA installer with `/silent AutoUpdateCheck=disabled EnableCEIP=False` and verifies the new version in Add/Remove Programs. Finally it reports what still needs .NET 8: a CWA older than 26.7, or any app whose `*.runtimeconfig.json` binds to an 8.x shared framework without `rollForward: LatestMajor`. The scan covers Program Files and per-user `AppData\Local\Programs`. It relaunches as 64-bit under the 32-bit EC agent. Dependency files: the CWA installer (required), plus optionally the .NET 10 x86 installer and `Remove-DotNetEolChannel.ps1`. Exit `0` = done, `3010` = done with reboot needed, `2` = deferred (open Citrix session) or .NET 8 still needed with `-RemoveDotNet8`, `1` = failed. Log: `C:\Logs\CompoSecure\CitrixWorkspace_<timestamp>.log`.
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `-InstallerPath` | string | `''` | Full path to the CWA installer. Default: the newest `CitrixWorkspace*.exe` beside the script, then `C:\`. Local use; in EC, stage the file. |
+| `-InstallIfMissing` | switch | off | Install CWA where it is not installed. Default upgrades existing installs only. |
+| `-ForceClose` | switch | off | Close open Citrix sessions (`wfica32`, `CDViewer`) and CWA processes instead of deferring (exit 2). Disconnects the user. |
+| `-AutoUpdate` | switch | off | Keep Citrix auto-update on, limited to LTSR cumulative updates (`AutoUpdateCheck=auto AutoUpdateStream=LTSR`). Default turns it off so EC controls the version. |
+| `-SkipThirdPartyVCCheck` | switch | off | Pass `/SkipThirdPartyVCCheck`. Only for a 64-bit installer replacing a 32-bit CWA, where the silent install otherwise pauses or fails on 32-bit third-party virtual channel add-ons. Confirm none are in use. |
+| `-ForceInstall` | switch | off | Pass `/forceinstall` (Citrix's cleanup-and-reinstall) for a retry after a failed upgrade. |
+| `-SkipDotNetPrestage` | switch | off | Do not install .NET 10 x86 first; let the CWA installer download it. |
+| `-RemoveDotNet8` | switch | off | When nothing still needs .NET 8, run the staged `Remove-DotNetEolChannel.ps1 -DotNet8 -RemoveStaleFolders` (also removes the swidtag and Package Cache leftovers Tenable reads). Blocked (exit 2) on a CWA below 26.7, without .NET 10 x86, or when a .NET 8 app is found; skipped after a failed upgrade. |
+| `-DryRun` | switch | off | Report what would happen without changing anything (passes `-DryRun` to the remover too). |
+
 ## Get-DriveInventory.ps1
 Read-only drive/storage inventory. **No arguments.**
 
