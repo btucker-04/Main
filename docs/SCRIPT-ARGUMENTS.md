@@ -145,7 +145,7 @@ Dependency files: the CWA installer(s) (required), plus optionally the .NET 10 x
 | `-DryRun` | switch | off | Report what would happen without changing anything (passes `-DryRun` to the remover too). |
 
 ## Install-SqlExpress2022.ps1
-Installs SQL Server 2022 Express from staged offline media. Stage `SQLEXPR_x64_ENU.exe` (Express Core) or `SQLEXPRADV_x64_ENU.exe` (Express Advanced, needed for `FullText`/`PolyBase`), taken from `SQL2022-SSEI-Expr.exe` > Download Media. The script extracts the package to `C:\Windows\Temp\SQLEXPR2022`, checks that `setup.exe` is version 16.x (SQL Server 2019 Express uses the same file name), and runs setup quietly. Setup runs as SYSTEM under EC, so it adds the `-SqlSysAdmins` accounts as sysadmins rather than the current user.
+Installs SQL Server 2022 Express from staged offline media. It does not remove an older SQL Server; use `Remove-UnsupportedSqlServer.ps1` for plugin 64784. Stage `SQLEXPR_x64_ENU.exe` (Express Core) or `SQLEXPRADV_x64_ENU.exe` (Express Advanced, needed for `FullText`/`PolyBase`), taken from `SQL2022-SSEI-Expr.exe` > Download Media. The script extracts the package to `C:\Windows\Temp\SQLEXPR2022`, checks that `setup.exe` is version 16.x (SQL Server 2019 Express uses the same file name), and runs setup quietly. Setup runs as SYSTEM under EC, so it adds the `-SqlSysAdmins` accounts as sysadmins rather than the current user.
 
 Stage a `SQLServer2022-KB<number>-x64.exe` cumulative update or GDR alongside the media. If several are staged, the highest KB number is used. A new install gets it slipstreamed (`/UPDATEENABLED=True /UPDATESOURCE`). An existing 2022 instance on an older build gets it with `/ACTION=Patch`. The RTM build (16.0.1000.6) is vulnerable, so always stage the current update. Without an update, setup runs with `/UPDATEENABLED=False`.
 
@@ -173,6 +173,28 @@ Dependency files: the Express package (required) and optionally the update. Exit
 | `-UpgradeExisting` | switch | off | Upgrade an older instance of the same name in place (`/ACTION=Upgrade`). Back up its databases first. |
 | `-IgnorePendingReboot` | switch | off | Install despite a pending reboot (`/SKIPRULES=RebootRequiredCheck`). |
 | `-DryRun` | switch | off | Report what would happen without changing anything. |
+
+## Remove-UnsupportedSqlServer.ps1
+Removes end-of-support SQL Server database engine instances and LocalDB (Tenable plugin 64784, Microsoft SQL Server Unsupported Version Detection). Installing a newer SQL Server does not clear 64784, because the old engine stays installed alongside it until it is uninstalled. On CSLT-135, 64784 stayed active after the 2022 Express install.
+
+As of 2026-10-14, SQL Server 2016 (extended support ended 2026-07-14) and earlier are unsupported. 2017 is supported until 2027-10-12. Supported instances, such as a 2022 Express install, are never touched.
+
+What the script checks and removes:
+- **Engine instances:** read from both registry views, so 32-bit instances (registered under WOW6432Node) are found too. Each unsupported instance is uninstalled with its own `setup.exe` from `<Program Files>\Microsoft SQL Server\<NNN>\Setup Bootstrap`, using `/Q /ACTION=Uninstall /FEATURES=SQL /INSTANCENAME=<name>`.
+- **LocalDB:** found from `Local DB\Installed Versions` and removed through its MSI. Any running LocalDB `sqlservr.exe` is stopped first.
+- **Leftover engine packages:** for example Database Engine Services, Common Files, Setup, RsFx, VSS Writer and Browser for that year. These are removed with `msiexec /x`, which also covers an instance whose `setup.exe` is missing or fails.
+- **Client libraries are kept:** Native Client, ODBC / OLE DB, Management Objects, CLR Types and Management Studio. Other apps load them, and 64784 does not report them.
+
+An unsupported instance with user database files in its DATA folder is not removed: the run exits 2 unless `-AllowUserDatabases` is passed. Uninstall keeps those files on disk either way. The script finishes by re-reading the inventory. It relaunches as 64-bit under the 32-bit EC agent.
+
+Exit `0` = nothing unsupported left, `3010` = removed, reboot needed, `2` = blocked by user databases, `1` = failed or still installed. Log: `C:\Logs\CompoSecure\RemoveUnsupportedSql_<timestamp>.log`, with one MSI log per package.
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `-AllowUserDatabases` | switch | off | Remove an unsupported instance even if its DATA folder has user databases. The files stay on disk, so they can be attached to the supported instance. |
+| `-KeepLocalDB` | switch | off | Leave unsupported LocalDB versions installed. |
+| `-KeepSharedComponents` | switch | off | Skip removing the leftover engine packages. |
+| `-DryRun` | switch | off | Report what would be removed; change nothing. |
 
 ## Get-DriveInventory.ps1
 Read-only drive/storage inventory. **No arguments.**
