@@ -154,6 +154,12 @@ function Get-UserDatabaseFiles {
     return @($FileNames | Where-Object { $_ -match '(?i)\.(mdf|ndf|ldf)$' -and $SystemDbFiles -notcontains $_.ToLowerInvariant() })
 }
 
+function Select-UniqueLocalDb {
+    # The same LocalDB version registers in both registry views.
+    param([object[]]$Entries)
+    return @($Entries | Sort-Object Version -Unique)
+}
+
 function Get-SqlUninstallArguments {
     param([string]$InstanceName)
     return @('/Q', '/ACTION=Uninstall', '/FEATURES=SQL', ('/INSTANCENAME=' + $InstanceName))
@@ -294,6 +300,19 @@ function Get-LocalDbVersions {
             if ($ver) { $out += [pscustomobject]@{ Version = $c.PSChildName; Major = $ver.Major; Dll = '' + $p.InstanceAPIPath } }
         }
     }
+    return @(Select-UniqueLocalDb -Entries $out)
+}
+
+function Get-LocalDbUserInstances {
+    # Per-user LocalDB instances (e.g. MSSQLLocalDB). Removing the LocalDB
+    # runtime leaves these folders; their last write shows recent use.
+    $out = @()
+    foreach ($u in @(Get-ChildItem 'C:\Users' -Directory -ErrorAction SilentlyContinue)) {
+        $root = $u.FullName + '\AppData\Local\Microsoft\Microsoft SQL Server Local DB\Instances'
+        foreach ($i in @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue)) {
+            $out += [pscustomobject]@{ User = $u.Name; Instance = $i.Name; LastWrite = $i.LastWriteTime }
+        }
+    }
     return $out
 }
 
@@ -419,6 +438,9 @@ try {
     } elseif ($badLocalDbMsis.Count -eq 0 -and $badLocalDbOrphans.Count -eq 0) {
         Write-Log '  None.'
     } else {
+        foreach ($u in @(Get-LocalDbUserInstances)) {
+            Write-Log ('  LocalDB instance ' + $u.Instance + ' for ' + $u.User + ', last used ' + $u.LastWrite.ToString('yyyy-MM-dd'))
+        }
         foreach ($l in $badLocalDbOrphans) {
             $msi = @($badLocalDbMsis | Where-Object { $_.Major -eq $l.Major })
             if ($msi.Count -eq 0) { Write-Log ('  LocalDB ' + $l.Version + ' has no uninstallable MSI entry.') -Level WARN }
