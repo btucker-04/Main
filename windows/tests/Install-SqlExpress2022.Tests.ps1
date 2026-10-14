@@ -32,6 +32,7 @@ Assert-Eq (Get-SqlServiceName -InstanceName 'MSSQLSERVER') 'MSSQLSERVER' 'defaul
 Assert-Eq (Get-SqlMajorFromInstanceId -InstanceId 'MSSQL16.SQLEXPRESS') '16' '2022 id'
 Assert-Eq (Get-SqlMajorFromInstanceId -InstanceId 'MSSQL15.SQLEXPRESS') '15' '2019 id'
 Assert-Eq (Get-SqlMajorFromInstanceId -InstanceId 'garbage') '' 'unparsable id'
+Assert-Eq (Get-SqlMajorFromInstanceId -InstanceId 'MSSQL10_50.SQLEXPRESS') '10' '2008 R2 id'
 Assert-Eq (Get-InstanceAction -ExistingMajor $null -UpgradeExisting $false) 'Install' 'not installed'
 Assert-Eq (Get-InstanceAction -ExistingMajor 16 -UpgradeExisting $false) 'Present' '2022 present'
 Assert-Eq (Get-InstanceAction -ExistingMajor 17 -UpgradeExisting $true) 'Newer' 'newer left alone'
