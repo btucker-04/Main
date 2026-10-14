@@ -145,9 +145,9 @@ function Get-SqlServiceName {
 }
 
 function Get-SqlMajorFromInstanceId {
-    # MSSQL16.SQLEXPRESS -> 16
+    # MSSQL16.SQLEXPRESS -> 16; MSSQL10_50.X (2008 R2) -> 10
     param([string]$InstanceId)
-    $m = [regex]::Match('' + $InstanceId, '^MSSQL(\d+)\.')
+    $m = [regex]::Match('' + $InstanceId, '^MSSQL(\d+)(_\d+)?\.')
     if ($m.Success) { return [int]$m.Groups[1].Value }
     return $null
 }
@@ -335,20 +335,25 @@ function Write-Log {
 }
 
 function Get-SqlInstances {
-    # Objects: Name, Id, Major, Version, PatchLevel, Edition.
+    # Objects: Name, Id, Major, Version, PatchLevel, Edition, View. Both
+    # registry views: a 32-bit instance registers under WOW6432Node.
     $out = @()
-    $names = Get-ItemProperty ($SqlRegRoot + '\Instance Names\SQL') -ErrorAction SilentlyContinue
-    if (-not $names) { return $out }
-    foreach ($p in $names.PSObject.Properties) {
-        if ($p.Name -like 'PS*') { continue }
-        $setup = Get-ItemProperty ($SqlRegRoot + '\' + $p.Value + '\Setup') -ErrorAction SilentlyContinue
-        $out += [pscustomobject]@{
-            Name       = $p.Name
-            Id         = '' + $p.Value
-            Major      = Get-SqlMajorFromInstanceId -InstanceId $p.Value
-            Version    = $(if ($setup) { '' + $setup.Version } else { '' })
-            PatchLevel = $(if ($setup) { '' + $setup.PatchLevel } else { '' })
-            Edition    = $(if ($setup) { '' + $setup.Edition } else { '' })
+    $roots = @(@('64-bit', $SqlRegRoot), @('32-bit', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Microsoft SQL Server'))
+    foreach ($r in $roots) {
+        $names = Get-ItemProperty ($r[1] + '\Instance Names\SQL') -ErrorAction SilentlyContinue
+        if (-not $names) { continue }
+        foreach ($p in $names.PSObject.Properties) {
+            if ($p.Name -like 'PS*') { continue }
+            $setup = Get-ItemProperty ($r[1] + '\' + $p.Value + '\Setup') -ErrorAction SilentlyContinue
+            $out += [pscustomobject]@{
+                Name       = $p.Name
+                Id         = '' + $p.Value
+                Major      = Get-SqlMajorFromInstanceId -InstanceId $p.Value
+                Version    = $(if ($setup) { '' + $setup.Version } else { '' })
+                PatchLevel = $(if ($setup) { '' + $setup.PatchLevel } else { '' })
+                Edition    = $(if ($setup) { '' + $setup.Edition } else { '' })
+                View       = $r[0]
+            }
         }
     }
     return $out
@@ -483,7 +488,7 @@ try {
     $instances = @(Get-SqlInstances)
     if ($instances.Count -eq 0) { Write-Log '  SQL Server instances : none' }
     foreach ($i in $instances) {
-        Write-Log ('  ' + $i.Name + ' : ' + $i.Id + '  ' + $i.Edition + '  build ' + $i.PatchLevel)
+        Write-Log ('  ' + $i.Name + ' : ' + $i.Id + ' (' + $i.View + ')  ' + $i.Edition + '  build ' + $i.PatchLevel)
     }
     $existing = $instances | Where-Object { $_.Name -eq $InstanceName } | Select-Object -First 1
     $netFx = Get-NetFxRelease
