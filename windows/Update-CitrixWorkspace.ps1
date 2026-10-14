@@ -48,10 +48,34 @@
     HKLM\SOFTWARE redirected to WOW6432Node and would miss a 64-bit CWA's
     uninstall entry, so the script relaunches itself as 64-bit.
 
+    32-BIT OR 64-BIT INSTALLER. Stage both; the script picks one per machine:
+      * 32-bit Windows                -> 32-bit.
+      * CWA already 64-bit (or ARM64) -> the same architecture. Citrix does
+        not support going from 64-bit back to 32-bit.
+      * CWA already 32-bit            -> 32-bit, so the upgrade does not also
+        change architecture. -MigrateTo64Bit uses the native build instead
+        (x64, or ARM64 on ARM devices); 2607 is the last LTSR with a 32-bit
+        build.
+      * CWA not installed             -> the native build, or 32-bit when
+        only that is staged.
+    The installed architecture comes from where CWA registers in
+    Add/Remove Programs: a 32-bit install registers under WOW6432Node.
+    A staged installer's architecture comes from its file name (ARM64, then
+    x64 / amd64 / 64bit), else the executable's PE header, else 32-bit.
+    Rename a file if the log shows the wrong architecture for it.
+    Citrix will not change architecture within the same version (the
+    installer reports it is already installed); that case is reported
+    (exit 2) for a manual uninstall of the 32-bit build first.
+
 .PARAMETER InstallerPath
-    Full path to the CWA installer. Default: the newest CitrixWorkspace*.exe
-    beside the script (EC extracts dependency files there), then C:\.
-    Local/terminal use; in EC, stage the file instead.
+    Full path to one CWA installer, used as-is. Default: pick from the
+    CitrixWorkspace*.exe files beside the script (EC extracts dependency
+    files there), then C:\. Local/terminal use; in EC, stage the files.
+
+.PARAMETER MigrateTo64Bit
+    Replace a 32-bit CWA with the native 64-bit (or ARM64) build during the
+    upgrade. Check for 32-bit third-party virtual channel add-ons first, and
+    add -SkipThirdPartyVCCheck if the silent install stops on that check.
 
 .PARAMETER InstallIfMissing
     Install CWA on machines that do not have it. Default is upgrade only.
@@ -85,7 +109,7 @@
 
 .NOTES
     Deploy via Endpoint Central (SYSTEM), -File invocation.
-    Dependency files: the CWA 2607 LTSR installer; optionally
+    Dependency files: the CWA 2607 LTSR installer(s), 32-bit and 64-bit; optionally
     windowsdesktop-runtime-10.*-win-x86.exe and Remove-DotNetEolChannel.ps1.
     Script Arguments: bare switches only, e.g. -RemoveDotNet8
     Specify exit code(s): 0,3010
@@ -98,6 +122,7 @@
 [CmdletBinding()]
 param(
     [string]$InstallerPath = '',
+    [switch]$MigrateTo64Bit,
     [switch]$InstallIfMissing,
     [switch]$ForceClose,
     [switch]$AutoUpdate,
@@ -135,10 +160,79 @@ function Select-CwaArpEntry {
         $v = ConvertTo-SafeVersion ('' + $e.DisplayVersion)
         if (-not $v) { continue }
         if (-not $best -or $v -gt $best.Version) {
-            $best = [pscustomobject]@{ DisplayName = $e.DisplayName; Version = $v }
+            $best = [pscustomobject]@{ DisplayName = $e.DisplayName; Version = $v; IsWow = [bool]$e.IsWow; InstallLocation = ('' + $e.InstallLocation) }
         }
     }
     return $best
+}
+
+function ConvertTo-OsArch {
+    # PROCESSOR_ARCHITEW6432 is set only in a 32-bit process on 64-bit Windows.
+    param([string]$ProcessorArchitecture, [string]$ProcessorArchitectureW6432)
+    $a = $ProcessorArchitectureW6432
+    if (-not $a) { $a = $ProcessorArchitecture }
+    switch (('' + $a).ToUpperInvariant()) {
+        'AMD64' { return 'x64' }
+        'ARM64' { return 'arm64' }
+        'X86'   { return 'x86' }
+        default { return '' }
+    }
+}
+
+function Get-CwaInstalledArch {
+    # Install folder first (32-bit CWA lives in Program Files (x86)), then the
+    # registry view its uninstall entry is in.
+    param([bool]$IsWow, [string]$InstallLocation, [string]$OsArch)
+    if ($OsArch -eq 'x86') { return 'x86' }
+    if ($InstallLocation -match '(?i)\\Program Files \(x86\)\\') { return 'x86' }
+    if ($InstallLocation -match '(?i)\\Program Files\\') { return $OsArch }
+    if ($IsWow) { return 'x86' }
+    return $OsArch
+}
+
+function Get-InstallerArch {
+    # PeMachine: IMAGE_FILE_HEADER.Machine of the exe, or 0 if unreadable.
+    param([string]$Name, [int]$PeMachine)
+    if ($Name -match '(?i)arm64') { return 'arm64' }
+    if ($Name -match '(?i)(x64|amd64|64bit|64-bit)') { return 'x64' }
+    switch ($PeMachine) {
+        0xAA64  { return 'arm64' }
+        0x8664  { return 'x64' }
+        default { return 'x86' }
+    }
+}
+
+function Resolve-TargetArch {
+    # Returns Arch (installer architecture to use), Reason, and Error ('' when ok).
+    param([string]$OsArch, [string]$InstalledArch, [bool]$MigrateTo64Bit, [string[]]$Available)
+    $native = $OsArch
+    if (-not $native) { $native = 'x86' }
+    if ($InstalledArch) {
+        if ($InstalledArch -eq 'x86' -and $native -ne 'x86' -and $MigrateTo64Bit) {
+            $want = $native; $why = 'migrating 32-bit CWA to ' + $native
+        } else {
+            $want = $InstalledArch; $why = 'matches the installed ' + $InstalledArch + ' CWA'
+        }
+    } elseif ($Available -contains $native) {
+        $want = $native; $why = 'not installed; native ' + $native + ' build'
+    } else {
+        $want = 'x86'; $why = 'not installed; no ' + $native + ' installer staged, using 32-bit'
+    }
+    $err = ''
+    if ($Available -notcontains $want) {
+        $err = 'no ' + $want + ' installer staged (' + $why + ')'
+        if ($InstalledArch -eq 'x86' -and $want -eq 'x86') { $err += '; stage the 32-bit installer or use -MigrateTo64Bit' }
+    }
+    return [pscustomobject]@{ Arch = $want; Reason = $why; Error = $err }
+}
+
+function Test-SameVersionArchSwitch {
+    # Citrix's installer refuses to change architecture without a version
+    # change ('already installed'); the 32-bit build must be uninstalled first.
+    param([string]$InstalledArch, [version]$InstalledVersion, [string]$TargetArch, [version]$InstallerVersion)
+    if (-not $InstalledArch -or $InstalledArch -eq $TargetArch) { return $false }
+    if (-not $InstalledVersion -or -not $InstallerVersion) { return $false }
+    return ($InstalledVersion -ge $InstallerVersion)
 }
 
 function Test-CwaUsesDotNet10 {
@@ -241,6 +335,24 @@ function Get-RelaunchArguments {
     return $a
 }
 
+function Get-PeMachine {
+    # IMAGE_FILE_HEADER.Machine: e_lfanew at 0x3C points at 'PE\0\0', Machine follows.
+    param([string]$Path)
+    try {
+        $fs = [System.IO.File]::OpenRead($Path)
+        try {
+            $br = New-Object System.IO.BinaryReader($fs)
+            if ($fs.Length -lt 0x40) { return 0 }
+            $fs.Position = 0x3C
+            $pe = $br.ReadInt32()
+            if ($pe -lt 0 -or ($pe + 6) -gt $fs.Length) { return 0 }
+            $fs.Position = $pe
+            if ($br.ReadUInt32() -ne 0x00004550) { return 0 }
+            return [int]$br.ReadUInt16()
+        } finally { $fs.Close() }
+    } catch { return 0 }
+}
+
 if ($env:CITRIX_WORKSPACE_DOTSOURCE -eq '1') { return }
 
 if (Test-Needs64BitRelaunch -Is64BitOS ([Environment]::Is64BitOperatingSystem) -Is64BitProcess ([Environment]::Is64BitProcess)) {
@@ -271,9 +383,13 @@ function Get-ArpEntries {
     )
     $out = @()
     foreach ($r in $roots) {
+        $isWow = ($r -match 'WOW6432Node')
         foreach ($k in @(Get-ChildItem $r -ErrorAction SilentlyContinue)) {
             $p = Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue
-            if ($p -and $p.DisplayName) { $out += $p }
+            if ($p -and $p.DisplayName) {
+                $p | Add-Member -NotePropertyName IsWow -NotePropertyValue $isWow -Force
+                $out += $p
+            }
         }
     }
     return $out
@@ -336,6 +452,11 @@ function Find-Net8Apps {
 
 function Find-StagedFile {
     param([string]$Filter)
+    return (Select-StagedInstaller -Files @(Get-StagedFiles -Filter $Filter))
+}
+
+function Get-StagedFiles {
+    param([string]$Filter)
     $dirs = @()
     if ($PSScriptRoot) { $dirs += $PSScriptRoot }
     $dirs += 'C:\'
@@ -346,10 +467,11 @@ function Find-StagedFile {
             $v = ConvertTo-SafeVersion ('' + $f.VersionInfo.ProductVersion)
             if (-not $v) { $v = ConvertTo-SafeVersion ('' + $f.VersionInfo.FileVersion) }
             if (-not $v) { $v = ConvertTo-SafeVersion $f.Name }
-            $files += [pscustomobject]@{ FullName = $f.FullName; Version = $v }
+            $arch = Get-InstallerArch -Name $f.Name -PeMachine (Get-PeMachine -Path $f.FullName)
+            $files += [pscustomobject]@{ FullName = $f.FullName; Version = $v; Arch = $arch }
         }
     }
-    return (Select-StagedInstaller -Files $files)
+    return $files
 }
 
 function Test-ExeHeader {
@@ -433,14 +555,21 @@ Write-Log '=============================================='
 Write-Log ' Citrix Workspace app update + .NET 8 -> 10'
 Write-Log (' Host    : ' + $env:COMPUTERNAME)
 Write-Log (' 64-bit  : ' + [Environment]::Is64BitProcess)
-Write-Log (' Options : InstallIfMissing=' + $InstallIfMissing + ' ForceClose=' + $ForceClose + ' AutoUpdate=' + $AutoUpdate + ' SkipThirdPartyVCCheck=' + $SkipThirdPartyVCCheck + ' ForceInstall=' + $ForceInstall + ' SkipDotNetPrestage=' + $SkipDotNetPrestage + ' RemoveDotNet8=' + $RemoveDotNet8 + ' DryRun=' + $DryRun)
+Write-Log (' Options : MigrateTo64Bit=' + $MigrateTo64Bit + ' InstallIfMissing=' + $InstallIfMissing + ' ForceClose=' + $ForceClose + ' AutoUpdate=' + $AutoUpdate + ' SkipThirdPartyVCCheck=' + $SkipThirdPartyVCCheck + ' ForceInstall=' + $ForceInstall + ' SkipDotNetPrestage=' + $SkipDotNetPrestage + ' RemoveDotNet8=' + $RemoveDotNet8 + ' DryRun=' + $DryRun)
 Write-Log '=============================================='
 
 # ---- 1. Inventory -----------------------------------------------------------
 Write-Log '[1] Current state'
+$osArch = ConvertTo-OsArch -ProcessorArchitecture $env:PROCESSOR_ARCHITECTURE -ProcessorArchitectureW6432 $env:PROCESSOR_ARCHITEW6432
+Write-Log ('  Windows architecture : ' + $osArch)
 $cwa = Select-CwaArpEntry -Entries (Get-ArpEntries)
-if ($cwa) { Write-Log ('  Citrix Workspace : ' + $cwa.DisplayName + '  ' + $cwa.Version) }
-else { Write-Log '  Citrix Workspace : not installed' }
+$cwaArch = ''
+if ($cwa) {
+    $cwaArch = Get-CwaInstalledArch -IsWow $cwa.IsWow -InstallLocation $cwa.InstallLocation -OsArch $osArch
+    Write-Log ('  Citrix Workspace : ' + $cwa.DisplayName + '  ' + $cwa.Version + '  (' + $cwaArch + ')')
+} else {
+    Write-Log '  Citrix Workspace : not installed'
+}
 $desktopX86 = @(Get-X86DesktopVersions)
 Write-Log ('  .NET Desktop Runtime x86 : ' + $(if ($desktopX86.Count) { ($desktopX86 -join ', ') } else { 'none' }))
 $net8 = @(Get-DotNet8Folders)
@@ -449,34 +578,71 @@ Write-Log ('  .NET 8 runtimes : ' + $(if ($net8.Count) { ($net8 -join '; ') } el
 # ---- 2. Installer + decision ------------------------------------------------
 Write-Log '[2] Installer'
 $installer = $null
+$staged = @()
 if ($InstallerPath) {
     if (-not (Test-Path -LiteralPath $InstallerPath)) {
         Write-Log ('  -InstallerPath not found: ' + $InstallerPath) -Level ERROR
         exit 1
     }
     $item = Get-Item -LiteralPath $InstallerPath
-    $installer = [pscustomobject]@{ FullName = $item.FullName; Version = (ConvertTo-SafeVersion ('' + $item.VersionInfo.ProductVersion)) }
+    $staged = @([pscustomobject]@{
+        FullName = $item.FullName
+        Version  = (ConvertTo-SafeVersion ('' + $item.VersionInfo.ProductVersion))
+        Arch     = (Get-InstallerArch -Name $item.Name -PeMachine (Get-PeMachine -Path $item.FullName))
+    })
 } else {
-    $installer = Find-StagedFile -Filter 'CitrixWorkspace*.exe'
+    $staged = @(Get-StagedFiles -Filter 'CitrixWorkspace*.exe')
+}
+foreach ($s in $staged) {
+    Write-Log ('  Staged: ' + $s.FullName + '  version ' + $(if ($s.Version) { $s.Version } else { 'unknown' }) + '  arch ' + $s.Arch)
+}
+if ($staged.Count -gt 0) {
+    $available = @($staged | ForEach-Object { $_.Arch } | Sort-Object -Unique)
+    $target = Resolve-TargetArch -OsArch $osArch -InstalledArch $cwaArch -MigrateTo64Bit $MigrateTo64Bit -Available $available
+    Write-Log ('  Target architecture: ' + $target.Arch + ' (' + $target.Reason + ')')
+    if ($target.Error) {
+        $newest = Select-StagedInstaller -Files $staged
+        $current = $cwa -and $newest.Version -and $cwa.Version -ge $newest.Version
+        if ($current) {
+            Write-Log ('  ' + $target.Error + '. CWA is already at the staged version, so nothing to install.') -Level WARN
+        } else {
+            Write-Log ('  ' + $target.Error + '.') -Level ERROR
+            $Failed = $true
+        }
+    } else {
+        $installer = Select-StagedInstaller -Files @($staged | Where-Object { $_.Arch -eq $target.Arch })
+    }
 }
 
 $needInstall = $false
-if (-not $installer) {
+if ($staged.Count -eq 0) {
     Write-Log '  No CitrixWorkspace*.exe staged beside the script or in C:\.' -Level WARN
     if (-not $cwa -or -not (Test-CwaUsesDotNet10 -Version $cwa.Version)) {
-        Write-Log '  Add the 2607 LTSR installer to the EC package as a dependency file.' -Level ERROR
+        Write-Log '  Add the 2607 LTSR installer(s) to the EC package as dependency files.' -Level ERROR
         $Failed = $true
     }
-} else {
-    Write-Log ('  ' + $installer.FullName + '  version ' + $(if ($installer.Version) { $installer.Version } else { 'unknown' }))
-    if (-not $cwa) {
+} elseif ($installer) {
+    Write-Log ('  Using: ' + $installer.FullName)
+    if ($cwa -and (Test-SameVersionArchSwitch -InstalledArch $cwaArch -InstalledVersion $cwa.Version -TargetArch $target.Arch -InstallerVersion $installer.Version)) {
+        Write-Log ('  CWA ' + $cwa.Version + ' (' + $cwaArch + ') is already at this version. Citrix will not switch') -Level WARN
+        Write-Log ('  to ' + $target.Arch + ' without a version change: uninstall the ' + $cwaArch + ' CWA first, then re-run.') -Level WARN
+        $NeedsHuman = $true
+    } elseif (-not $cwa) {
         if ($InstallIfMissing) { $needInstall = $true; Write-Log '  Not installed; -InstallIfMissing set, installing.' }
         else { Write-Log '  Not installed; upgrade-only run, skipping (use -InstallIfMissing to install).' }
     } elseif ($installer.Version -and $cwa.Version -ge $installer.Version) {
         Write-Log '  Installed version is already at or above the installer. No upgrade needed.'
     } else {
         $needInstall = $true
-        Write-Log '  Upgrade needed.'
+        if ($cwaArch -and $cwaArch -ne $target.Arch) {
+            Write-Log ('  Upgrade needed, ' + $cwaArch + ' -> ' + $target.Arch + '.')
+            if (-not $SkipThirdPartyVCCheck) {
+                Write-Log '  If the install stops on the 32-bit add-on check, re-run with -SkipThirdPartyVCCheck' -Level WARN
+                Write-Log '  after confirming no 32-bit third-party virtual channels are in use.' -Level WARN
+            }
+        } else {
+            Write-Log '  Upgrade needed.'
+        }
     }
 }
 
@@ -543,7 +709,7 @@ if ($needInstall -and -not $Failed) {
         Write-Log '[6] Verify'
         $cwa = Select-CwaArpEntry -Entries (Get-ArpEntries)
         $desktopX86 = @(Get-X86DesktopVersions)
-        if ($cwa) { Write-Log ('  Citrix Workspace : ' + $cwa.DisplayName + '  ' + $cwa.Version) }
+        if ($cwa) { Write-Log ('  Citrix Workspace : ' + $cwa.DisplayName + '  ' + $cwa.Version + '  (' + (Get-CwaInstalledArch -IsWow $cwa.IsWow -InstallLocation $cwa.InstallLocation -OsArch $osArch) + ')') }
         else { Write-Log '  Citrix Workspace : not found in Add/Remove Programs' -Level ERROR }
         Write-Log ('  .NET Desktop Runtime x86 : ' + $(if ($desktopX86.Count) { ($desktopX86 -join ', ') } else { 'none' }))
         if (-not $Failed -and $installer.Version -and (-not $cwa -or $cwa.Version -lt $installer.Version)) {
@@ -552,6 +718,13 @@ if ($needInstall -and -not $Failed) {
             } else {
                 Write-Log ('  Installer exited cleanly but the version is not ' + $installer.Version + '.') -Level ERROR
                 $Failed = $true
+            }
+        }
+        if (-not $Failed -and $cwa -and -not $Reboot) {
+            $nowArch = Get-CwaInstalledArch -IsWow $cwa.IsWow -InstallLocation $cwa.InstallLocation -OsArch $osArch
+            if ($nowArch -ne $target.Arch) {
+                Write-Log ('  Installed architecture reads as ' + $nowArch + ', expected ' + $target.Arch + '. Check') -Level WARN
+                Write-Log '  Program Files vs Program Files (x86)\Citrix\ICA Client.' -Level WARN
             }
         }
     }
