@@ -202,6 +202,22 @@ try {
     Assert-Eq (Get-PeMachine -Path $tmp) 0 'truncated file -> 0'
 } finally { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
 
+# --- Install log error lines (CSPRLT-94, exit 101603) -------------------------
+$msiLog = @'
+MSI (s) (A4:B8) [11:12:30:101]: Product: Citrix Workspace(USB) -- Error 1722. There is a problem with this Windows Installer package.
+Action ended 11:12:30: InstallFinalize. Return value 3.
+Action ended 11:12:30: InstallFinalize. Return value 3.
+MSI (s) (A4:B8) [11:12:31:000]: Product: Citrix Workspace(USB) -- Installation operation failed.
+Action ended 11:12:20: CostFinalize. Return value 1.
+Property(S): ProductVersion = 26.7.0.269
+'@
+$el = @(Get-InstallLogErrorLines -Text $msiLog -Max 5)
+Assert-Eq $el.Count '3' 'error lines found, duplicates dropped'
+Assert-Eq ($el[0] -match 'Error 1722') 'True' 'MSI error number kept'
+Assert-Eq (@($el | Where-Object { $_ -match 'Return value 1' }).Count) '0' 'success actions ignored'
+Assert-Eq (@(Get-InstallLogErrorLines -Text $msiLog -Max 1).Count) '1' 'max respected'
+Assert-Eq (@(Get-InstallLogErrorLines -Text '' -Max 5).Count) '0' 'empty log'
+
 if ($failed -gt 0) { Write-Host "$failed test(s) failed"; exit 1 }
 Write-Host 'All tests passed'
 exit 0
