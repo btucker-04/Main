@@ -144,6 +144,31 @@ Dependency files: the CWA installer(s) (required), plus optionally the .NET 10 x
 | `-RemoveDotNet8` | switch | off | When nothing still needs .NET 8, run the staged `Remove-DotNetEolChannel.ps1 -DotNet8 -RemoveStaleFolders` (also removes the swidtag and Package Cache leftovers Tenable reads). Blocked (exit 2) on a CWA below 26.7, without .NET 10 x86, or when a .NET 8 app is found; skipped after a failed upgrade. |
 | `-DryRun` | switch | off | Report what would happen without changing anything (passes `-DryRun` to the remover too). |
 
+## Remove-CitrixWorkspaceLegacy.ps1
+Removes old Citrix Workspace app / Citrix Receiver copies that `Update-CitrixWorkspace.ps1` can't see: per-user installs and leftover files. Use it when Tenable reports an old Citrix Workspace version (for example plugin 207238, CTX691485) but the Update script logs `Citrix Workspace : not installed (machine-wide)`. That was the case on CSPRLT-94 on 2026-10-15.
+
+**What it checks:** anything below 26.7 (the fleet target) is old. It looks in:
+- machine uninstall entries (both registry views);
+- every user's uninstall entries, including unloaded profiles, whose `NTUSER.DAT` is loaded temporarily;
+- the `wfica32.exe`/`wfica.exe` binaries in `Program Files\Citrix\ICA Client`, `Program Files (x86)\Citrix\ICA Client` and each profile's `AppData\Local\Citrix\ICA Client`;
+- the `Citrix\PluginPackages\XenAppSuite\ICA_Client` version key.
+
+**What it removes:**
+- **Per-user installs:** uninstalled with their own `TrolleyExpress.exe /uninstall /cleanup /silent`. Anything left behind is then deleted: the user's ICA Client, SelfService and AuthManager folders, the uninstall entry, and startup (Run) entries pointing into the folder.
+- **Leftover machine files with no machine uninstall entry:** `ICA Client`, `SelfServicePlugin` and `AuthManager` under `Program Files\Citrix`, plus the PluginPackages key. Other Citrix products are not touched.
+- **An old machine-wide install:** left for `Update-CitrixWorkspace.ps1` to upgrade (exit 2), unless `-IncludeMachineInstall` is passed.
+
+An open Citrix session defers the run (exit 2) unless `-ForceClose`. Citrix will not install machine-wide over a per-user install, so `-ReinstallMachineWide` removes the per-user copy first and then runs the staged `Update-CitrixWorkspace.ps1 -InstallIfMissing`.
+
+Dependency files: none for removal. With `-ReinstallMachineWide`, also stage `Update-CitrixWorkspace.ps1`, the CWA installers and optionally the .NET 10 x86 installer. Exit `0` = nothing old left, `3010` = reboot needed, `2` = deferred or old machine install left for the upgrade, `1` = failed or still present. Log: `C:\Logs\CompoSecure\CitrixWorkspaceLegacy_<timestamp>.log`.
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `-ForceClose` | switch | off | Close open Citrix sessions and CWA processes instead of deferring. |
+| `-IncludeMachineInstall` | switch | off | Also uninstall an old machine-wide CWA (normally upgraded by `Update-CitrixWorkspace.ps1`). |
+| `-ReinstallMachineWide` | switch | off | After cleanup, run the staged `Update-CitrixWorkspace.ps1 -InstallIfMissing` (passes `-ForceClose` and `-DryRun` through). |
+| `-DryRun` | switch | off | Report what would happen; change nothing. |
+
 ## Install-SqlExpress2022.ps1
 Installs SQL Server 2022 Express from staged offline media. It does not remove an older SQL Server; use `Remove-UnsupportedSqlServer.ps1` for plugin 64784. Stage `SQLEXPR_x64_ENU.exe` (Express Core) or `SQLEXPRADV_x64_ENU.exe` (Express Advanced, needed for `FullText`/`PolyBase`), taken from `SQL2022-SSEI-Expr.exe` > Download Media. The script extracts the package to `C:\Windows\Temp\SQLEXPR2022`, checks that `setup.exe` is version 16.x (SQL Server 2019 Express uses the same file name), and runs setup quietly. Setup runs as SYSTEM under EC, so it adds the `-SqlSysAdmins` accounts as sysadmins rather than the current user.
 

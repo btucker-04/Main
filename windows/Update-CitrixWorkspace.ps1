@@ -620,7 +620,22 @@ if ($cwa) {
     $cwaArch = Get-CwaInstalledArch -DisplayName $cwa.DisplayName -IsWow $cwa.IsWow -InstallLocation $cwa.InstallLocation -OsArch $osArch
     Write-Log ('  Citrix Workspace : ' + $cwa.DisplayName + '  ' + $cwa.Version + '  (' + $cwaArch + ')')
 } else {
-    Write-Log '  Citrix Workspace : not installed'
+    Write-Log '  Citrix Workspace : not installed (machine-wide)'
+    # CSPRLT-94: Tenable still reported an old CWA from a per-user install
+    # or leftover ICA Client files, neither of which has a machine entry.
+    $outside = @()
+    foreach ($pf in @($env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { $_ } | Select-Object -Unique) {
+        $outside += @(Get-Item -LiteralPath ($pf + '\Citrix\ICA Client\wfica32.exe'), ($pf + '\Citrix\ICA Client\wfica.exe') -ErrorAction SilentlyContinue)
+    }
+    foreach ($u in @(Get-ChildItem 'C:\Users' -Directory -ErrorAction SilentlyContinue)) {
+        $outside += @(Get-Item -LiteralPath ($u.FullName + '\AppData\Local\Citrix\ICA Client\wfica32.exe'), ($u.FullName + '\AppData\Local\Citrix\ICA Client\wfica.exe') -ErrorAction SilentlyContinue)
+    }
+    foreach ($f in @($outside | Sort-Object FullName -Unique)) {
+        Write-Log ('  Old copy outside Add/Remove Programs: ' + $f.FullName + '  ' + $f.VersionInfo.ProductVersion) -Level WARN
+    }
+    if ($outside.Count -gt 0) {
+        Write-Log '  Remove it with Remove-CitrixWorkspaceLegacy.ps1 (add -ReinstallMachineWide to install 2607).' -Level WARN
+    }
 }
 $desktopX86 = @(Get-X86DesktopVersions)
 Write-Log ('  .NET Desktop Runtime x86 : ' + $(if ($desktopX86.Count) { ($desktopX86 -join ', ') } else { 'none' }))
