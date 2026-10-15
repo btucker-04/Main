@@ -1,0 +1,7 @@
+[Unit]
+Description=Falcon Shield to Slack poller
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/falcon-shield-alerts.env
+ExecStart=/usr/bin/python3 -m falcon_shield_alerts
