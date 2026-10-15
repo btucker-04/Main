@@ -1,0 +1,9 @@
+[Unit]
+Description=Run the Falcon Shield to Slack poller every 15 minutes
+
+[Timer]
+OnUnitActiveSec=15min
+Unit=falcon-shield-alerts.service
+
+[Install]
+WantedBy=timers.target

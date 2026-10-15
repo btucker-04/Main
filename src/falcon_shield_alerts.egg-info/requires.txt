@@ -1,0 +1,4 @@
+httpx
+
+[dev]
+pytest
