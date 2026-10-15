@@ -1,2 +1,0 @@
-[console_scripts]
-falcon-shield-alerts = falcon_shield_alerts.__main__:main
