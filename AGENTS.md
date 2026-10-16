@@ -4,8 +4,8 @@
 
 ### What this repo is
 This repository is a collection of **standalone system-remediation scripts**, not a
-buildable application. There is no package manager, build system, automated test
-suite, or CI config. Two platforms:
+buildable application. There is no package manager, build system, or CI config, but
+there are per-script unit tests (see "Tests" below). Two platforms:
 
 - `windows/` — PowerShell (`.ps1`), deployed via Endpoint Central (runs as SYSTEM).
 - `macos/` — bash 3.2-compatible (`.sh`), deployed via Mosyle (runs as root).
@@ -13,6 +13,22 @@ suite, or CI config. Two platforms:
 
 Read `README.md` for the deployment conventions and cross-cutting lessons; script
 headers document plugin IDs, exit-code meanings, and per-script quirks.
+
+### Before writing or fixing a script
+Read `.cursor/skills/writing-remediation-scripts/SKILL.md`, plus the section of its
+`lessons.md` for the platform you are touching. It collects the mistakes past fleet runs
+exposed (blank exit codes, stale snapshots, killed `$(...)` captures, dishonest summaries,
+32-bit registry redirection, root-owned files in brew trees, and so on).
+
+### Tests
+Scripts with testable logic put pure helpers above a gate and have a test file:
+- PowerShell: `if ($env:<NAME>_DOTSOURCE -eq '1') { return }`, tests in
+  `windows/tests/<Script>.Tests.ps1`, run with `pwsh -NoProfile -File windows/tests/<Script>.Tests.ps1`.
+- bash: `if [ "${<NAME>_SELFTEST:-0}" = "1" ]`, tests in `macos/tests/<script>.test.sh`,
+  run with `bash macos/tests/<script>.test.sh`. End-to-end cases use shims for `sudo`,
+  `stat`, `brew` and the other macOS tools on `PATH`.
+When you change a script that has a test file, add a regression case that uses the
+verbatim log line from the failing host, and run the whole file.
 
 ### Development toolchain (installed by the environment update script)
 There are no project dependencies to install. "Development readiness" for this repo
