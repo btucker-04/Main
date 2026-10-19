@@ -38,7 +38,7 @@ Every script here runs unattended on a real fleet machine: SYSTEM via a 32-bit E
 ## Verify before claiming
 - `bash -n`, `shellcheck -s bash -S warning` (no new warnings), and the macOS test script. For PowerShell: the parser, then `pwsh -NoProfile -File windows/tests/<Script>.Tests.ps1`.
 - If a test fails, read the run's log before changing the script. The fixture can be wrong too, for example a shim created after `chmod +x` ran.
-- Commit only after every edit tool call has returned, then check `git status` is clean. An edit sent in the same batch as `git commit` gets left out.
+- Commit only after every edit tool call has returned. An edit sent in the same batch as `git commit` gets left out. Then prove the tree is clean with `test -z "$(git status --porcelain)"`. `git status --short && echo clean` prints "clean" either way.
 - Put measured numbers in PR text (test counts, timings), not estimates.
 
 ## Final answer shape
