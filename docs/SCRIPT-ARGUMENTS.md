@@ -536,6 +536,17 @@ Updates App Store-installed Microsoft Office (Word/Excel/PowerPoint/Outlook/OneN
 | `--dry-run` | Report which apps `mas outdated` currently flags; change nothing beyond ensuring `mas` itself is installed (a detection dependency, not an Office change). |
 | `--accurate` | Pass `--accurate` through to `mas outdated`/`mas upgrade` for a slower, more precise check (may prompt for App Store sign-in). |
 
+## update-zoom.sh
+Updates Zoom Workplace to the release Zoom currently ships (Tenable ZSB advisories such as plugins 334489 / 334491). **No pinned version:** the target is read from where `https://zoom.us/client/latest/ZoomInstallerIT.pkg` redirects (`cdn.zoom.us/prod/<N.N.N.build>/...`). Inventories `/Applications/zoom.us.app` and per-user `~/Applications/zoom.us.app` copies, and exits 0 without downloading when everything is current. Defers while a meeting is in progress (`CptHost` / `aomhost` running). Checks the package is signed with Zoom's Developer ID, installs with a time limit, and re-reads the app version before claiming success. Older per-user copies are removed only after the machine-wide copy is verified. Reads **environment variables**, with an in-script `CONFIG` block for Mosyle. Exit `0` = current or not installed, `2` = deferred / not verified / per-user copy left, `1` = latest version, download or signature check failed.
+
+| Environment variable | CONFIG default | Description |
+|----------------------|----------------|-------------|
+| `DRY_RUN` | `CFG_DRY_RUN="0"` | Set `1` to report what would be installed or removed and change nothing. |
+| `FORCE_CLOSE` | `CFG_FORCE_CLOSE="0"` | Set `1` to install even during a meeting (the installer quits Zoom and drops the call). |
+| `REMOVE_USER_COPIES` | `CFG_REMOVE_USER_COPIES="1"` | Remove older `~/Applications/zoom.us.app` copies that are not running, once the machine-wide copy is verified current. `0` = report them (exit 2). |
+| `PKG_URL` | `CFG_PKG_URL="https://zoom.us/client/latest/ZoomInstallerIT.pkg"` | The "latest" URL the version and package come from. |
+| `DOWNLOAD_TIMEOUT` / `INSTALL_TIMEOUT` | `900` / `900` | Wall-clock limits in seconds for the download and the installer. |
+
 ## macos/superseded/*
 Retained for reference/rollback; prefer the replacements noted in each header (the Ruby-gem scripts are superseded by `remediate-ruby-gem.sh`; `update-photoshop.sh` by `update-adobe-rum.sh`).
 
