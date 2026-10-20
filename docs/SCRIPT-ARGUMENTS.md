@@ -547,6 +547,15 @@ Updates Zoom Workplace to the release Zoom currently ships (Tenable ZSB advisori
 | `PKG_URL` | `CFG_PKG_URL="https://zoom.us/client/latest/ZoomInstallerIT.pkg"` | The "latest" URL the version and package come from. |
 | `DOWNLOAD_TIMEOUT` / `INSTALL_TIMEOUT` | `900` / `900` | Wall-clock limits in seconds for the download and the installer. |
 
+## remove-apple-pages.sh
+Removes Apple Pages (`com.apple.iWork.Pages`) app bundles, e.g. Tenable plugin 298993 "Apple Pages < 15.1" (CVE-2025-46316). Finds copies the way Tenable does: Spotlight by bundle id (so renamed copies count) plus a walk of `/Applications` and `/Users` (Downloads, Desktop, Trash, nested folders; `~/Library` is skipped). Only bundles whose `CFBundleIdentifier` is exactly `com.apple.iWork.Pages` are touched; documents and the per-user container are never removed. Copies under `/Volumes` are reported, not deleted. Defers while Pages is running. Re-searches after removal before claiming success, and names the missing macOS permission when it gets "Operation not permitted" (App Management for the delete, Full Disk Access for the search). Reads **environment variables**, with an in-script `CONFIG` block for Mosyle. Exit `0` = nothing left to remove, `2` = running / not removed / not searchable / other volume / dry run with work, `1` = PlistBuddy missing.
+
+| Environment variable | CONFIG default | Description |
+|----------------------|----------------|-------------|
+| `DRY_RUN` | `CFG_DRY_RUN="0"` | Set `1` to list what would be removed and change nothing (exit 2 when something would be removed). |
+| `FORCE_CLOSE` | `CFG_FORCE_CLOSE="0"` | Set `1` to quit a running Pages first (graceful quit as the console user, then TERM, then KILL; unsaved work can be lost). |
+| `KEEP_FROM_VERSION` | `CFG_KEEP_FROM_VERSION=""` | Empty = remove every Apple Pages copy. Set e.g. `15.1` to keep copies at or above that version and remove only older ones. |
+
 ## macos/superseded/*
 Retained for reference/rollback; prefer the replacements noted in each header (the Ruby-gem scripts are superseded by `remediate-ruby-gem.sh`; `update-photoshop.sh` by `update-adobe-rum.sh`).
 
