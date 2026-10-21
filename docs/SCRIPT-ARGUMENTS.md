@@ -77,6 +77,13 @@ Channel-agnostic Office Click-to-Run updater.
 | `-NotifyMinutes` | int | `0` | Warn the signed-in user N minutes before open Office apps are force-closed: a message box (`msg.exe`) lists the open apps, then the script waits N minutes before triggering the update. Skipped when no Office app is open, and ignored with `-ForceAppShutdown:$false`. `0` = no warning. |
 | `-NotifyMessage` | string | (built-in) | Custom warning text. Default names the open apps and the delay. |
 
+## Get-OfficeC2RState.ps1
+Read-only check for an Office C2R finding that stays open after `Update-OfficeC2R.ps1` (which only launches the update and exits 0). Reports the file versions of the Office binaries on disk (what Tenable reads) in both Program Files roots, for C2R and MSI layouts. Alongside them it reports C2R's `VersionToReport`, the channel, `UpdatesEnabled` / `UpdateToVersion`, the GPO and cloud-policy update settings, running Office apps, and error lines from the newest C2R logs in `C:\Windows\Temp`. Prints one `VERDICT:` line and appends a row to `C:\Logs\CompoSecure\OfficeC2RState.csv`. The verdicts, most severe first: `NOT_C2R`, `LEFTOVER_FILES`, `PINNED_TARGET`, `UPDATES_DISABLED`, `CUSTOM_SOURCE`, `NOT_FINALIZED`, `BELOW_EXPECTED`, `CONSISTENT`. Exit `0` = report written, `1` = could not create the log folder.
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `-ExpectVersion` | string | none | Fixed build from the Tenable finding (e.g. `16.0.20228.20190`). Any active Office binary below it is reported as `BELOW_EXPECTED`. |
+
 ## Remediate-OfficeMacroSecurity.ps1
 Plugins 123459 and 123461 (replaces `Disable-OfficeVbaProjectAccess.ps1`). Fixes the Office Trust Center macro settings Tenable flags, for every Office app and version: `AccessVBOM` nonzero → `0` (VBA project access), `VBAWarnings` `1` (enable all macros) → `2` (disable with notification, the Office default), and Outlook `Level` `1` → `2`. Stricter values (`VBAWarnings` 3/4) are left alone. Covers HKLM (both registry views), every local user profile, and the Default profile new accounts copy.
 
