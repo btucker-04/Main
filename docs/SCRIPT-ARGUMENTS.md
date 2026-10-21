@@ -46,6 +46,17 @@ Bundle remediation (Notepad++, Cursor, Office C2R) for the cspc-100 profile.
 | `-SkipOffice` | switch | off | Skip the Office Click-to-Run component. |
 | `-DryRun` | switch | off | Log every action without changing anything. |
 
+The Notepad++ component pins 8.9.6.1, which no longer clears plugin 327203 (< 8.9.7). For Notepad++ use `Update-NotepadPlusPlus.ps1`, or run this bundle with `-SkipNotepadPP`.
+
+## Update-NotepadPlusPlus.ps1
+Updates every installed Notepad++ to the **latest release**, resolved at run time from where `github.com/notepad-plus-plus/notepad-plus-plus/releases/latest` redirects (no pinned version, no REST API rate limit). Clears plugins 327203 (< 8.9.7), 318684 (< 8.9.6.1), 299664 (< 8.9.2) and later ones. Finds installs in both Program Files folders and in any Notepad++ uninstall entry's `InstallLocation`. It upgrades each install in place with the installer for that install's architecture (x64, x86 or arm64, read from `notepad++.exe`), using the release MSI for MSI-managed x64 installs. Before running an installer it checks the PE or MSI header, the SHA-256 in the release's `checksums.sha256`, and an Authenticode signature from `CN=NOTEPAD++`. It defers while `notepad++.exe` is running and messages the user. Success is judged by re-reading the file version. Offline or Zscaler-blocked hosts: stage `npp.<ver>.Installer.x64.exe` (or `.Installer.exe` for x86) in Dependency Files or `C:\`. Exit `0` = all current or not installed, `2` = deferred / not verified / dry run with work, `1` = no target version, or download / checksum / signature failed.
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `-ForceClose` | switch | off | Kill running `notepad++.exe` before installing (Notepad++ usually restores unsaved tabs from its session backup, but that is a user setting). |
+| `-DryRun` | switch | off | Report what would be installed and change nothing. |
+| `-TargetVersion` | string | latest release | Install a specific version (e.g. `8.9.8.1`). Not needed for EC; leave blank. |
+
 ## Update-OracleJava8.ps1
 Updates Oracle Java SE 8 JRE to 8u491+ from a staged installer.
 
