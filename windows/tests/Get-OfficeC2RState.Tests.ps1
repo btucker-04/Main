@@ -94,6 +94,34 @@ Assert-Eq ((@($r[2]) -join '') -like '*Office16\MSACCESS.EXE 16.0.5435.1001*') '
 $r = V @{ Files = @((F ($c2r + 'MSACCESS.EXE') '16.0.20228.20190')); ReportVersion = '16.0.20228.20190'; ExpectVersion = '16.0.20300.20000' }
 Assert-Eq $r[0] 'BELOW_EXPECTED' 'numeric build comparison'
 
+# Fleet logs 2026-10-21 (no -ExpectVersion given). v1 said CONSISTENT for all
+# three because it ignored Updates\UpdatesReadyToApply.
+$r = V @{ Files = @((F ($c2r + 'MSACCESS.EXE') '16.0.20228.20110'), (F ($c2r + 'WINWORD.EXE') '16.0.20228.20110')); ReportVersion = '16.0.20228.20110'
+          ReadyToApply = '16.0.20527.20088'; RunningApps = @('EXCEL', 'OUTLOOK', 'POWERPNT', 'WINWORD') }
+Assert-Eq $r[0] 'PENDING_APPLY' 'CSLT-226: 20527 staged behind open apps'
+Assert-Eq (@($r[2]) -join ' | ') 'build 16.0.20527.20088 is downloaded and waiting to apply (installed 16.0.20228.20110) | Office apps open now: EXCEL, OUTLOOK, POWERPNT, WINWORD' 'CSLT-226 findings'
+$r = V @{ Files = @((F ($c2r + 'MSACCESS.EXE') '16.0.10417.20176')); ReportVersion = '16.0.10417.20176'; ReadyToApply = '16.0.10417.20228'; RunningApps = @('OUTLOOK') }
+Assert-Eq $r[0] 'PENDING_APPLY' 'CSMELT-10: Office 2019 build staged behind Outlook'
+$r = V @{ Files = @((F ($c2r + 'MSACCESS.EXE') '16.0.20430.20182')); ReportVersion = '16.0.20430.20182'; ReadyToApply = '0'; ExpectVersion = '16.0.20228.20190' }
+Assert-Eq $r[0] 'CONSISTENT' 'CSLT-171: already past the August build'
+$r = V @{ Files = @((F ($c2r + 'MSACCESS.EXE') '16.0.20430.20182')); ReportVersion = '16.0.20430.20182'; ReadyToApply = '0' }
+Assert-Eq ($r[1] -like '*pass -ExpectVersion*') 'True' 'CONSISTENT without -ExpectVersion says it was not compared'
+$r = V @{ Files = @((F ($c2r + 'MSACCESS.EXE') '16.0.20430.20182')); ReportVersion = '16.0.20430.20182'; ReadyToApply = '16.0.20430.20182' }
+Assert-Eq $r[0] 'CONSISTENT' 'ready build equal to installed is not pending'
+
+Assert-Eq (ConvertFrom-C2RTime '13436545218059') '2026-10-15 13:40 UTC' 'CSLT-226 UpdatePendingSince decoded'
+Assert-Eq (ConvertFrom-C2RTime '13418410331087') '2026-03-19 16:12 UTC' 'CSLT-226 UpdatesAppliedTime decoded'
+Assert-Eq (ConvertFrom-C2RTime '0') '' 'zero time is blank'
+Assert-Eq (ConvertFrom-C2RTime '') '' 'empty time is blank'
+
+$tab = [string][char]9
+$monitorable = '10/21/2026 11:56:45.690' + $tab + 'OFFICECL (0x8f80)' + $tab + '0x86ac' + $tab + $tab + 'Click-To-Run' + $tab + 'apkpk' + $tab + 'Monitorable' + $tab + 'ScenarioController::CheckProcessPool - Failed to get/create ui process pool'
+$identity = '10/21/2026 11:56:45.019' + $tab + 'OFFICEC2 (0x1bd8)' + $tab + '0x3f58' + $tab + $tab + 'Activity' + $tab + 'bjtcw' + $tab + 'Medium' + $tab + 'ActivityEnded {Name: Office.Identity.ServiceRequest, Success: true}'
+$exit0 = '10/21/2026 11:57:00.050' + $tab + 'OFFICECL (0x5d9c)' + $tab + '0x6218' + $tab + $tab + 'Click-To-Run' + $tab + 'ap11d' + $tab + 'Medium' + $tab + 'StandaloneStartupBehavior::Start - Exit with error code 0'
+Assert-Eq (Test-C2RLogLineOfInterest $monitorable) 'True' 'Monitorable log line kept'
+Assert-Eq (Test-C2RLogLineOfInterest $identity) 'False' 'telemetry noise dropped'
+Assert-Eq (Test-C2RLogLineOfInterest $exit0) 'False' 'exit code 0 dropped'
+
 if ($failed -gt 0) { Write-Host "$failed test(s) failed"; exit 1 }
 Write-Host 'All tests passed'
 exit 0

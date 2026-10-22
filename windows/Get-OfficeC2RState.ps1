@@ -48,6 +48,8 @@
       PINNED_TARGET      a policy or UpdateToVersion holds the build
       UPDATES_DISABLED   Office update policy is off (GPO / cloud policy)
       CUSTOM_SOURCE      updates come from a share or URL, not the Office CDN
+      PENDING_APPLY      a newer build is downloaded (Updates\UpdatesReadyToApply)
+                         but not applied, normally because Office apps are open
       NOT_FINALIZED      a binary is older than C2R's VersionToReport
                          (staged, not applied: an app was open, or a reboot)
       BELOW_EXPECTED     the build is below -ExpectVersion (update did not land)
@@ -127,7 +129,9 @@ function Get-StateVerdict {
         [string]$PolicyAutoUpdates,  # '0' = disabled by policy
         [string]$UpdatesEnabled,
         [string]$CustomSource,
-        [string]$ExpectVersion
+        [string]$ExpectVersion,
+        [string]$ReadyToApply,       # Updates\UpdatesReadyToApply: '0' or a staged build
+        [string[]]$RunningApps = @()
     )
     $findings = New-Object System.Collections.ArrayList
     $tokens = New-Object System.Collections.ArrayList
@@ -163,6 +167,13 @@ function Get-StateVerdict {
         [void]$findings.Add('updates come from ' + $CustomSource + ' (not the Office CDN); that source may hold an old build')
         [void]$tokens.Add('CUSTOM_SOURCE')
     }
+    $ready = $null
+    if (('' + $ReadyToApply) -match '^\d+(\.\d+){3}$') { $ready = [version]$ReadyToApply }
+    if ($ready -and $report -and $ready -gt $report) {
+        [void]$findings.Add('build ' + $ready + ' is downloaded and waiting to apply (installed ' + $report + ')')
+        if ($RunningApps.Count -gt 0) { [void]$findings.Add('Office apps open now: ' + ($RunningApps -join ', ')) }
+        [void]$tokens.Add('PENDING_APPLY')
+    }
     $active = @($Files | Where-Object { $_.Version -and $_.Active })
     if ($report) {
         $stale = @($active | Where-Object { $_.Version -lt $report })
@@ -175,7 +186,7 @@ function Get-StateVerdict {
         if ($below.Count -gt 0 -or ($report -and $report -lt $expect)) { [void]$tokens.Add('BELOW_EXPECTED') }
     }
 
-    $order = @('LEFTOVER_FILES', 'PINNED_TARGET', 'UPDATES_DISABLED', 'CUSTOM_SOURCE', 'NOT_FINALIZED', 'BELOW_EXPECTED')
+    $order = @('LEFTOVER_FILES', 'PINNED_TARGET', 'UPDATES_DISABLED', 'CUSTOM_SOURCE', 'PENDING_APPLY', 'NOT_FINALIZED', 'BELOW_EXPECTED')
     foreach ($t in $order) {
         if ($tokens -contains $t) {
             $summary = switch ($t) {
@@ -183,13 +194,34 @@ function Get-StateVerdict {
                 'PINNED_TARGET'    { 'the build is held by a target-version setting; clear it, then update' }
                 'UPDATES_DISABLED' { 'Office updates are disabled by policy; the C2R script cannot override a GPO' }
                 'CUSTOM_SOURCE'    { 'updates come from a custom share/URL; check it holds the fixed build' }
+                'PENDING_APPLY'    { 'a newer build is downloaded but cannot apply while Office apps are open; run Update-OfficeC2R.ps1 with its default force-close (add -NotifyMinutes to warn the user)' }
                 'NOT_FINALIZED'    { 'the update staged but binaries were not replaced; close Office (or reboot) and re-run' }
                 'BELOW_EXPECTED'   { 'the installed build is below the fixed build; the update did not land' }
             }
             return @($t, $summary, $findings)
         }
     }
-    return @('CONSISTENT', 'install is consistent; if Tenable still flags it, rescan (the scan may predate the update)', $findings)
+    $note = 'install is consistent; if Tenable still flags it, rescan (the scan may predate the update)'
+    if (-not $expect) { $note += '. Not compared with a fixed build: pass -ExpectVersion from the finding' }
+    return @('CONSISTENT', $note, $findings)
+}
+
+# C2R Updates\*Time / *Since values are milliseconds since 1601-01-01 UTC.
+# '' for 0, blank or non-numeric.
+function ConvertFrom-C2RTime {
+    param([string]$Value)
+    $n = [long]0
+    if (-not [long]::TryParse(('' + $Value).Trim(), [ref]$n) -or $n -le 0) { return '' }
+    return (New-Object DateTime(1601, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)).AddMilliseconds($n).ToString('yyyy-MM-dd HH:mm') + ' UTC'
+}
+
+# A C2R log line (tab-separated; column 7 is the level) worth showing:
+# Unexpected/Monitorable entries, or update-apply / veto events.
+function Test-C2RLogLineOfInterest {
+    param([string]$Line)
+    $cols = ('' + $Line).Split([char]9)
+    if ($cols.Count -ge 7 -and ($cols[6] -eq 'Unexpected' -or $cols[6] -eq 'Monitorable')) { return $true }
+    return (('' + $Line) -match 'Veto|AppsRunning|apps? (are )?(running|open)|UpdatesBlocked|ForceAppShutdown|Failed to (apply|download)')
 }
 
 if ($env:OFFICE_C2R_STATE_DOTSOURCE -eq '1') { return }
@@ -272,7 +304,14 @@ if ($hasC2R) {
         $v = Get-Val $cfg $n
         if ($v) { Write-Log ('  ' + $n.PadRight(15) + ' : ' + $v) }
     }
-    foreach ($n in ($upd.Keys | Sort-Object)) { Write-Log ('  Updates\' + $n + ' = ' + $upd[$n]) }
+    foreach ($n in ($upd.Keys | Sort-Object)) {
+        $line = '  Updates\' + $n + ' = ' + $upd[$n]
+        if ($n -match '(Time|Since|Period)$') {
+            $when = ConvertFrom-C2RTime ('' + $upd[$n])
+            if ($when) { $line += '  (' + $when + ')' }
+        }
+        Write-Log $line
+    }
 } else {
     Write-Log '  No Click-to-Run configuration key.' -Level WARN
 }
@@ -323,8 +362,9 @@ $logs = @(Get-ChildItem -LiteralPath (Join-Path $env:WINDIR 'Temp') -Filter ($en
 if ($logs.Count -eq 0) { Write-Log '  No C2R logs in C:\Windows\Temp.' }
 foreach ($l in $logs) {
     Write-Log ('  ' + $l.Name + '  (' + $l.LastWriteTime.ToString('yyyy-MM-dd HH:mm') + ', ' + [math]::Round($l.Length / 1KB) + ' KB)')
-    $hits = @(Select-String -LiteralPath $l.FullName -Pattern 'error|fail|blocked|UpdatesEnabled|UpdateToVersion|ApplyUpdates' -ErrorAction SilentlyContinue |
-              Where-Object { $_.Line -notmatch 'ErrorCode[:=]\s*0\b' } | Select-Object -Last 8)
+    $hits = @(Get-Content -LiteralPath $l.FullName -ErrorAction SilentlyContinue |
+              Where-Object { Test-C2RLogLineOfInterest $_ } | Select-Object -Last 8 |
+              ForEach-Object { [pscustomobject]@{ Line = $_ } })
     foreach ($h in $hits) {
         $t = $h.Line.Trim()
         if ($t.Length -gt 220) { $t = $t.Substring(0, 220) + '...' }
@@ -335,7 +375,8 @@ foreach ($l in $logs) {
 # Verdict
 $r = Get-StateVerdict -HasC2R $hasC2R -Files $files -ReportVersion $reportVer -PolicyTargetVersion $policyTarget `
     -UpdateToVersion (Get-Val $cfg 'UpdateToVersion') -PolicyAutoUpdates $policyAuto -UpdatesEnabled (Get-Val $cfg 'UpdatesEnabled') `
-    -CustomSource $customSource -ExpectVersion $ExpectVersion
+    -CustomSource $customSource -ExpectVersion $ExpectVersion -ReadyToApply (Get-Val $upd 'UpdatesReadyToApply') `
+    -RunningApps @($running | ForEach-Object { $_.ProcessName } | Sort-Object -Unique)
 $token = $r[0]; $summary = $r[1]; $findings = @($r[2])
 Write-Log ''
 if ($findings.Count -gt 0) {
