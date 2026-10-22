@@ -45,12 +45,26 @@ check_nogrep() {
   u 'bare build number is not a version' "$(y is_full_version 88465)" 'n'
   u 'N.N.N.build is a version' "$(y is_full_version 7.2.2.88465)" 'y'
   u '7.10 above 7.9' "$(y version_ge 7.10.0.1 7.9.9.9)" 'y'
+  # CSPRMB-15-A (2026-10-22): the 7.2.2.88465 package is signed as "Zoom
+  # Communications, Inc."; v1 matched the old company name and refused it.
   good='Package "ZoomInstallerIT.pkg":
    Status: signed by a developer certificate issued by Apple for distribution
+   Notarization: trusted by the Apple notary service
+   Signed with a trusted timestamp on: 2026-10-01 18:21:12 +0000
    Certificate Chain:
-    1. Developer ID Installer: Zoom Video Communications, Inc. (BJ4HAAB9B3)'
-  u 'Zoom signature accepted' "$(echo "$good" | y signature_is_zoom)" 'y'
-  u 'other developer refused' "$(echo "$good" | sed 's/Zoom Video Communications, Inc./Evil LLC/' | y signature_is_zoom)" 'n'
+    1. Developer ID Installer: Zoom Communications, Inc. (BJ4HAAB9B3)
+       Expires: 2030-02-15 20:04:50 +0000
+    2. Developer ID Certification Authority
+       Expires: 2031-09-17 00:00:00 +0000
+    3. Apple Root CA
+       Expires: 2035-02-09 21:40:36 +0000'
+  u 'CSPRMB-15-A: renamed Zoom signer accepted' "$(echo "$good" | y signature_is_zoom)" 'y'
+  u 'signer name extracted' "$(echo "$good" | signer_from_pkgutil)" 'Developer ID Installer: Zoom Communications, Inc. (BJ4HAAB9B3)'
+  u 'old Zoom company name still accepted' "$(echo "$good" | sed 's/Zoom Communications/Zoom Video Communications/' | y signature_is_zoom)" 'y'
+  u 'Zoom name with another team ID refused' "$(echo "$good" | sed 's/BJ4HAAB9B3/ABCDE12345/' | y signature_is_zoom)" 'n'
+  u 'team ID inside a longer name refused' "$(echo "$good" | sed 's/(BJ4HAAB9B3)/(BJ4HAAB9B3) Evil/' | y signature_is_zoom)" 'n'
+  u 'Developer ID Application cert refused' "$(echo "$good" | sed 's/Developer ID Installer: Zoom/Developer ID Application: Zoom/' | y signature_is_zoom)" 'n'
+  u 'not issued by Apple refused' "$(echo "$good" | sed 's/issued by Apple for distribution/self-signed/' | y signature_is_zoom)" 'n'
   u 'unsigned refused' "$(printf 'Package "x.pkg":\n   Status: no signature\n' | y signature_is_zoom)" 'n'
   exit $ufail
 ) || fail=1
@@ -86,7 +100,10 @@ EOF
 #!/bin/bash
 if [ "\$(cat "$S/signature")" = good ]; then
   printf '%s\n' 'Package "ZoomInstallerIT.pkg":' '   Status: signed by a developer certificate issued by Apple for distribution' \
-    '    1. Developer ID Installer: Zoom Video Communications, Inc. (BJ4HAAB9B3)'
+    '    1. Developer ID Installer: Zoom Communications, Inc. (BJ4HAAB9B3)'
+elif [ "\$(cat "$S/signature")" = other ]; then
+  printf '%s\n' 'Package "ZoomInstallerIT.pkg":' '   Status: signed by a developer certificate issued by Apple for distribution' \
+    '    1. Developer ID Installer: Evil LLC (ABCDE12345)'
 else
   printf '%s\n' 'Package "ZoomInstallerIT.pkg":' '   Status: no signature'
 fi
@@ -126,6 +143,7 @@ check_grep 'installer ran on the IT package' '^installer -pkg .*/ZoomInstallerIT
 check_grep 'downloaded the resolved CDN url' 'curl .*https://cdn.zoom.us/prod/7.2.2.88465/ZoomInstallerIT.pkg' "$S/calls"
 check_grep 'verified version logged' 'zoom.us.app  7.2.2.88465  OK' "$L"
 check 'work dir cleaned up' "$([ -e "$fix/run/work" ] && echo present || echo gone)" 'gone'
+cp "$L" "$fix/good.log"
 
 make_fixture; zoom_app "$A" 7.2.2.88465
 run_script env; rc=$?
@@ -157,6 +175,14 @@ make_fixture; zoom_app "$A" 7.1.0.60000; echo bad > "$S/signature"
 run_script env; rc=$?
 check 'bad signature -> 1' "$rc" '1'
 check_nogrep 'bad signature: no install' '^installer' "$S/calls"
+check_grep 'unsigned: pkgutil output logged' 'Status: no signature' "$L"
+
+make_fixture; zoom_app "$A" 7.1.0.60000; echo other > "$S/signature"
+run_script env; rc=$?
+check 'other team ID -> 1' "$rc" '1'
+check_nogrep 'other team ID: no install' '^installer' "$S/calls"
+check_grep 'signer named in the problem' 'team BJ4HAAB9B3\); signer: Developer ID Installer: Evil LLC \(ABCDE12345\)' "$L"
+check_grep 'good run logs the renamed signer' 'Signature: Developer ID Installer: Zoom Communications, Inc. \(BJ4HAAB9B3\)' "$fix/good.log"
 
 # installer exits 0 but the app did not change: must not report success.
 make_fixture; zoom_app "$A" 7.1.0.60000; : > "$S/installs"

@@ -64,7 +64,10 @@ USERS_DIR="${USERS_DIR:-/Users}"
 LOG_DIR="${LOG_DIR:-/var/log/composecure}"
 LOG_FILE="$LOG_DIR/zoom_update.log"
 WORK_DIR="${WORK_DIR:-/var/tmp/zoom_update_$$}"
-ZOOM_TEAM="Zoom Video Communications, Inc."
+# Apple team ID, not the company name: Zoom's certificate changed from "Zoom
+# Video Communications, Inc." to "Zoom Communications, Inc." (CSPRMB-15-A,
+# 2026-10-22) with the same team ID.
+ZOOM_TEAM_ID="BJ4HAAB9B3"
 MEETING_PROCS="CptHost aomhost"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"; }
@@ -94,12 +97,18 @@ version_ge() {
     [ "$(printf '%s\n%s\n' "$vg_a" "$vg_b" | sort -V | tail -n 1)" = "$vg_a" ]
 }
 
-# `pkgutil --check-signature` output on stdin -> 0 when Apple-issued and
-# signed by Zoom's Developer ID Installer certificate.
+# `pkgutil --check-signature` output on stdin -> the leaf certificate's name
+# (chain entry 1), e.g. "Developer ID Installer: Zoom Communications, Inc. (BJ4HAAB9B3)".
+signer_from_pkgutil() {
+    sed -n 's/^[[:space:]]*1\.[[:space:]]*//p' | head -n 1
+}
+
+# `pkgutil --check-signature` output on stdin -> 0 when Apple-issued and the
+# leaf is a Developer ID Installer certificate for Zoom's team ID.
 signature_is_zoom() {
     sz_out=$(cat)
     echo "$sz_out" | grep -q 'signed by a developer certificate issued by Apple' || return 1
-    echo "$sz_out" | grep -q "Developer ID Installer: $ZOOM_TEAM" || return 1
+    echo "$sz_out" | signer_from_pkgutil | grep -qE "^Developer ID Installer: .+ \\($ZOOM_TEAM_ID\\)[[:space:]]*\$" || return 1
 }
 
 descendants() (
@@ -262,11 +271,16 @@ if [ "$need_main" -eq 1 ]; then
         finish 1 "could not download $LATEST_URL."
     fi
     log "  Downloaded $(wc -c < "$PKG" | tr -d ' ') bytes."
-    if ! pkgutil --check-signature "$PKG" 2>&1 | signature_is_zoom; then
-        add_issue "package signature is not Zoom's Developer ID ($ZOOM_TEAM)"
+    SIG_LOG="$LOG_DIR/zoom_update_signature.log"
+    pkgutil --check-signature "$PKG" > "$SIG_LOG" 2>&1
+    SIGNER=$(signer_from_pkgutil < "$SIG_LOG")
+    if ! signature_is_zoom < "$SIG_LOG"; then
+        log "  pkgutil --check-signature said:"
+        while IFS= read -r l; do log "    $l"; done < "$SIG_LOG"
+        add_issue "package is not signed by Zoom's Developer ID Installer (team $ZOOM_TEAM_ID); signer: ${SIGNER:-none}"
         finish 1 "refused to install an unverified package."
     fi
-    log "  Signature: Developer ID Installer: $ZOOM_TEAM"
+    log "  Signature: $SIGNER"
     STEP_LOG="$LOG_DIR/zoom_update_installer.log"; : > "$STEP_LOG"
     run_limited "$INSTALL_TIMEOUT" installer -pkg "$PKG" -target /
     irc=$?
