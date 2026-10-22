@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# update-zoom.sh  (v1)
+# update-zoom.sh  (v2)
 # Remediates : Zoom Workplace below the current release (plugins 334489
 #              ZSB-26015 "< 7.0.6 / 7.1.0" and 334491 ZSB-26017
 #              "< 7.0.6 / 7.1.5", csprmb-15-a 2026-10-19), and later Zoom
@@ -19,20 +19,29 @@
 #      reports those too and nothing updates them as root).
 #   2. Nothing below the latest -> exit 0 without downloading.
 #   3. A meeting in progress (CptHost / aomhost running) defers with exit 2
-#      unless FORCE_CLOSE=1: the installer quits Zoom and would drop the call.
-#   4. Download, check the package is signed with Zoom's Developer ID, run
-#      `installer` with a wall-clock limit.
-#   5. Re-read the app's version. The installer's exit code is not proof.
+#      unless FORCE_CLOSE=1: closing Zoom would drop the call.
+#   4. Download, check the package is signed with Zoom's Developer ID. If Zoom
+#      is open, quit it (CLOSE_IDLE_ZOOM=1), then run `installer` with a
+#      wall-clock limit and reopen Zoom for the user afterwards.
+#   5. Re-read the app's version. The installer's exit code is not proof. On
+#      failure, Zoom's own /Library/Logs/zoomusinstall.log is copied into ours.
 #   6. Only after /Applications is verified current: remove per-user copies
 #      that are older and not running (REMOVE_USER_COPIES=1).
+#
+# Why Zoom must be closed (v2, CSPRMB-15-A 2026-10-22): the IT package's
+# preinstall does not install over a running zoom.us >= 6.6 from the command
+# line. It copies the package to /Applications/.zoomusUpdateUseOnly for Zoom to
+# apply itself, then exits 1 ("An error occurred while running scripts from
+# the package"). v1 only waited for meetings, so an idle open Zoom never
+# updated.
 #
 # CONFIG -- Mosyle passes no environment variables. Edit the block below
 # before paste, or pass the same names from a terminal (DRY_RUN=1 ...).
 # APP_DIR, USERS_DIR, LOG_DIR and WORK_DIR may be set for tests.
 #
 # Exit: 0 = every Zoom copy is current (or Zoom is not installed)
-#       2 = deferred (meeting), not verified after install, or a per-user
-#           copy is still old -- see the RESULT line
+#       2 = deferred (meeting, or Zoom open and would not quit), not verified
+#           after install, or a per-user copy is still old -- see the RESULT line
 #       1 = could not run (no latest version, download / signature failed)
 # =============================================================================
 
@@ -44,6 +53,11 @@ export HOME
 CFG_DRY_RUN="0"
 # Close Zoom even during a meeting. Off: a meeting defers to the next run.
 CFG_FORCE_CLOSE="0"
+# Quit an open Zoom that is not in a meeting, install, then reopen it. Zoom's
+# installer will not update a running Zoom. "0" defers (exit 2) instead.
+CFG_CLOSE_IDLE_ZOOM="1"
+# Seconds to wait for Zoom to quit when asked, and again after a TERM.
+CFG_QUIT_TIMEOUT="30"
 # Remove older per-user copies (~/Applications/zoom.us.app) once the
 # machine-wide copy is verified current. "0" only reports them.
 CFG_REMOVE_USER_COPIES="1"
@@ -54,6 +68,8 @@ CFG_INSTALL_TIMEOUT="900"
 # =============================================================================
 DRY_RUN="${DRY_RUN:-$CFG_DRY_RUN}"
 FORCE_CLOSE="${FORCE_CLOSE:-$CFG_FORCE_CLOSE}"
+CLOSE_IDLE_ZOOM="${CLOSE_IDLE_ZOOM:-$CFG_CLOSE_IDLE_ZOOM}"
+QUIT_TIMEOUT="${QUIT_TIMEOUT:-$CFG_QUIT_TIMEOUT}"
 REMOVE_USER_COPIES="${REMOVE_USER_COPIES:-$CFG_REMOVE_USER_COPIES}"
 PKG_URL="${PKG_URL:-$CFG_PKG_URL}"
 DOWNLOAD_TIMEOUT="${DOWNLOAD_TIMEOUT:-$CFG_DOWNLOAD_TIMEOUT}"
@@ -64,6 +80,7 @@ USERS_DIR="${USERS_DIR:-/Users}"
 LOG_DIR="${LOG_DIR:-/var/log/composecure}"
 LOG_FILE="$LOG_DIR/zoom_update.log"
 WORK_DIR="${WORK_DIR:-/var/tmp/zoom_update_$$}"
+ZOOM_INSTALL_LOG="${ZOOM_INSTALL_LOG:-/Library/Logs/zoomusinstall.log}"
 # Apple team ID, not the company name: Zoom's certificate changed from "Zoom
 # Video Communications, Inc." to "Zoom Communications, Inc." (CSPRMB-15-A,
 # 2026-10-22) with the same team ID.
@@ -109,6 +126,19 @@ signature_is_zoom() {
     sz_out=$(cat)
     echo "$sz_out" | grep -q 'signed by a developer certificate issued by Apple' || return 1
     echo "$sz_out" | signer_from_pkgutil | grep -qE "^Developer ID Installer: .+ \\($ZOOM_TEAM_ID\\)[[:space:]]*\$" || return 1
+}
+
+# Zoom's /Library/Logs/zoomusinstall.log from a failed install on stdin -> why
+# it failed, or nothing when the log does not say.
+zoom_install_cause() {
+    zc_out=$(cat)
+    if echo "$zc_out" | grep -q 'Copied IT pkg to'; then
+        echo "Zoom was open for the logged-in user: Zoom's preinstall copied the package to /Applications/.zoomusUpdateUseOnly for Zoom to apply itself and stopped the install (exit 1). Quit Zoom and re-run."
+        return 0
+    fi
+    zc_line=$(echo "$zc_out" | grep -E 'sha256 (auth|verify) failed|codesign fail|daemon helper not exit|copyPlist' | head -n 1)
+    [ -n "$zc_line" ] && echo "Zoom's postinstall rejected part of the package: $zc_line"
+    return 0
 }
 
 descendants() (
@@ -169,6 +199,55 @@ in_meeting() {
     return 1
 }
 
+zoom_pids() { pgrep -x zoom.us 2>/dev/null; }
+
+console_user() {
+    cu_name=$(stat -f %Su /dev/console 2>/dev/null)
+    case "$cu_name" in ""|root|loginwindow|_mbsetupuser) return 1 ;; esac
+    echo "$cu_name"
+}
+
+as_user() {
+    au_user="$1"; shift
+    au_uid=$(id -u "$au_user" 2>/dev/null) || return 1
+    launchctl asuser "$au_uid" sudo -u "$au_user" "$@"
+}
+
+wait_zoom_gone() {
+    wz_end=$(( $(date +%s) + $1 ))
+    while [ -n "$(zoom_pids)" ]; do
+        [ "$(date +%s)" -ge "$wz_end" ] && return 1
+        sleep 1
+    done
+    return 0
+}
+
+# Ask Zoom to quit as the logged-in user, then TERM what is left. 0 = gone.
+quit_zoom() {
+    if qz_user=$(console_user); then
+        log "  Asking Zoom to quit (as $qz_user)."
+        STEP_LOG="$LOG_DIR/zoom_update_quit.log"; : > "$STEP_LOG"
+        run_limited 30 as_user "$qz_user" osascript -e 'tell application id "us.zoom.xos" to quit'
+        wait_zoom_gone "$QUIT_TIMEOUT" && return 0
+    fi
+    qz_pids=$(zoom_pids | tr '\n' ' ')
+    log "  Zoom still running (pid ${qz_pids% }) -- sending TERM."
+    # shellcheck disable=SC2086
+    kill $qz_pids 2>/dev/null
+    wait_zoom_gone "$QUIT_TIMEOUT"
+}
+
+# Why the install has to wait, or nothing when it can go ahead.
+install_blocker() {
+    [ "$FORCE_CLOSE" = "1" ] && return 0
+    if ib_mp=$(in_meeting); then
+        echo "meeting in progress ($ib_mp); re-run later or set FORCE_CLOSE=1"
+    elif [ -n "$(zoom_pids)" ] && [ "$CLOSE_IDLE_ZOOM" != "1" ]; then
+        echo "Zoom is open (no meeting) and CLOSE_IDLE_ZOOM=0; Zoom's installer does not update a running Zoom -- re-run when it is closed"
+    fi
+    return 0
+}
+
 finish() {
     log ""
     log "================ SUMMARY ================"
@@ -183,7 +262,7 @@ finish() {
 
 log "===== update-zoom.sh START ====="
 log "Host: $(hostname -s 2>/dev/null || hostname)   macOS $(sw_vers -productVersion 2>/dev/null || echo '?')   arch $(uname -m)"
-log "DryRun=$DRY_RUN  ForceClose=$FORCE_CLOSE  RemoveUserCopies=$REMOVE_USER_COPIES"
+log "DryRun=$DRY_RUN  ForceClose=$FORCE_CLOSE  CloseIdleZoom=$CLOSE_IDLE_ZOOM  RemoveUserCopies=$REMOVE_USER_COPIES"
 
 log ""
 log "[1] Installed copies"
@@ -243,18 +322,21 @@ log "  Needs work: $( [ "$need_main" -eq 1 ] && echo "machine-wide copy" )$( [ -
 
 if [ "$need_main" -eq 1 ]; then
     log ""
-    log "[3] Meeting check"
+    log "[3] Running Zoom"
     if mp=$(in_meeting); then
-        if [ "$FORCE_CLOSE" = "1" ]; then
-            log "  A meeting is in progress ($mp) -- FORCE_CLOSE=1, continuing."
-        else
-            log "  A meeting is in progress ($mp) -- deferring so the call is not dropped."
-            add_issue "meeting in progress; re-run later or set FORCE_CLOSE=1"
-            finish 2 "deferred: Zoom ${MAIN_VER:-not installed} < $LATEST."
-        fi
+        log "  A meeting is in progress ($mp)."
+    elif [ -n "$(zoom_pids)" ]; then
+        log "  Zoom is open, no meeting."
     else
-        log "  No meeting in progress."
+        log "  Zoom is not running."
     fi
+    blocker=$(install_blocker)
+    if [ -n "$blocker" ]; then
+        log "  Deferring: $blocker"
+        add_issue "$blocker"
+        finish 2 "deferred: Zoom ${MAIN_VER:-not installed} < $LATEST."
+    fi
+    [ -n "$(zoom_pids)" ] && log "  Zoom will be quit just before the install$( [ "$FORCE_CLOSE" = "1" ] && echo " (FORCE_CLOSE=1)" )."
 
     if [ "$DRY_RUN" = "1" ]; then
         log "  [DRY_RUN] would install $LATEST_URL"
@@ -281,7 +363,26 @@ if [ "$need_main" -eq 1 ]; then
         finish 1 "refused to install an unverified package."
     fi
     log "  Signature: $SIGNER"
+
+    # A meeting can start, or Zoom be opened, during a long download.
+    blocker=$(install_blocker)
+    if [ -n "$blocker" ]; then
+        log "  Deferring: $blocker"
+        add_issue "$blocker"
+        finish 2 "deferred: Zoom ${MAIN_VER:-not installed} < $LATEST."
+    fi
+    REOPEN_USER=""
+    if [ -n "$(zoom_pids)" ]; then
+        REOPEN_USER=$(console_user) || REOPEN_USER=""
+        if ! quit_zoom; then
+            add_issue "Zoom would not quit (pid $(zoom_pids | tr '\n' ' ' | sed 's/ $//')); Zoom's installer does not update a running Zoom"
+            finish 2 "deferred: Zoom ${MAIN_VER:-not installed} < $LATEST."
+        fi
+        log "  Zoom closed."
+    fi
+
     STEP_LOG="$LOG_DIR/zoom_update_installer.log"; : > "$STEP_LOG"
+    touch "$WORK_DIR/install.start"
     run_limited "$INSTALL_TIMEOUT" installer -pkg "$PKG" -target /
     irc=$?
     tail -n 15 "$STEP_LOG" | while IFS= read -r l; do log "    $l"; done
@@ -294,7 +395,25 @@ if [ "$need_main" -eq 1 ]; then
         log "  $MAIN_APP  $MAIN_VER  OK"
     else
         add_issue "after install $MAIN_APP is ${MAIN_VER:-missing}, not $LATEST (installer exit $irc) -- $STEP_LOG"
+        # Zoom's preinstall truncates its log, so a file not older than the
+        # marker is this run's.
+        if [ -f "$ZOOM_INSTALL_LOG" ] && ! [ "$ZOOM_INSTALL_LOG" -ot "$WORK_DIR/install.start" ]; then
+            log "  Zoom's own log ($ZOOM_INSTALL_LOG), last 25 lines:"
+            tail -n 25 "$ZOOM_INSTALL_LOG" | while IFS= read -r l; do log "    $l"; done
+            cause=$(zoom_install_cause < "$ZOOM_INSTALL_LOG")
+            [ -n "$cause" ] && add_issue "$cause"
+        else
+            log "  $ZOOM_INSTALL_LOG was not written by this install."
+        fi
         finish 2 "Zoom not verified at $LATEST."
+    fi
+    if [ -n "$REOPEN_USER" ]; then
+        STEP_LOG="$LOG_DIR/zoom_update_quit.log"
+        if run_limited 30 as_user "$REOPEN_USER" open -a "$MAIN_APP"; then
+            log "  Reopened Zoom for $REOPEN_USER."
+        else
+            log "  Could not reopen Zoom for $REOPEN_USER (not required for the fix)."
+        fi
     fi
 fi
 
