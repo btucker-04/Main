@@ -81,6 +81,7 @@ Each entry gives the rule, then the evidence: the host or PR where it bit us. Se
 - **Split failure classes that look alike to the operator:** Nessus 409 duplicate identity vs connection failed vs empty response from TLS inspection. "Never connected" is not a regression (#30, #42).
 - **Bundle placeholders** (`PackageFullName` containing `_~_`) have no manifest on disk until a user signs in (#14).
 - **MSI 1714 + System Error 1612 means the installed product's cached .msi is gone.** No newer installer, repair or uninstall can get past it. Clear the registration first, after a `reg export` backup (`Update-VCRedist.ps1`). Bootstrappers hide it: Citrix reported only 101603, and the cause was in the Application log's MsiInstaller events (CSPRLT-94).
+- **A Burn bundle's Add/Remove Programs entry can outlive its failed MSIs.** Read the version from the payload MSI (VC++: the Minimum Runtime), not the bundle. Before an install, wait for `Global\_MSIExecute` to be free; on 1618, log which installer processes are running and retry. Check vendor permalinks too: `aka.ms/vs/17` stopped at VC++ 14.44 when `aka.ms/vc14` moved to 14.50 (CSPRLT-94).
 - **Hostname lookup tables go stale.** Use prefix patterns plus a short exception list (#9).
 - **When a vendor .pkg fails "while running scripts", read its scripts.** Extract the xar to get `preinstall` / `postinstall`; they log to the vendor's own file. Zoom's IT pkg stages itself in `/Applications/.zoomusUpdateUseOnly` and exits 1 whenever `zoom.us` is open, meeting or not, so the app must be quit first (CSPRMB-15-A).
 

@@ -169,9 +169,9 @@ On CSPRLT-94 (2026-10-26), "Microsoft Visual C++ 2022 X86 Minimum Runtime - 14.4
 
 How it works:
 - **Broken registrations:** a VC++ runtime MSI whose `LocalPackage` is missing, or a v14 bundle whose `BundleCachePath` is missing. Every key involved is exported to `C:\Logs\CompoSecure\VCRedist_backup_<timestamp>\` before anything is deleted (undo with `reg import`). Only Windows Installer's records are removed; the runtime DLLs stay, so apps keep working.
-- **Target:** `vc_redist.<arch>.exe` staged beside the script or in `C:\`, else downloaded from `https://aka.ms/vs/17/release/vc_redist.<arch>.exe`. There is no pinned version; the target is that file's own version. The file must have an MZ header and a Valid Authenticode signature from `O=Microsoft Corporation`.
-- **Install:** for each architecture below the target, or whose registration was cleared.
-- **Verify:** by re-reading Add/Remove Programs and the registrations. `vcruntime140.dll` versions are logged.
+- **Target:** `vc_redist.<arch>.exe` staged beside the script or in `C:\`, else downloaded from `https://aka.ms/vc14/vc_redist.<arch>.exe`. That is Microsoft's current permalink; the older `aka.ms/vs/17/release` link stops at the VS 2022 build 14.44. There is no pinned version; the target is that file's own version. The file must have an MZ header and a Valid Authenticode signature from `O=Microsoft Corporation`.
+- **Install:** for each architecture below the target, whose registration was cleared, or whose bundle is registered without its Minimum Runtime MSI. It first waits up to 10 minutes for Windows Installer to be idle. On 1618 (another install in progress) it logs the installer processes running and retries, up to 3 attempts.
+- **Verify:** by re-reading Add/Remove Programs and the registrations. The version that counts is the Minimum Runtime MSI's, because a bundle entry can stay registered after its MSIs failed. `vcruntime140.dll` versions are logged before and after.
 - **Unsupported 2005-2013 runtimes** are listed, and removed only with `-RemoveUnsupported`.
 
 Exit `0` = current, `3010` = reboot needed, `2` = dry run with work / another install in progress / unsupported removal failed, `1` = no verified installer, or an install or cleanup failed.
