@@ -217,6 +217,51 @@ Assert-Eq ($el[0] -match 'Error 1722') 'True' 'MSI error number kept'
 Assert-Eq (@($el | Where-Object { $_ -match 'Return value 1' }).Count) '0' 'success actions ignored'
 Assert-Eq (@(Get-InstallLogErrorLines -Text $msiLog -Max 1).Count) '1' 'max respected'
 Assert-Eq (@(Get-InstallLogErrorLines -Text '' -Max 5).Count) '0' 'empty log'
+# CWAInstaller-*.log format (2311+), verbatim from Citrix CTX695461.
+$cwaLog = @'
+CInstallationManager::InstallComponent(1088) - Component Install Status: ID = ReceiverInside, InstallMode = Install, InstallResult = 1603, InstallSuccess = False, InstallRebootRequired = False, InstallSuppressed = False
+CInstallationManager::InstallComponent(1088) - Component Install Status: ID = WebHelper, InstallMode = Install, InstallResult = 0, InstallSuccess = True, InstallRebootRequired = False, InstallSuppressed = False
+CWAInstallerHelper::CWA_InstallerHelper::WriteLogs(29) - ExitInstance : Exiting Application with error Code : 40034
+CWAInstallerHelper::CWA_InstallerHelper::WriteLogs(29) - ExitInstance : Exiting Application with error Code : 0
+'@
+$cl = @(Get-InstallLogErrorLines -Text $cwaLog -Max 5)
+Assert-Eq $cl.Count '2' 'CWAInstaller: failed component and exit code kept, successes dropped'
+Assert-Eq ($cl[0] -match 'ID = ReceiverInside') 'True' 'CWAInstaller: failing component named'
+
+# --- Exit code meaning (CSPRLT-94 2026-10-26: exit 101603, no log folder) ----
+Assert-Eq (Get-CwaExitCodeMeaning -ExitCode 101603) 'not in Citrix''s exit-code table; likely MSI error 1603 from a component install (fatal error during installation)' 'CSPRLT-94: 101603 explained'
+Assert-Eq (Get-CwaExitCodeMeaning -ExitCode 40034) 'CWA 40034: a component MSI install failed' 'Citrix table code'
+Assert-Eq (Get-CwaExitCodeMeaning -ExitCode 1618) 'MSI 1618: another installation is already in progress' 'plain MSI code'
+Assert-Eq (Get-CwaExitCodeMeaning -ExitCode 101234) 'not in Citrix''s exit-code table; likely MSI error 1234 from a component install' 'unknown inner MSI code'
+Assert-Eq (Get-CwaExitCodeMeaning -ExitCode 12345) '' 'unknown code -> empty'
+Assert-Eq (Get-CwaExitCodeMeaning -ExitCode $null) '' 'no code -> empty'
+
+# --- Log roots ----------------------------------------------------------------
+$roots = @(Get-CwaLogRoots -ProgramFilesX86 'C:\Program Files (x86)' -ProgramW6432 'C:\Program Files' -ProgramFiles 'C:\Program Files' -Temp 'C:\WINDOWS\TEMP\' -WinDir 'C:\WINDOWS')
+Assert-Eq ($roots -contains 'C:\WINDOWS\SystemTemp') 'True' 'Windows 11 SYSTEM temp searched'
+Assert-Eq ($roots -contains 'C:\WINDOWS\System32\config\systemprofile\AppData\Local\Temp') 'True' 'SYSTEM profile temp searched'
+Assert-Eq ($roots -contains 'C:\Program Files\Citrix\Logs') 'True' '64-bit Citrix logs searched'
+Assert-Eq (@($roots | Where-Object { $_ -eq 'C:\Program Files\Citrix\Logs' }).Count) '1' 'duplicate roots dropped'
+Assert-Eq (@($roots | Where-Object { $_ -like 'C:\WINDOWS\TEMP*' }).Count) '1' 'trailing backslash duplicate dropped'
+$roots32 = @(Get-CwaLogRoots -ProgramFilesX86 'C:\Program Files (x86)' -ProgramW6432 'C:\Program Files' -ProgramFiles 'C:\Program Files (x86)' -Temp '' -WinDir 'C:\WINDOWS')
+Assert-Eq ($roots32 -contains 'C:\Program Files\Citrix\Logs') 'True' '32-bit process still searches native Program Files'
+
+# --- MsiInstaller events -------------------------------------------------------
+$msiEvents = @(
+    'Product: Citrix Workspace Inside -- Installation completed successfully.',
+    'Windows Installer installed the product. Product Name: Citrix Workspace Inside. Product Version: 26.3.20.4. Product Language: 1033. Manufacturer: Citrix Systems, Inc.. Installation success or error status: 0.',
+    "Product: Citrix Workspace(SSON) -- Error 1722. There is a problem with this Windows Installer package.`r`nAction CtxSsonRemoveProvider",
+    'Product: Citrix Workspace(SSON) -- Installation operation failed.',
+    'Windows Installer installed the product. Product Name: Citrix Workspace(SSON). Product Version: 26.3.20.4. Product Language: 1033. Manufacturer: Citrix Systems, Inc.. Installation success or error status: 1603.',
+    'Product: Citrix Workspace(SSON) -- Installation operation failed.',
+    $null
+)
+$mf = @(Select-MsiFailureMessages -Messages $msiEvents -Max 10)
+Assert-Eq $mf.Count '3' 'failures kept, successes and duplicates dropped'
+Assert-Eq ($mf[0] -match 'Error 1722\. There is a problem with this Windows Installer package\. Action') 'True' 'multi-line message flattened'
+Assert-Eq ($mf[2] -match 'error status: 1603') 'True' 'non-zero status kept'
+Assert-Eq (@(Select-MsiFailureMessages -Messages $msiEvents -Max 1).Count) '1' 'msi max respected'
+Assert-Eq (@(Select-MsiFailureMessages -Messages @() -Max 5).Count) '0' 'no events'
 
 if ($failed -gt 0) { Write-Host "$failed test(s) failed"; exit 1 }
 Write-Host 'All tests passed'
