@@ -23,18 +23,22 @@
          runtime DLLs stay on disk and apps keep working. -SkipBrokenCleanup
          only reports them.
       3. Target: vc_redist.<arch>.exe staged beside this script or in C:\,
-         else downloaded from https://aka.ms/vs/17/release (Microsoft's
-         permalink for the latest v14). No pinned version: the target is
+         else downloaded from https://aka.ms/vc14 (Microsoft's permalink
+         for the latest v14; aka.ms/vs/17 stopped at the VS 2022 build
+         14.44). No pinned version: the target is
          the file's own version. The file must have an MZ header and a Valid
          Authenticode signature from Microsoft Corporation.
       4. Installs for each architecture whose v14 runtime is below the
          target or whose broken registration was cleared. -InstallMissing
-         also installs architectures that have no v14 runtime.
+         also installs architectures that have no v14 runtime. Waits for
+         Windows Installer to be idle first, and retries on 1618 (another
+         install in progress), naming the installer processes holding it.
       5. Unsupported runtimes (2005, 2008, 2010, 2012, 2013) are listed.
          -RemoveUnsupported uninstalls them; any app built against them
          stops working, so use it only where Tenable flags them.
       6. Verify by re-reading Add/Remove Programs and the registrations,
-         never by an installer's exit code.
+         never by an installer's exit code. The version that counts is the
+         Minimum Runtime MSI: a bundle entry can outlive a failed install.
 
 .PARAMETER SkipBrokenCleanup
     Report broken registrations; do not remove them (the update for that
@@ -74,8 +78,10 @@ param(
     [switch]$DryRun
 )
 
-$VcRedistBaseUrl = 'https://aka.ms/vs/17/release/vc_redist.'
+$VcRedistBaseUrl = 'https://aka.ms/vc14/vc_redist.'
 $InstallTimeoutMinutes = 20
+$IdleWaitMinutes = 10
+$BusyAttempts = 3
 
 # '14.42.34433', 'v14.42.34433.00' -> [version] with four parts; $null otherwise.
 function ConvertTo-VcVersion {
@@ -184,7 +190,7 @@ function Get-VcLogErrorLines {
     $out = @()
     foreach ($line in ($Text -split '\r?\n')) {
         $t = $line.Trim()
-        if ($t -match '(?i)(\bError \d{4}\b|Return value 3\b|Installation (failed|operation failed)|error 0x8[0-9a-f]{7}|Failed to (install|execute|uninstall)|System Error \d+)') {
+        if ($t -match '(?i)(\bError \d{4}\b|Return value 3\b|Installation (failed|operation failed)|error 0x8[0-9a-f]{7}|Failed to (install|execute|uninstall)|System Error \d+|Applied (execute|rollback) package: [^,]+, result: 0x0*[1-9a-f])') {
             if ($t.Length -gt 300) { $t = $t.Substring(0, 300) }
             if ($out -notcontains $t) { $out += $t }
             if ($out.Count -ge $Max) { break }
@@ -222,11 +228,13 @@ function Get-VcArchsForOs {
 }
 
 # Newest installed v14 runtime per architecture: the Minimum Runtime MSI is
-# the runtime itself; the bundle entry is the fallback.
+# the runtime itself; the bundle entry is the fallback unless -RuntimeOnly
+# (a bundle stays registered when its MSIs failed, CSPRLT-94).
 function Get-InstalledV14 {
-    param([object[]]$Entries, [string]$Arch)
+    param([object[]]$Entries, [string]$Arch, [switch]$RuntimeOnly)
     $best = $null
-    foreach ($kind in @('Minimum', 'Redistributable')) {
+    $kinds = $(if ($RuntimeOnly) { @('Minimum') } else { @('Minimum', 'Redistributable') })
+    foreach ($kind in $kinds) {
         foreach ($e in $Entries) {
             if ($e.Arch -ne $Arch -or $e.Major -ne 14 -or $e.Kind -ne $kind -or $null -eq $e.Version) { continue }
             if ($null -eq $best -or $e.Version -gt $best) { $best = $e.Version }
@@ -234,6 +242,33 @@ function Get-InstalledV14 {
         if ($null -ne $best) { return $best }
     }
     return $null
+}
+
+# v14 bundle entries for an architecture with no Minimum Runtime MSI.
+function Select-OrphanV14Bundles {
+    param([object[]]$Entries)
+    $withRuntime = @($Entries | Where-Object { $_.Major -eq 14 -and $_.Kind -eq 'Minimum' } | ForEach-Object { $_.Arch })
+    return @($Entries | Where-Object { $_.Major -eq 14 -and $_.Kind -eq 'Redistributable' -and $withRuntime -notcontains $_.Arch })
+}
+
+# Running installers that can hold the Windows Installer lock (1618):
+# msiexec clients and custom-action hosts (not the idle service, /V),
+# and setup bootstrappers. Objects need Name, ProcessId, CommandLine.
+function Select-InstallerProcesses {
+    param([object[]]$Processes, [int]$ExcludePid)
+    $out = @()
+    foreach ($p in $Processes) {
+        if ($p.ProcessId -eq $ExcludePid) { continue }
+        $n = '' + $p.Name
+        $c = '' + $p.CommandLine
+        if ($n -ieq 'msiexec.exe') {
+            if ($c -match '(?i)\s[/-]V\s*$') { continue }
+            $out += $p
+        } elseif ($n -match '(?i)(vc_?redist|setup|install|TrolleyExpress|CitrixWorkspaceApp)') {
+            $out += $p
+        }
+    }
+    return $out
 }
 
 # Registrations to clear: VC++ runtime MSIs whose cached .msi is gone, and
@@ -252,16 +287,18 @@ function Select-BrokenVcRegistrations {
     return $out
 }
 
-# Which architectures get an install: below target, registration cleared,
-# or (with -InstallMissing) absent. Objects: Arch, From, To, Reason.
+# Which architectures get an install: registration cleared, bundle without
+# its runtime MSI, below target, or (with -InstallMissing) absent.
+# Objects: Arch, From, To, Reason.
 function Get-VcInstallPlan {
-    param([string[]]$Archs, [hashtable]$Installed, [hashtable]$Target, [string[]]$Cleared, [bool]$InstallMissing)
+    param([string[]]$Archs, [hashtable]$Installed, [hashtable]$Target, [string[]]$Cleared, [bool]$InstallMissing, [string[]]$Orphaned = @())
     $plan = @()
     foreach ($a in $Archs) {
         if (-not $Target.ContainsKey($a) -or $null -eq $Target[$a]) { continue }
         $have = $Installed[$a]
         $reason = ''
         if ($Cleared -contains $a) { $reason = 'broken registration cleared' }
+        elseif ($Orphaned -contains $a) { $reason = 'bundle registered without its runtime' }
         elseif ($null -ne $have -and $have -lt $Target[$a]) { $reason = 'below target' }
         elseif ($null -eq $have -and $InstallMissing) { $reason = 'not installed (-InstallMissing)' }
         if ($reason) { $plan += [pscustomobject]@{ Arch = $a; From = $have; To = $Target[$a]; Reason = $reason } }
@@ -619,6 +656,46 @@ function Write-InstallLogErrors {
     return (Get-VcLogHint -Text $text)
 }
 
+# Windows Installer holds Global\_MSIExecute while any install runs.
+function Test-MsiBusy {
+    $m = $null
+    try {
+        if ([System.Threading.Mutex]::TryOpenExisting('Global\_MSIExecute', [ref]$m)) { $m.Dispose(); return $true }
+        return $false
+    } catch [System.UnauthorizedAccessException] {
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Get-InstallerProcessText {
+    $procs = @()
+    try { $procs = @(Get-CimInstance Win32_Process -ErrorAction Stop | Select-Object Name, ProcessId, CommandLine) } catch { return '(process list unavailable)' }
+    $hits = @(Select-InstallerProcesses -Processes $procs -ExcludePid $PID)
+    if ($hits.Count -eq 0) { return 'none found' }
+    return (($hits | ForEach-Object {
+        $c = '' + $_.CommandLine
+        if ($c.Length -gt 160) { $c = $c.Substring(0, 160) + '...' }
+        $_.Name + ' (' + $_.ProcessId + ')' + $(if ($c) { ' ' + $c } else { '' })
+    }) -join '; ')
+}
+
+# $true once Windows Installer is idle; $false after $Minutes.
+function Wait-InstallerIdle {
+    param([int]$Minutes)
+    if (-not (Test-MsiBusy)) { return $true }
+    Write-Log ('  Windows Installer is busy: ' + (Get-InstallerProcessText)) -Level WARN
+    Write-Log ('  Waiting up to ' + $Minutes + ' minutes for it to finish...')
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.Elapsed.TotalMinutes -lt $Minutes) {
+        Start-Sleep -Seconds 15
+        if (-not (Test-MsiBusy)) { Write-Log ('  Windows Installer idle after ' + [int]$sw.Elapsed.TotalSeconds + 's.'); return $true }
+    }
+    Write-Log ('  Still busy after ' + $Minutes + ' minutes: ' + (Get-InstallerProcessText)) -Level WARN
+    return $false
+}
+
 function Get-DllVersion {
     param([string]$Path)
     try {
@@ -654,6 +731,19 @@ foreach ($p in ($msi | Where-Object { -not $_.CacheOk })) {
 $installed = @{}
 foreach ($a in $Archs) { $installed[$a] = Get-InstalledV14 -Entries $arp -Arch $a }
 foreach ($a in $Archs) { Write-Log ('  v14 runtime ' + $a + ' : ' + (Format-VcVersion $installed[$a])) }
+foreach ($o in (Select-OrphanV14Bundles -Entries $arp)) {
+    Write-Log ('  ' + $o.DisplayName + ' is registered, but no ' + $o.Arch + ' Minimum Runtime MSI is installed (a failed earlier install)') -Level WARN
+}
+$sysDll = $env:WINDIR + '\System32\vcruntime140.dll'
+$wowDll = $env:WINDIR + '\SysWOW64\vcruntime140.dll'
+function Write-DllVersions {
+    if ([Environment]::Is64BitOperatingSystem) {
+        Write-Log ('  vcruntime140.dll  x64: ' + (Get-DllVersion $sysDll) + '   x86: ' + (Get-DllVersion $wowDll))
+    } else {
+        Write-Log ('  vcruntime140.dll  x86: ' + (Get-DllVersion $sysDll))
+    }
+}
+Write-DllVersions
 
 # ---- 2. Broken registrations -----------------------------------------------
 Write-Log '[2] Broken registrations'
@@ -708,22 +798,32 @@ foreach ($a in $wanted) {
 
 # ---- 4. Install ------------------------------------------------------------
 Write-Log '[4] Install'
-$plan = @(Get-VcInstallPlan -Archs $Archs -Installed $installed -Target $target -Cleared $cleared -InstallMissing ([bool]$InstallMissing))
+$orphaned = @(Select-OrphanV14Bundles -Entries $arp | ForEach-Object { $_.Arch } | Select-Object -Unique)
+$plan = @(Get-VcInstallPlan -Archs $Archs -Installed $installed -Target $target -Cleared $cleared -InstallMissing ([bool]$InstallMissing) -Orphaned $orphaned)
 if ($plan.Count -eq 0) { Write-Log '  Every v14 runtime is current.' }
 $failHints = @{}
 foreach ($step in $plan) {
     Write-Log ('  ' + $step.Arch + ': ' + (Format-VcVersion $step.From) + ' -> ' + $step.To + '  (' + $step.Reason + ')')
     if ($DryRun) { $NeedsHuman = $true; continue }
-    $logBase = Join-Path $LogDir ('VCRedist_' + $Stamp + '_' + $step.Arch + '_install.log')
-    $code = Invoke-Bounded -Path $installers[$step.Arch].Path -Arguments ('/install /quiet /norestart /log ' + $Q + $logBase + $Q) -TimeoutMinutes $InstallTimeoutMinutes
-    $meaning = Get-VcExitMeaning -ExitCode $code
-    Write-Log ('  Exit code: ' + $(if ($null -eq $code) { '(not reported)' } else { $code }) + $(if ($meaning) { '  (' + $meaning + ')' } else { '' }))
-    switch (Get-VcInstallOutcome -ExitCode $code) {
+    $outcome = 'UNKNOWN'
+    foreach ($attempt in 1..$BusyAttempts) {
+        $null = Wait-InstallerIdle -Minutes $IdleWaitMinutes
+        $logBase = Join-Path $LogDir ('VCRedist_' + $Stamp + '_' + $step.Arch + '_install' + $(if ($attempt -gt 1) { '_try' + $attempt } else { '' }) + '.log')
+        $code = Invoke-Bounded -Path $installers[$step.Arch].Path -Arguments ('/install /quiet /norestart /log ' + $Q + $logBase + $Q) -TimeoutMinutes $InstallTimeoutMinutes
+        $meaning = Get-VcExitMeaning -ExitCode $code
+        Write-Log ('  Exit code: ' + $(if ($null -eq $code) { '(not reported)' } else { $code }) + $(if ($meaning) { '  (' + $meaning + ')' } else { '' }))
+        $outcome = Get-VcInstallOutcome -ExitCode $code
+        if ($outcome -ne 'BUSY') { break }
+        Write-Log ('  Installers running now: ' + (Get-InstallerProcessText)) -Level WARN
+        $null = Write-InstallLogErrors -LogBase $logBase
+        if ($attempt -lt $BusyAttempts) { Write-Log ('  Retrying (' + ($attempt + 1) + ' of ' + $BusyAttempts + ').') }
+    }
+    switch ($outcome) {
         'OK'      { }
         'NEWER'   { }
         'UNKNOWN' { }
         'REBOOT'  { $Reboot = $true }
-        'BUSY'    { Add-Issue ($step.Arch + ': another installation was in progress; re-run later') }
+        'BUSY'    { Add-Issue ($step.Arch + ': another installation was still in progress after ' + $BusyAttempts + ' attempts; re-run later') }
         'FAIL'    {
             $hint = Write-InstallLogErrors -LogBase $logBase
             if ($hint) { Write-Log ('  Cause: ' + $hint) -Level ERROR; $failHints[$step.Arch] = $hint }
@@ -745,6 +845,7 @@ if ($unsupported.Count -eq 0) {
         if ($DryRun) { Write-Log ('  [DRYRUN] Would remove ' + $u.DisplayName); $NeedsHuman = $true; continue }
         Write-Log ('  Removing ' + $u.DisplayName)
         $log = Join-Path $LogDir ('VCRedist_' + $Stamp + '_remove_' + $u.Year + '_' + $u.Arch + '.log')
+        $null = Wait-InstallerIdle -Minutes $IdleWaitMinutes
         if ($u.BundleCachePath -and $u.CacheOk) {
             $code = Invoke-Bounded -Path $u.BundleCachePath -Arguments ('/uninstall /quiet /norestart /log ' + $Q + $log + $Q) -TimeoutMinutes $InstallTimeoutMinutes
         } elseif ($u.IsMsi -and (ConvertTo-PackedGuid $u.Key)) {
@@ -767,7 +868,7 @@ if ($DryRun) {
     $arp = @(Get-VcArpEntries)
     $msi = @(Get-VcMsiRegistrations)
     foreach ($step in $plan) {
-        $now = Get-InstalledV14 -Entries $arp -Arch $step.Arch
+        $now = Get-InstalledV14 -Entries $arp -Arch $step.Arch -RuntimeOnly
         if ($null -ne $now -and $now -ge $step.To) {
             Write-Log ('  ' + $step.Arch + ' v14 runtime ' + $now + '  OK')
         } elseif ($Reboot) {
@@ -790,13 +891,10 @@ if ($DryRun) {
             Add-Issue ('still installed: ' + $u.DisplayName)
         }
     }
-    $sys = $env:WINDIR + '\System32\vcruntime140.dll'
-    $wow = $env:WINDIR + '\SysWOW64\vcruntime140.dll'
-    if ([Environment]::Is64BitOperatingSystem) {
-        Write-Log ('  vcruntime140.dll  x64: ' + (Get-DllVersion $sys) + '   x86: ' + (Get-DllVersion $wow))
-    } else {
-        Write-Log ('  vcruntime140.dll  x86: ' + (Get-DllVersion $sys))
+    foreach ($o in (Select-OrphanV14Bundles -Entries $arp)) {
+        Write-Log ('  ' + $o.DisplayName + ' is registered without a Minimum Runtime MSI') -Level WARN
     }
+    Write-DllVersions
 }
 
 # ---- Summary -----------------------------------------------------------------

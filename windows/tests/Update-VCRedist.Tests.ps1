@@ -67,6 +67,32 @@ $arp = @(
 Assert-Eq (Get-InstalledV14 -Entries $arp -Arch 'x86') '14.42.34433.0' 'Minimum Runtime is the truth over the bundle'
 Assert-Eq (Get-InstalledV14 -Entries $arp -Arch 'x64') '14.40.33810.0' 'bundle used when no Minimum Runtime entry'
 Assert-Eq (Get-InstalledV14 -Entries $arp -Arch 'arm64') '' 'absent architecture -> null'
+Assert-Eq (Get-InstalledV14 -Entries $arp -Arch 'x64' -RuntimeOnly) '' '-RuntimeOnly ignores the bundle'
+Assert-Eq (Get-InstalledV14 -Entries $arp -Arch 'x86' -RuntimeOnly) '14.42.34433.0' '-RuntimeOnly reads the Minimum Runtime'
+
+# CSPRLT-94 after cleanup: the 14.42 x86 bundle stayed registered after its
+# MSIs failed; x64 has its runtime.
+$after = @(
+    (ConvertTo-VcEntry 'Microsoft Visual C++ 2015-2022 Redistributable (x86) - 14.42.34433' '14.42.34433.0'),
+    (ConvertTo-VcEntry 'Microsoft Visual C++ 2022 X64 Minimum Runtime - 14.50.35719' '14.50.35719'),
+    (ConvertTo-VcEntry 'Microsoft Visual C++ 2015-2022 Redistributable (x64) - 14.50.35719' '14.50.35719.0'),
+    (ConvertTo-VcEntry 'Microsoft Visual C++ 2013 Redistributable (x86) - 12.0.40664' '12.0.40664.0')
+)
+Assert-Eq ((Select-OrphanV14Bundles -Entries $after | ForEach-Object { $_.Arch }) -join ',') 'x86' 'bundle without runtime found'
+Assert-Eq (@(Select-OrphanV14Bundles -Entries $arp | ForEach-Object { $_.Arch }) -join ',') 'x64' 'x64 bundle-only entry is an orphan'
+Assert-Eq (Get-InstalledV14 -Entries $after -Arch 'x86' -RuntimeOnly) '' 'CSPRLT-94 verify: no x86 runtime, not 14.42'
+
+# --- installer processes (1618) ---------------------------------------------------
+$procs = @(
+    [pscustomobject]@{ Name = 'msiexec.exe'; ProcessId = 900; CommandLine = 'C:\WINDOWS\system32\msiexec.exe /V' },
+    [pscustomobject]@{ Name = 'msiexec.exe'; ProcessId = 901; CommandLine = 'C:\WINDOWS\syswow64\MsiExec.exe -Embedding 6F1A' },
+    [pscustomobject]@{ Name = 'CitrixWorkspaceApp.exe'; ProcessId = 902; CommandLine = 'CitrixWorkspaceApp.exe /silent' },
+    [pscustomobject]@{ Name = 'vc_redist.x86.exe'; ProcessId = 903; CommandLine = '' },
+    [pscustomobject]@{ Name = 'explorer.exe'; ProcessId = 904; CommandLine = 'C:\WINDOWS\Explorer.EXE' },
+    [pscustomobject]@{ Name = 'powershell.exe'; ProcessId = 905; CommandLine = 'powershell -File Update-VCRedist.ps1' }
+)
+Assert-Eq ((Select-InstallerProcesses -Processes $procs -ExcludePid 905 | ForEach-Object { $_.ProcessId }) -join ',') '901,902,903' 'msiexec clients and setups named, idle service and self skipped'
+Assert-Eq (@(Select-InstallerProcesses -Processes @() -ExcludePid 1).Count) '0' 'no processes'
 
 # --- broken registrations ------------------------------------------------------
 function New-Reg { param($Name, $Ver, $CacheOk) $r = ConvertTo-VcEntry $Name $Ver; $r | Add-Member CacheOk $CacheOk; $r | Add-Member Packed 'X'; $r }
@@ -100,6 +126,8 @@ $p = @(Get-VcInstallPlan -Archs @('x86', 'x64') -Installed @{ x86 = (ConvertTo-V
 Assert-Eq $p.Count '0' 'no verified installer for x86 -> not planned'
 $p = @(Get-VcInstallPlan -Archs @('x86') -Installed @{ x86 = (ConvertTo-VcVersion '14.50.1.0') } -Target $t -Cleared @() -InstallMissing $false)
 Assert-Eq $p.Count '0' 'newer than target -> nothing'
+$p = @(Get-VcInstallPlan -Archs @('x86', 'x64') -Installed @{ x86 = (ConvertTo-VcVersion '14.44.35211'); x64 = (ConvertTo-VcVersion '14.44.35211') } -Target $t -Cleared @() -InstallMissing $false -Orphaned @('x86'))
+Assert-Eq (($p | ForEach-Object { $_.Arch + ':' + $_.Reason }) -join ',') 'x86:bundle registered without its runtime' 'orphan bundle at target still reinstalled'
 
 # --- outcomes, meanings, logs ---------------------------------------------------
 Assert-Eq (Get-VcInstallOutcome 0) 'OK' '0 ok'
@@ -124,6 +152,13 @@ Assert-Eq ($el[2] -match '0x80070643') 'True' 'Burn error kept'
 Assert-Eq (Get-VcLogHint $log) 'an older VC++ runtime cannot be removed because its cached installer is missing (1714 / 1612); run without -SkipBrokenCleanup' 'CSPRLT-94 cause named'
 Assert-Eq (Get-VcLogHint 'e000: Error 0x80070666: Cannot install a product when a newer version is installed.') 'a newer version of this runtime is already installed (0x80070666)' 'newer version named'
 Assert-Eq (Get-VcLogHint 'nothing here') '' 'no hint'
+$burn = @'
+[1A2C:0F10][2026-10-26T09:37:40]i319: Applied execute package: vcRuntimeMinimum_x86, result: 0x0, restart: None
+[1A2C:0F10][2026-10-26T09:37:41]i319: Applied execute package: vcRuntimeAdditional_x86, result: 0x80070652, restart: None
+'@
+$el = @(Get-VcLogErrorLines -Text $burn -Max 6)
+Assert-Eq ('' + $el.Count + '|' + ($el[0] -match 'vcRuntimeAdditional_x86')) '1|True' 'failed Burn package named, succeeded one dropped'
+Assert-Eq (Get-VcLogHint $burn) 'another installation was in progress (0x80070652 / 1618)' '1618 in Burn log named'
 
 # --- signer, architectures, exit, relaunch ----------------------------------------
 Assert-Eq (Test-MicrosoftSigner 'CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US') 'True' 'Microsoft signer accepted'
