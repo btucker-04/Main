@@ -473,6 +473,19 @@ function Select-MsiFailureMessages {
     return $out
 }
 
+function Get-MsiFailureHint {
+    # MsiInstaller failure messages -> the cause in plain words, or ''.
+    # CSPRLT-94 (2026-10-26): CWA's VC++ prerequisite hit 1714 + System
+    # Error 1612, so CWA itself exited 101603.
+    param([string[]]$Messages)
+    foreach ($m in $Messages) {
+        if ($m -match '(?i)Product: (.+?) -- Error 1714\..*System Error 1612') {
+            return ('The installed ' + $Matches[1] + ' cannot be upgraded: Windows Installer''s cached copy of the old version is missing (MSI 1714 / 1612). Remove that broken registration, then retry.')
+        }
+    }
+    return ''
+}
+
 function Format-DotNet8Folders {
     param([object[]]$Folders)
     if (-not $Folders -or $Folders.Count -eq 0) { return 'none' }
@@ -681,32 +694,37 @@ function Write-CwaInstallLogHint {
     # CWA logs to <Program Files>\Citrix\Logs, but a run under SYSTEM can log
     # to a SYSTEM temp folder instead. CSPRLT-94 (exit 101603) twice left no
     # log folder from the run in Program Files, %TEMP% or C:\Windows\Temp, so
-    # loose installer logs written since the install started count too.
+    # loose installer logs written since the install started count too. The
+    # VC++ prerequisite step logs to its own CTXPreRequisiteInstallLogs-*
+    # folder (CSPRLT-94 2026-10-26: that was where the failure was).
     param([bool]$Failed, [datetime]$Since)
     $bases = @(Get-CwaLogRoots -ProgramFilesX86 ${env:ProgramFiles(x86)} -ProgramW6432 $env:ProgramW6432 -ProgramFiles $env:ProgramFiles -Temp $env:TEMP -WinDir $env:WINDIR)
     $cutoff = $Since.AddMinutes(-1)
     $all = @()
     $loose = @()
     foreach ($b in $bases) {
-        foreach ($f in @('CTXWorkspaceInstallLogs*', 'CTXReceiverInstallLogs*')) {
+        foreach ($f in @('CTXWorkspaceInstallLogs*', 'CTXReceiverInstallLogs*', 'CTXPreRequisiteInstallLogs*')) {
             $all += @(Get-ChildItem -LiteralPath $b -Directory -Filter $f -ErrorAction SilentlyContinue)
         }
-        foreach ($f in @('CWAInstaller*.log', 'TrolleyExpress*.log', 'CtxInstall-*.log')) {
+        foreach ($f in @('CWAInstaller*.log', 'TrolleyExpress*.log', 'CtxInstall-*.log', 'PreRequisiteInstaller*.log')) {
             $loose += @(Get-ChildItem -LiteralPath $b -File -Filter $f -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $cutoff })
         }
     }
-    $latest = $all | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    $fromThisRun = ($latest -and $latest.LastWriteTime -ge $cutoff)
-    if ($latest) {
-        Write-Log ('  Citrix install logs: ' + $latest.FullName + '  (' + $latest.LastWriteTime + ')' + $(if ($fromThisRun) { '' } else { '  -- older than this run' }))
-    }
+    $thisRun = @($all | Where-Object { $_.LastWriteTime -ge $cutoff } | Sort-Object LastWriteTime)
     $logs = @()
-    if ($fromThisRun) {
-        $logs = @(Get-ChildItem -LiteralPath $latest.FullName -Recurse -File -Filter '*.log' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime)
-    } elseif ($loose.Count -gt 0) {
+    if ($thisRun.Count -gt 0) {
+        foreach ($d in $thisRun) {
+            Write-Log ('  Citrix install logs: ' + $d.FullName + '  (' + $d.LastWriteTime + ')')
+            $logs += @(Get-ChildItem -LiteralPath $d.FullName -Recurse -File -Filter '*.log' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime)
+        }
+    } else {
+        $latest = $all | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if ($latest) { Write-Log ('  Citrix install logs: ' + $latest.FullName + '  (' + $latest.LastWriteTime + ')  -- older than this run') }
+    }
+    if ($thisRun.Count -eq 0 -and $loose.Count -gt 0) {
         $logs = @($loose | Sort-Object LastWriteTime)
         foreach ($d in @($logs | ForEach-Object { $_.DirectoryName } | Select-Object -Unique)) { Write-Log ('  Citrix installer logs from this run in: ' + $d) }
-    } else {
+    } elseif ($thisRun.Count -eq 0) {
         Write-Log ('  No Citrix installer log from this run in: ' + ($bases -join ', ') + '.')
     }
     if (-not $Failed -or $logs.Count -eq 0) { return }
@@ -730,6 +748,8 @@ function Write-CwaFailureDiagnostics {
     if ($fails.Count -gt 0) {
         Write-Log '  Windows Installer failures since the install started (Application log, MsiInstaller):' -Level ERROR
         foreach ($f in $fails) { Write-Log ('    ' + $f) -Level ERROR }
+        $hint = Get-MsiFailureHint -Messages $fails
+        if ($hint) { Write-Log ('  Cause: ' + $hint) -Level ERROR }
     } else {
         Write-Log ('  Windows Installer logged ' + $events.Count + ' event(s) since the install started, none a failure.')
     }
