@@ -115,6 +115,9 @@
     Specify exit code(s): 0,3010
     Log: C:\Logs\CompoSecure\CitrixWorkspace_<timestamp>.log
     CWA's own install logs: <Program Files>\Citrix\Logs\CTXWorkspaceInstallLogs-*
+    (or a SYSTEM temp folder). On a failed install the script also logs the
+    exit code's meaning, MsiInstaller failures from the Application event log,
+    and whether NetworkProvider\Order ProviderOrder exists (CTX697148).
     Exit: 0 = done / 3010 = done, reboot needed /
           2 = deferred or needs a human (session open, .NET 8 still needed) /
           1 = failed
@@ -389,11 +392,83 @@ function Get-InstallLogErrorLines {
     $out = @()
     foreach ($line in ($Text -split '\r?\n')) {
         $t = $line.Trim()
-        if ($t -match '(?i)(\bError \d{4}\b|Return value 3\b|Installation (failed|operation failed)|\bfailed with (error|exit) code\b|Product: .+ -- Error)') {
+        # CWAInstaller (2311+, CTX695461): InstallSuccess = False names the component.
+        if ($t -match '(?i)(\bError \d{4}\b|Return value 3\b|Installation (failed|operation failed)|\bfailed with (error|exit) code\b|Product: .+ -- Error|InstallSuccess = False|Exiting Application with error Code : [1-9])') {
             if ($t.Length -gt 300) { $t = $t.Substring(0, 300) }
             if ($out -notcontains $t) { $out += $t }
             if ($out.Count -ge $Max) { break }
         }
+    }
+    return $out
+}
+
+function Get-CwaExitCodeMeaning {
+    # Citrix CTX695019 for 4xxxx/5xxxx. 1xxxxx is not in that table; CWA
+    # 2603+ returned 101603 on CSPRLT-94 (2026-10-15 and 2026-10-26), which
+    # reads as 100000 + the MSI error of a component install.
+    param($ExitCode)
+    if ($null -eq $ExitCode -or ('' + $ExitCode) -eq '') { return '' }
+    $c = [int]$ExitCode
+    $msi = @{
+        1602 = 'user cancelled'
+        1603 = 'fatal error during installation'
+        1618 = 'another installation is already in progress'
+        1625 = 'blocked by system policy'
+        1638 = 'another version of this product is already installed'
+    }
+    $cwa = @{
+        40002 = 'a previous installation exists; uninstall it and retry'
+        40008 = 'a more recent version is available'
+        40026 = 'could not stop processes or drivers; reboot and retry'
+        40027 = 'a Citrix update is already in progress'
+        40028 = 'administrator rights required'
+        40032 = 'already up to date'
+        40034 = 'a component MSI install failed'
+        40035 = 'a component MSI uninstall failed'
+        40037 = 'partial success: mandatory components installed'
+        50001 = 'a client exists that only an administrator can modify'
+        50002 = 'upgrade path is unsupported'
+    }
+    if ($cwa.ContainsKey($c)) { return ('CWA ' + $c + ': ' + $cwa[$c]) }
+    if ($msi.ContainsKey($c)) { return ('MSI ' + $c + ': ' + $msi[$c]) }
+    if ($c -ge 100000 -and $c -le 199999) {
+        $inner = $c - 100000
+        $m = 'not in Citrix''s exit-code table; likely MSI error ' + $inner + ' from a component install'
+        if ($msi.ContainsKey($inner)) { $m += ' (' + $msi[$inner] + ')' }
+        return $m
+    }
+    return ''
+}
+
+function Get-CwaLogRoots {
+    # Folders CWA's installer may log to when run as SYSTEM. Windows 11's
+    # GetTempPath2 gives SYSTEM C:\Windows\SystemTemp rather than %TEMP%.
+    param([string]$ProgramFilesX86, [string]$ProgramW6432, [string]$ProgramFiles, [string]$Temp, [string]$WinDir)
+    $r = @()
+    foreach ($pf in @($ProgramFilesX86, $ProgramW6432, $ProgramFiles)) { if ($pf) { $r += ($pf + '\Citrix\Logs') } }
+    if ($Temp) { $r += $Temp }
+    if ($WinDir) {
+        $r += @(($WinDir + '\Temp'), ($WinDir + '\SystemTemp'), ($WinDir + '\System32\config\systemprofile\AppData\Local\Temp'))
+    }
+    $out = @()
+    foreach ($p in $r) { if ($out -notcontains $p.TrimEnd('\')) { $out += $p.TrimEnd('\') } }
+    return $out
+}
+
+function Select-MsiFailureMessages {
+    # MsiInstaller event messages that report a failure, de-duplicated, at most $Max.
+    param([string[]]$Messages, [int]$Max)
+    $out = @()
+    foreach ($m in $Messages) {
+        if (-not $m) { continue }
+        $t = ($m -replace '\s+', ' ').Trim()
+        $fail = ($t -match '(?i)error status: (\d+)' -and $Matches[1] -ne '0') -or
+                ($t -match '(?i)Installation (operation )?failed') -or
+                ($t -match '(?i) -- Error \d+')
+        if (-not $fail) { continue }
+        if ($t.Length -gt 300) { $t = $t.Substring(0, 300) }
+        if ($out -notcontains $t) { $out += $t }
+        if ($out.Count -ge $Max) { break }
     }
     return $out
 }
@@ -603,29 +678,40 @@ function Install-DotNet10Desktop {
 }
 
 function Write-CwaInstallLogHint {
-    # CWA logs to <Program Files>\Citrix\Logs, but a run under SYSTEM that
-    # fails early logs to the SYSTEM temp folder instead (CSPRLT-94, exit
-    # 101603: nothing under Program Files). Prefer folders from this run.
+    # CWA logs to <Program Files>\Citrix\Logs, but a run under SYSTEM can log
+    # to a SYSTEM temp folder instead. CSPRLT-94 (exit 101603) twice left no
+    # log folder from the run in Program Files, %TEMP% or C:\Windows\Temp, so
+    # loose installer logs written since the install started count too.
     param([bool]$Failed, [datetime]$Since)
-    $bases = @()
-    foreach ($b in @(${env:ProgramFiles(x86)}, $env:ProgramFiles)) { if ($b) { $bases += ($b + '\Citrix\Logs') } }
-    $bases += @($env:TEMP, ($env:WINDIR + '\Temp')) | Where-Object { $_ }
+    $bases = @(Get-CwaLogRoots -ProgramFilesX86 ${env:ProgramFiles(x86)} -ProgramW6432 $env:ProgramW6432 -ProgramFiles $env:ProgramFiles -Temp $env:TEMP -WinDir $env:WINDIR)
+    $cutoff = $Since.AddMinutes(-1)
     $all = @()
-    foreach ($b in ($bases | Select-Object -Unique)) {
+    $loose = @()
+    foreach ($b in $bases) {
         foreach ($f in @('CTXWorkspaceInstallLogs*', 'CTXReceiverInstallLogs*')) {
             $all += @(Get-ChildItem -LiteralPath $b -Directory -Filter $f -ErrorAction SilentlyContinue)
         }
+        foreach ($f in @('CWAInstaller*.log', 'TrolleyExpress*.log', 'CtxInstall-*.log')) {
+            $loose += @(Get-ChildItem -LiteralPath $b -File -Filter $f -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $cutoff })
+        }
     }
     $latest = $all | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    if (-not $latest) {
-        Write-Log ('  No CTXWorkspaceInstallLogs / CTXReceiverInstallLogs folder in ' + (($bases | Select-Object -Unique) -join ', ') + '.')
-        return
+    $fromThisRun = ($latest -and $latest.LastWriteTime -ge $cutoff)
+    if ($latest) {
+        Write-Log ('  Citrix install logs: ' + $latest.FullName + '  (' + $latest.LastWriteTime + ')' + $(if ($fromThisRun) { '' } else { '  -- older than this run' }))
     }
-    $fromThisRun = ($latest.LastWriteTime -ge $Since.AddMinutes(-1))
-    Write-Log ('  Citrix install logs: ' + $latest.FullName + '  (' + $latest.LastWriteTime + ')' + $(if ($fromThisRun) { '' } else { '  -- older than this run' }))
-    if (-not $Failed -or -not $fromThisRun) { return }
+    $logs = @()
+    if ($fromThisRun) {
+        $logs = @(Get-ChildItem -LiteralPath $latest.FullName -Recurse -File -Filter '*.log' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime)
+    } elseif ($loose.Count -gt 0) {
+        $logs = @($loose | Sort-Object LastWriteTime)
+        foreach ($d in @($logs | ForEach-Object { $_.DirectoryName } | Select-Object -Unique)) { Write-Log ('  Citrix installer logs from this run in: ' + $d) }
+    } else {
+        Write-Log ('  No Citrix installer log from this run in: ' + ($bases -join ', ') + '.')
+    }
+    if (-not $Failed -or $logs.Count -eq 0) { return }
     $shown = 0
-    foreach ($log in @(Get-ChildItem -LiteralPath $latest.FullName -Recurse -File -Filter '*.log' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime)) {
+    foreach ($log in $logs) {
         $lines = @(Get-InstallLogErrorLines -Text (Get-Content -LiteralPath $log.FullName -Raw -ErrorAction SilentlyContinue) -Max 5)
         if ($lines.Count -eq 0) { continue }
         Write-Log ('  ' + $log.Name + ':') -Level ERROR
@@ -634,6 +720,28 @@ function Write-CwaInstallLogHint {
         if ($shown -ge 20) { break }
     }
     if ($shown -eq 0) { Write-Log '  No error lines found in those logs.' }
+}
+
+function Write-CwaFailureDiagnostics {
+    # Evidence that does not depend on where CWA put its own logs.
+    param([datetime]$Since)
+    $events = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'MsiInstaller'; StartTime = $Since.AddMinutes(-1) } -ErrorAction SilentlyContinue | Sort-Object TimeCreated)
+    $fails = @(Select-MsiFailureMessages -Messages @($events | ForEach-Object { $_.Message }) -Max 10)
+    if ($fails.Count -gt 0) {
+        Write-Log '  Windows Installer failures since the install started (Application log, MsiInstaller):' -Level ERROR
+        foreach ($f in $fails) { Write-Log ('    ' + $f) -Level ERROR }
+    } else {
+        Write-Log ('  Windows Installer logged ' + $events.Count + ' event(s) since the install started, none a failure.')
+    }
+    # CTX697148: CWA 2607's SSON custom action fails with 1603 when this is missing.
+    $po = $null
+    try { $po = (Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\NetworkProvider\Order' -Name ProviderOrder -ErrorAction Stop).ProviderOrder } catch { }
+    if (-not $po) {
+        Write-Log '  HKLM\SYSTEM\CurrentControlSet\Control\NetworkProvider\Order ProviderOrder is missing or empty.' -Level ERROR
+        Write-Log '  CWA single sign-on setup fails with 1603 without it (Citrix CTX697148); default value: RDPNP,LanmanWorkstation,webclient' -Level ERROR
+    } else {
+        Write-Log ('  NetworkProvider\Order ProviderOrder: ' + $po)
+    }
 }
 
 $Failed = $false
@@ -802,6 +910,8 @@ if ($needInstall -and -not $Failed) {
             'REBOOT' { $Reboot = $true; Write-Log '  Reboot required to finish.' }
             'FAIL'   {
                 $Failed = $true
+                $meaning = Get-CwaExitCodeMeaning -ExitCode $code
+                if ($meaning) { Write-Log ('  Exit code meaning: ' + $meaning) -Level ERROR }
                 Write-Log '  Install failed. Reboot and retry first (an uninstall just before can leave' -Level ERROR
                 Write-Log '  files pending deletion), then -ForceInstall. If a 32-bit CWA is being' -Level ERROR
                 Write-Log '  replaced by 64-bit, also consider -SkipThirdPartyVCCheck.' -Level ERROR
@@ -809,6 +919,7 @@ if ($needInstall -and -not $Failed) {
             default  { throw 'Unknown install outcome' }
         }
         Write-CwaInstallLogHint -Failed $Failed -Since $installStart
+        if ($Failed) { Write-CwaFailureDiagnostics -Since $installStart }
     }
 
     # ---- 6. Verify ---------------------------------------------------------
