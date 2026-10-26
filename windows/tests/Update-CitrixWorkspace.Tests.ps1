@@ -270,7 +270,7 @@ $vcEvents = @(
 )
 $vcFails = @(Select-MsiFailureMessages -Messages $vcEvents -Max 10)
 Assert-Eq $vcFails.Count '2' 'CSPRLT-94: both VC++ failure events kept'
-Assert-Eq (Get-MsiFailureHint -Messages $vcFails) 'The installed Microsoft Visual C++ 2022 X86 Minimum Runtime - 14.42.34433 cannot be upgraded: Windows Installer''s cached copy of the old version is missing (MSI 1714 / 1612). Remove that broken registration, then retry.' 'CSPRLT-94: VC++ 1714/1612 named'
+Assert-Eq (Get-MsiFailureHint -Messages $vcFails) 'The installed Microsoft Visual C++ 2022 X86 Minimum Runtime - 14.42.34433 cannot be upgraded: Windows Installer''s cached copy of the old version is missing (MSI 1714 / 1612). Run Update-VCRedist.ps1 to clear it and install the latest runtime, then retry.' 'CSPRLT-94: VC++ 1714/1612 named'
 Assert-Eq (Get-MsiFailureHint -Messages $msiEvents) '' 'other failures: no VC++ hint'
 
 if ($failed -gt 0) { Write-Host "$failed test(s) failed"; exit 1 }
