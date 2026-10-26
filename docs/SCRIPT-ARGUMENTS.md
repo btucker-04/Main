@@ -162,6 +162,27 @@ Dependency files: the CWA installer(s) (required), plus optionally the .NET 10 x
 | `-RemoveDotNet8` | switch | off | When nothing still needs .NET 8, run the staged `Remove-DotNetEolChannel.ps1 -DotNet8 -RemoveStaleFolders` (also removes the swidtag and Package Cache leftovers Tenable reads). Blocked (exit 2) on a CWA below 26.7, without .NET 10 x86, or when a .NET 8 app is found; skipped after a failed upgrade. |
 | `-DryRun` | switch | off | Report what would happen without changing anything (passes `-DryRun` to the remover too). |
 
+## Update-VCRedist.ps1
+Updates the Microsoft Visual C++ 2015-2022 (v14) runtimes to Microsoft's **latest**, and clears the broken Windows Installer registrations that block that upgrade.
+
+On CSPRLT-94 (2026-10-26), "Microsoft Visual C++ 2022 X86 Minimum Runtime - 14.42.34433" had lost its cached `.msi`. Every upgrade, repair or uninstall failed with MSI 1714 / System Error 1612, so Citrix Workspace's prerequisite step exited 101603. Run this script first, then `Update-CitrixWorkspace.ps1`.
+
+How it works:
+- **Broken registrations:** a VC++ runtime MSI whose `LocalPackage` is missing, or a v14 bundle whose `BundleCachePath` is missing. Every key involved is exported to `C:\Logs\CompoSecure\VCRedist_backup_<timestamp>\` before anything is deleted (undo with `reg import`). Only Windows Installer's records are removed; the runtime DLLs stay, so apps keep working.
+- **Target:** `vc_redist.<arch>.exe` staged beside the script or in `C:\`, else downloaded from `https://aka.ms/vs/17/release/vc_redist.<arch>.exe`. There is no pinned version; the target is that file's own version. The file must have an MZ header and a Valid Authenticode signature from `O=Microsoft Corporation`.
+- **Install:** for each architecture below the target, or whose registration was cleared.
+- **Verify:** by re-reading Add/Remove Programs and the registrations. `vcruntime140.dll` versions are logged.
+- **Unsupported 2005-2013 runtimes** are listed, and removed only with `-RemoveUnsupported`.
+
+Exit `0` = current, `3010` = reboot needed, `2` = dry run with work / another install in progress / unsupported removal failed, `1` = no verified installer, or an install or cleanup failed.
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `-SkipBrokenCleanup` | switch | off | Report broken registrations but leave them. The upgrade of that architecture will then fail with 1714 / 1612. |
+| `-InstallMissing` | switch | off | Also install the v14 runtime for architectures that have none (x86 and x64; plus arm64 on ARM64 Windows). |
+| `-RemoveUnsupported` | switch | off | Uninstall Visual C++ 2005, 2008, 2010, 2012 and 2013 runtimes. Apps built against them stop working; use only where Tenable flags them and nothing needs them. A cache-less one has its registration cleared instead (its DLLs stay). |
+| `-DryRun` | switch | off | Report what would be cleared, installed or removed; change nothing. |
+
 ## Remove-CitrixWorkspaceLegacy.ps1
 Removes old Citrix Workspace app / Citrix Receiver copies that `Update-CitrixWorkspace.ps1` can't see: per-user installs and leftover files. Use it when Tenable reports an old Citrix Workspace version (for example plugin 207238, CTX691485) but the Update script logs `Citrix Workspace : not installed (machine-wide)`. That was the case on CSPRLT-94 on 2026-10-15.
 
