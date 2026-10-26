@@ -263,6 +263,16 @@ Assert-Eq ($mf[2] -match 'error status: 1603') 'True' 'non-zero status kept'
 Assert-Eq (@(Select-MsiFailureMessages -Messages $msiEvents -Max 1).Count) '1' 'msi max respected'
 Assert-Eq (@(Select-MsiFailureMessages -Messages @() -Max 5).Count) '0' 'no events'
 
+# CSPRLT-94 2026-10-26: verbatim MsiInstaller events behind exit 101603.
+$vcEvents = @(
+    "Windows Installer installed the product. Product Name: Microsoft Visual C++ 2022 X86 Minimum Runtime - `r`n14.42.34433. Product Version: 14.42.34433. Product Language: 1033. Manufacturer: Microsoft Corporation. `r`nInstallation success or error status: 1603.",
+    "Product: Microsoft Visual C++ 2022 X86 Minimum Runtime - 14.42.34433 -- Error 1714. The older version of `r`nMicrosoft Visual C++ 2022 X86 Minimum Runtime - 14.42.34433 cannot be removed.  Contact your technical `r`nsupport group.  System Error 1612."
+)
+$vcFails = @(Select-MsiFailureMessages -Messages $vcEvents -Max 10)
+Assert-Eq $vcFails.Count '2' 'CSPRLT-94: both VC++ failure events kept'
+Assert-Eq (Get-MsiFailureHint -Messages $vcFails) 'The installed Microsoft Visual C++ 2022 X86 Minimum Runtime - 14.42.34433 cannot be upgraded: Windows Installer''s cached copy of the old version is missing (MSI 1714 / 1612). Remove that broken registration, then retry.' 'CSPRLT-94: VC++ 1714/1612 named'
+Assert-Eq (Get-MsiFailureHint -Messages $msiEvents) '' 'other failures: no VC++ hint'
+
 if ($failed -gt 0) { Write-Host "$failed test(s) failed"; exit 1 }
 Write-Host 'All tests passed'
 exit 0
