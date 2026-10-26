@@ -480,7 +480,7 @@ function Get-MsiFailureHint {
     param([string[]]$Messages)
     foreach ($m in $Messages) {
         if ($m -match '(?i)Product: (.+?) -- Error 1714\..*System Error 1612') {
-            return ('The installed ' + $Matches[1] + ' cannot be upgraded: Windows Installer''s cached copy of the old version is missing (MSI 1714 / 1612). Remove that broken registration, then retry.')
+            return ('The installed ' + $Matches[1] + ' cannot be upgraded: Windows Installer''s cached copy of the old version is missing (MSI 1714 / 1612). Run Update-VCRedist.ps1 to clear it and install the latest runtime, then retry.')
         }
     }
     return ''
