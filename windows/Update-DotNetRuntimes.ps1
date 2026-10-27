@@ -14,6 +14,18 @@
          and re-verifies. Exits 1 if the machine does not end in a
          strictly better state than it started.
 
+    v3.9 (2026-10-27): -RemoveRetiredMajor. Phase 4, after Phase 3 has
+    verified the run, removes an EOL or near-EOL major (8 and 9 map to 10)
+    once its successor is on disk for every flavor/arch that had it. The
+    uninstall is Remove-DotNetEolChannel.ps1 -DotNet<N> -RemoveStaleFolders,
+    staged beside this script. It refuses (exit 2) when:
+      * an app's runtimeconfig.json targets that major without rollForward
+        Major/LatestMajor (Program Files, ProgramData, inetpub, user
+        AppData and .dotnet\tools are scanned);
+      * an SDK or hosting bundle of that major is installed;
+      * the run failed, or an install needs a reboot first.
+    Implies -InstallSuccessorMajor.
+
     v3.8 (from the CSPC-072 run, 2026-10-12): -InstallSuccessorMajor did
     nothing on a .NET 8-only host 29 days before .NET 8's end of support.
     Phase 1a only considered majors in $EolMajors (9), and $EolSuccessorMajor
@@ -345,7 +357,10 @@
                             removed, a host needing a reboot first), and showing
                             those as failed in EC is the correct signal.
       Run As              : System (MSI install/uninstall requires it)
-    -DryRun to preview. Exit: 0 ok / 3010 reboot recommended / 1 failure.
+    -DryRun to preview. Exit: 0 ok / 3010 reboot recommended / 1 failure /
+    2 updates done but -RemoveRetiredMajor refused (a human decides).
+    -RemoveRetiredMajor: also stage Remove-DotNetEolChannel.ps1 as a
+    Dependency File.
 
     CSPRLT-94 (2026-09-16): 'dotnet --list-runtimes' failed outright with
     "the required library hostfxr.dll could not be found in
@@ -402,8 +417,18 @@ param(
     # does not need a second EC deployment round. Removing the EOL channel
     # once nothing depends on it is still Remove-DotNetEolChannel.ps1, a
     # separate human decision.
-    [switch]$InstallSuccessorMajor
+    [switch]$InstallSuccessorMajor,
+    # v3.9: after the successor is verified on disk, remove the retiring major
+    # (EOL or near-EOL, e.g. 8 -> 10) by running Remove-DotNetEolChannel.ps1
+    # -DotNet<N> -RemoveStaleFolders, which must be staged beside this script.
+    # Implies -InstallSuccessorMajor. Refuses (exit 2) when an app's
+    # runtimeconfig.json targets that major without rolling forward, when an
+    # SDK or hosting bundle of that major is installed, or when the run is
+    # not otherwise clean. That script's own foreign-WiX-holder check also
+    # still applies.
+    [switch]$RemoveRetiredMajor
 )
+if ($RemoveRetiredMajor) { $InstallSuccessorMajor = [switch]$true }
 
 $ErrorActionPreference = 'Stop'
 $LogDir  = 'C:\Logs\CompoSecure'
@@ -443,6 +468,58 @@ function Get-SuccessorTargets {
         if ($Map.ContainsKey([int]$m)) { $out += [pscustomobject]@{ From = [int]$m; To = $Map[[int]$m] } }
     }
     return $out
+}
+
+function Test-RuntimeConfigNeedsMajor {
+    # Does the app behind this <app>.runtimeconfig.json stop starting when
+    # .NET $Major is removed? Framework-dependent apps bind to their major and
+    # only cross to a later one with rollForward Major / LatestMajor (or the
+    # legacy rollForwardOnNoCandidateFx = 2). Self-contained apps list
+    # includedFrameworks and carry their own runtime. Unparseable text that
+    # names the major counts as a dependency: a guess must not delete it.
+    param([string]$Json, [int]$Major)
+    if ([string]::IsNullOrWhiteSpace($Json)) { return $false }
+    try { $cfg = $Json | ConvertFrom-Json -ErrorAction Stop } catch {
+        return ($Json -match ('"version"\s*:\s*"' + $Major + '\.'))
+    }
+    $ro = $cfg.runtimeOptions
+    if ($null -eq $ro) { return $false }
+    if ($ro.includedFrameworks) { return $false }
+    $rf = '' + $ro.rollForward
+    if ($rf -match '^(?i)(Major|LatestMajor)$') { return $false }
+    if (('' + $ro.rollForwardOnNoCandidateFx) -eq '2') { return $false }
+    $fws = @()
+    if ($ro.framework) { $fws += $ro.framework }
+    if ($ro.frameworks) { $fws += @($ro.frameworks) }
+    foreach ($fw in $fws) {
+        if (('' + $fw.version) -match ('^' + $Major + '\.')) { return $true }
+    }
+    return $false
+}
+
+function Get-RetireDecision {
+    # -RemoveRetiredMajor go/no-go for one retiring major. Removal only when
+    # the run is otherwise clean and every flavor/arch that had the major now
+    # has its successor on disk. Returns Remove (bool) and Reasons (why not).
+    param(
+        [int]$Major, [int]$Successor,
+        [string[]]$KeysWithMajor, [hashtable]$After,
+        [int]$AppPinCount, [string[]]$Sdks, [string[]]$HostingBundles,
+        [bool]$RunFailed, [bool]$RebootPending, [bool]$RemoverFound
+    )
+    $reasons = @()
+    if ($Major -lt 5 -or $Major -gt 9) { $reasons += ('Remove-DotNetEolChannel.ps1 has no -DotNet' + $Major + ' switch') }
+    if ($RunFailed) { $reasons += 'an earlier step of this run failed' }
+    if ($RebootPending) { $reasons += 'an install this run needs a reboot first' }
+    if (-not $RemoverFound) { $reasons += 'Remove-DotNetEolChannel.ps1 is not staged beside this script or in C:\' }
+    foreach ($k in $KeysWithMajor) {
+        $has = @($After[$k] | Where-Object { $_.Major -eq $Successor })
+        if ($has.Count -eq 0) { $reasons += ($k + ' has no .NET ' + $Successor + ' on disk') }
+    }
+    if ($AppPinCount -gt 0) { $reasons += ('' + $AppPinCount + ' app(s) on disk target .NET ' + $Major + ' without rolling forward') }
+    foreach ($s in $Sdks) { $reasons += ('SDK installed: ' + $s + ' (developer machine; remove by hand with the owner)') }
+    foreach ($h in $HostingBundles) { $reasons += ('Hosting bundle installed: ' + $h + ' (IIS apps)') }
+    return [pscustomobject]@{ Remove = ($reasons.Count -eq 0); Reasons = $reasons }
 }
 
 function Test-HostFxrLoadFailure {
@@ -991,8 +1068,44 @@ function Invoke-ArpEntryRemoval {
     }
 }
 
+function Find-RuntimeConfigPins {
+    # <app>.runtimeconfig.json files whose app needs .NET $Major (see
+    # Test-RuntimeConfigNeedsMajor). The dotnet roots are skipped: the SDK's
+    # own tools there go with the SDK.
+    param([int]$Major)
+    $roots = @('C:\Program Files', 'C:\Program Files (x86)', 'C:\ProgramData', 'C:\inetpub')
+    foreach ($u in @(Get-ChildItem 'C:\Users' -Directory -ErrorAction SilentlyContinue)) {
+        foreach ($sub in @('AppData\Local', 'AppData\Roaming', '.dotnet\tools')) {
+            $p = $u.FullName + '\' + $sub
+            if (Test-Path -LiteralPath $p) { $roots += $p }
+        }
+    }
+    $skip = '(?i)^C:\\Program Files( \(x86\))?\\dotnet\\|^C:\\ProgramData\\Package Cache\\'
+    $hits = @()
+    foreach ($r in $roots) {
+        if (-not (Test-Path -LiteralPath $r)) { continue }
+        foreach ($f in @(Get-ChildItem -LiteralPath $r -Filter '*.runtimeconfig.json' -Recurse -Depth 8 -File -ErrorAction SilentlyContinue)) {
+            if ($f.FullName -match $skip) { continue }
+            $text = Get-Content -LiteralPath $f.FullName -Raw -ErrorAction SilentlyContinue
+            if (Test-RuntimeConfigNeedsMajor -Json $text -Major $Major) { $hits += $f.FullName }
+        }
+    }
+    return $hits
+}
+
+function Find-RemoverScript {
+    foreach ($d in @($PSScriptRoot, 'C:\')) {
+        if (-not $d) { continue }
+        $p = $d.TrimEnd('\') + '\Remove-DotNetEolChannel.ps1'
+        if (Test-Path -LiteralPath $p) { return $p }
+    }
+    return $null
+}
+
 $Reboot = $false
 $Failed = $false
+$NeedsHuman = $false
+$RetiredRemoved = @()
 $UninstallNoOp = $false
 # (arch|flavor, major) pairs successfully installed by Phase 1a, so Phase 3
 # can verify they are still on disk at the end of the run (v3.6).
@@ -1028,7 +1141,7 @@ $script:MuxerBroken      = $false
 $script:MuxerBrokenRoots = @()
 
 Write-Log '=============================================='
-Write-Log ' .NET Runtime Update (v3.6) -- 302122/307353/314679/320854/326863/+.NETCore-family'
+Write-Log ' .NET Runtime Update (v3.9) -- 302122/307353/314679/320854/326863/+.NETCore-family'
 Write-Log (' Host   : ' + $env:COMPUTERNAME)
 # Echo EVERY switch, so a log proves which arguments actually arrived. Endpoint
 # Central has a history in this environment of altering argument strings, and a
@@ -1039,7 +1152,8 @@ Write-Log ('   -RemoveStaleFolders          : ' + $RemoveStaleFolders)
 Write-Log ('   -AbortOnPendingReboot        : ' + $AbortOnPendingReboot)
 Write-Log ('   -RemoveSupersededSdks        : ' + $RemoveSupersededSdks)
 Write-Log ('   -RemoveOrphanedRegistrations : ' + $RemoveOrphanedRegistrations)
-Write-Log ('   -InstallSuccessorMajor       : ' + $InstallSuccessorMajor)
+Write-Log ('   -InstallSuccessorMajor       : ' + $InstallSuccessorMajor + $(if ($RemoveRetiredMajor) { '  (implied by -RemoveRetiredMajor)' } else { '' }))
+Write-Log ('   -RemoveRetiredMajor          : ' + $RemoveRetiredMajor)
 if ($MyInvocation.Line) {
     Write-Log (' Invoked as: ' + $MyInvocation.Line.Trim())
 }
@@ -1773,6 +1887,86 @@ if (-not $DryRun) {
 }
 
 # ------------------------------------------------------------------
+# Phase 4: remove the retiring major once its successor is verified
+# (opt-in, -RemoveRetiredMajor). Runs only after Phase 3 so the successor
+# check reads the end-of-run disk, and delegates the uninstall itself to
+# Remove-DotNetEolChannel.ps1 (bundle-first teardown, SWID/host files,
+# foreign WiX holder refusal) rather than duplicating it here.
+# ------------------------------------------------------------------
+Write-Log ''
+Write-Log '=== Phase 4: remove the retired major after its successor (opt-in) ==='
+$retireTargets = @(Get-SuccessorTargets -EolSeen $EolSeen -EolSoonSeen $EolSoonSeen -Map $EolSuccessorMajor)
+if (-not $RemoveRetiredMajor) {
+    if ($retireTargets.Count -gt 0) { Write-Log '  Not removing anything (pass -RemoveRetiredMajor).' }
+    else { Write-Log '  No EOL or near-EOL major with a successor -- nothing to do.' }
+} elseif ($retireTargets.Count -eq 0) {
+    Write-Log '  No EOL or near-EOL major with a successor -- nothing to remove.'
+} else {
+    $remover = Find-RemoverScript
+    $diskEnd = $(if ($DryRun) { $before } else { Get-InstalledMap $roots })
+    $allSdks = @(Get-DotNetSdks)
+    $allHosting = @(Get-HostingBundles)
+    foreach ($rt in $retireTargets) {
+        $m = $rt.From
+        Write-Log ('  .NET ' + $m + ' -> .NET ' + $rt.To)
+        $keysWithMajor = @($before.Keys | Where-Object { @($before[$_] | Where-Object { $_.Major -eq $m }).Count -gt 0 } | Sort-Object)
+        Write-Log ('    Scanning for apps that need .NET ' + $m + ' (*.runtimeconfig.json)...')
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $pins = @(Find-RuntimeConfigPins -Major $m)
+        Write-Log ('    ' + $pins.Count + ' found in ' + [int]$sw.Elapsed.TotalSeconds + 's.')
+        foreach ($p in ($pins | Select-Object -First 25)) { Write-Log ('      needs .NET ' + $m + ': ' + $p) -Level WARN }
+        if ($pins.Count -gt 25) { Write-Log ('      ... and ' + ($pins.Count - 25) + ' more') -Level WARN }
+        $sdkM = @($allSdks | Where-Object { $_ -match ('^Microsoft \.NET SDK ' + $m + '\.') })
+        $hbM = @($allHosting | Where-Object { $_.Major -eq $m } | ForEach-Object { $_.Name })
+        $decision = Get-RetireDecision -Major $m -Successor $rt.To -KeysWithMajor $keysWithMajor -After $diskEnd `
+            -AppPinCount $pins.Count -Sdks $sdkM -HostingBundles $hbM `
+            -RunFailed ([bool]$Failed) -RebootPending ([bool]$Reboot) -RemoverFound ([bool]$remover)
+        if ($DryRun) {
+            $notYet = @($decision.Reasons | Where-Object { $_ -notmatch ' on disk$' })
+            if ($notYet.Count -eq 0) { Write-Log ('    [DRYRUN] Would remove .NET ' + $m + ' once .NET ' + $rt.To + ' is verified for: ' + ($keysWithMajor -join ', ')) }
+            else { foreach ($r in $notYet) { Write-Log ('    [DRYRUN] Would NOT remove: ' + $r) -Level WARN } }
+            continue
+        }
+        if (-not $decision.Remove) {
+            Write-Log ('    NOT removing .NET ' + $m + ':') -Level WARN
+            foreach ($r in $decision.Reasons) { Write-Log ('      - ' + $r) -Level WARN }
+            if ($pins.Count -gt 0) {
+                Write-Log ('    Those apps fail to start without .NET ' + $m + '. Retarget them (or set') -Level WARN
+                Write-Log '    "rollForward": "LatestMajor") with the owner, then re-run.' -Level WARN
+            }
+            $NeedsHuman = $true
+            continue
+        }
+        $psExe = (Get-Process -Id $PID).Path
+        Write-Log ('    .NET ' + $rt.To + ' verified for every flavor/arch that had .NET ' + $m + '; nothing found that needs ' + $m + '.')
+        Write-Log ('    Running: ' + $remover + ' -DotNet' + $m + ' -RemoveStaleFolders')
+        & $psExe -NoProfile -ExecutionPolicy Bypass -File $remover ('-DotNet' + $m) -RemoveStaleFolders
+        $rc = $LASTEXITCODE
+        Write-Log ('    Remove-DotNetEolChannel exit: ' + $rc)
+        $endMap = Get-InstalledMap $roots
+        $leftOld = @($endMap.Keys | Where-Object { @($endMap[$_] | Where-Object { $_.Major -eq $m }).Count -gt 0 })
+        $lostNew = @($keysWithMajor | Where-Object { @($endMap[$_] | Where-Object { $_.Major -eq $rt.To }).Count -eq 0 })
+        if ($lostNew.Count -gt 0) {
+            Write-Log ('    FAILED: .NET ' + $rt.To + ' is missing afterwards for ' + ($lostNew -join ', ')) -Level ERROR
+            $Failed = $true
+        }
+        switch ($rc) {
+            0       { }
+            3010    { $Reboot = $true }
+            2       { $NeedsHuman = $true }
+            default { $Failed = $true }
+        }
+        if ($leftOld.Count -eq 0 -and ($rc -eq 0 -or $rc -eq 3010)) {
+            Write-Log ('    .NET ' + $m + ' removed; .NET ' + $rt.To + ' in place.')
+            $RetiredRemoved += $m
+        } elseif ($leftOld.Count -gt 0) {
+            Write-Log ('    .NET ' + $m + ' still on disk for ' + ($leftOld -join ', ') + ' -- see that script' + [char]39 + 's log (RemoveDotNetEol_' + $m + '_*.log).') -Level WARN
+            if ($rc -eq 0) { $Failed = $true }
+        }
+    }
+}
+
+# ------------------------------------------------------------------
 Write-Log ''
 Write-Log '=== Final runtime inventory ==='
 foreach ($root in $roots) {
@@ -1793,9 +1987,15 @@ if ($Failed) {
     Write-Log '=============================================='
     exit 1
 }
+if ($NeedsHuman) {
+    Write-Log 'Updates done, but -RemoveRetiredMajor needs a human decision (see Phase 4).' -Level WARN
+    Write-Log '=============================================='
+    exit 2
+}
 Write-Log 'All present flavors advanced. Re-run a Nessus scan to confirm.'
-if ($EolSeen.Count -gt 0) {
-    Write-Log ('REMINDER: EOL channel(s) still installed on this host: .NET ' + (($EolSeen | Sort-Object) -join ', .NET ')) -Level WARN
+$eolLeft = @($EolSeen | Where-Object { $RetiredRemoved -notcontains $_ })
+if ($eolLeft.Count -gt 0) {
+    Write-Log ('REMINDER: EOL channel(s) still installed on this host: .NET ' + (($eolLeft | Sort-Object) -join ', .NET ')) -Level WARN
     Write-Log 'Patched to final build, but SEoL findings persist until removal/migration.' -Level WARN
     Write-Log 'To remove: Remove-DotNetEolChannel.ps1 with -DotNet5 / -DotNet6 / -DotNet7 / -DotNet8 / -DotNet9' -Level WARN
     Write-Log '(one or more in the same run). No switch defaults to major 6. Pair with -RemoveStaleFolders.' -Level WARN

@@ -157,6 +157,54 @@ Assert-Eq $t.Count 0 'major with no mapping yields nothing'
 $t = @(Get-SuccessorTargets -EolSeen @(8) -EolSoonSeen @(8) -Map $map)
 Assert-Eq $t.Count 1 'duplicate major targeted once'
 
+# --- -RemoveRetiredMajor: which apps need .NET 8 --------------------------------
+$fd8 = '{ "runtimeOptions": { "tfm": "net8.0", "framework": { "name": "Microsoft.NETCore.App", "version": "8.0.0" } } }'
+Assert-True (Test-RuntimeConfigNeedsMajor -Json $fd8 -Major 8) 'framework-dependent net8.0 app needs 8'
+Assert-True (-not (Test-RuntimeConfigNeedsMajor -Json $fd8 -Major 9)) 'net8.0 app does not need 9'
+$lm = '{ "runtimeOptions": { "tfm": "net8.0", "rollForward": "LatestMajor", "framework": { "name": "Microsoft.NETCore.App", "version": "8.0.0" } } }'
+Assert-True (-not (Test-RuntimeConfigNeedsMajor -Json $lm -Major 8)) 'rollForward LatestMajor moves to 10'
+$mj = '{ "runtimeOptions": { "rollForward": "Major", "framework": { "name": "Microsoft.NETCore.App", "version": "8.0.0" } } }'
+Assert-True (-not (Test-RuntimeConfigNeedsMajor -Json $mj -Major 8)) 'rollForward Major moves to 10'
+$mn = '{ "runtimeOptions": { "rollForward": "Minor", "framework": { "name": "Microsoft.NETCore.App", "version": "8.0.0" } } }'
+Assert-True (Test-RuntimeConfigNeedsMajor -Json $mn -Major 8) 'rollForward Minor stays on 8'
+$legacy = '{ "runtimeOptions": { "rollForwardOnNoCandidateFx": 2, "framework": { "name": "Microsoft.NETCore.App", "version": "8.0.0" } } }'
+Assert-True (-not (Test-RuntimeConfigNeedsMajor -Json $legacy -Major 8)) 'legacy rollForwardOnNoCandidateFx 2 crosses majors'
+$multi = '{ "runtimeOptions": { "tfm": "net8.0-windows", "frameworks": [ { "name": "Microsoft.NETCore.App", "version": "8.0.0" }, { "name": "Microsoft.WindowsDesktop.App", "version": "8.0.0" } ] } }'
+Assert-True (Test-RuntimeConfigNeedsMajor -Json $multi -Major 8) 'WinForms/WPF frameworks array needs 8'
+$sc = '{ "runtimeOptions": { "tfm": "net8.0", "includedFrameworks": [ { "name": "Microsoft.NETCore.App", "version": "8.0.11" } ] } }'
+Assert-True (-not (Test-RuntimeConfigNeedsMajor -Json $sc -Major 8)) 'self-contained app carries its own runtime'
+Assert-True (Test-RuntimeConfigNeedsMajor -Json '{ // comment
+  "runtimeOptions": { "framework": { "version": "8.0.0" } } }' -Major 8) 'unparseable file naming 8.x counts as a dependency'
+Assert-True (-not (Test-RuntimeConfigNeedsMajor -Json '' -Major 8)) 'empty file is not a dependency'
+Assert-True (-not (Test-RuntimeConfigNeedsMajor -Json '{ "runtimeOptions": { "framework": { "version": "18.0.0" } } }' -Major 8)) '18.x is not 8.x'
+
+# --- -RemoveRetiredMajor: go/no-go ------------------------------------------------
+$after = @{
+    'x64|Microsoft.NETCore.App'        = @([version]'8.0.21', [version]'10.0.11')
+    'x64|Microsoft.WindowsDesktop.App' = @([version]'8.0.21', [version]'10.0.11')
+    'x86|Microsoft.NETCore.App'        = @([version]'8.0.21')
+}
+$ok = { param($keys, $pins, $sdks, $hb, $failedRun, $reboot, $found)
+    Get-RetireDecision -Major 8 -Successor 10 -KeysWithMajor $keys -After $after -AppPinCount $pins -Sdks $sdks -HostingBundles $hb -RunFailed $failedRun -RebootPending $reboot -RemoverFound $found }
+$d = & $ok @('x64|Microsoft.NETCore.App', 'x64|Microsoft.WindowsDesktop.App') 0 @() @() $false $false $true
+Assert-True $d.Remove 'successor on every flavor/arch, nothing pinned -> remove'
+$d = & $ok @('x64|Microsoft.NETCore.App', 'x86|Microsoft.NETCore.App') 0 @() @() $false $false $true
+Assert-Eq ('' + $d.Remove + '|' + ($d.Reasons -join ';')) 'False|x86|Microsoft.NETCore.App has no .NET 10 on disk' 'x86 without 10 blocks removal'
+$d = & $ok @('x64|Microsoft.NETCore.App') 2 @() @() $false $false $true
+Assert-Eq ($d.Reasons -join ';') '2 app(s) on disk target .NET 8 without rolling forward' 'pinned apps block removal'
+$d = & $ok @('x64|Microsoft.NETCore.App') 0 @('Microsoft .NET SDK 8.0.421 (x64)') @() $false $false $true
+Assert-True (-not $d.Remove) 'SDK 8 blocks removal'
+$d = & $ok @('x64|Microsoft.NETCore.App') 0 @() @('Microsoft .NET 8.0.21 - Windows Server Hosting') $false $false $true
+Assert-True (-not $d.Remove) 'hosting bundle 8 blocks removal'
+$d = & $ok @('x64|Microsoft.NETCore.App') 0 @() @() $true $false $true
+Assert-Eq ($d.Reasons -join ';') 'an earlier step of this run failed' 'failed run blocks removal'
+$d = & $ok @('x64|Microsoft.NETCore.App') 0 @() @() $false $true $true
+Assert-Eq ($d.Reasons -join ';') 'an install this run needs a reboot first' 'pending reboot blocks removal'
+$d = & $ok @('x64|Microsoft.NETCore.App') 0 @() @() $false $false $false
+Assert-True (($d.Reasons -join ';') -match 'not staged') 'missing Remove-DotNetEolChannel.ps1 blocks removal'
+$d = Get-RetireDecision -Major 10 -Successor 12 -KeysWithMajor @() -After @{} -AppPinCount 0 -Sdks @() -HostingBundles @() -RunFailed $false -RebootPending $false -RemoverFound $true
+Assert-True (-not $d.Remove) 'a major the remover has no switch for is refused'
+
 if ($failed -gt 0) {
     Write-Host "`n$failed test(s) failed"
     exit 1
