@@ -17,6 +17,7 @@ Each entry gives the rule, then the evidence: the host or PR where it bit us. Se
   - The WinGet bundle held 1.29.290, the version already installed, so 315 "successful" provisions would have changed nothing (#15).
   - Check the inner manifest version, an `MZ` header on downloads, and `setup.exe`'s major (SQL 2019 and 2022 Express share a file name).
 - **Version eyeball trap:** 1.29.290 < 1.30.80. Compare with `[version]` or `sort -V`, never as strings or by eye.
+- **`sort -V` puts `12.0` below `12.0.0`.** When one side may have fewer fields (macOS `sw_vers` against a feed's `minimumSystemVersion`), compare field by field with missing fields as 0 (`version_ge` in `update-wireshark.sh`).
 
 ## Stale state inside one run
 
