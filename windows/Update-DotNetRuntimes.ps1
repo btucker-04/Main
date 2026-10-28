@@ -14,6 +14,15 @@
          and re-verifies. Exits 1 if the machine does not end in a
          strictly better state than it started.
 
+    v3.10 (CSLT-015, 2026-10-28): host\fxr was missing entirely and
+    dotnet.exe printed "The folder [...\host\fxr] does not exist" to stderr.
+    Windows PowerShell 5.1 turned that into a terminating error under
+    ErrorActionPreference Stop, so the run died at its first
+    'dotnet --list-runtimes'. The call now runs with the preference relaxed,
+    the missing folder is recognised as a broken host next to CSPRLT-94's
+    missing hostfxr.dll, the on-disk runtimes are logged, and the stop
+    message says to repair the newest one.
+
     v3.9 (2026-10-27): -RemoveRetiredMajor. Phase 4, after Phase 3 has
     verified the run, removes an EOL or near-EOL major (8 and 9 map to 10)
     once its successor is on disk for every flavor/arch that had it. The
@@ -522,21 +531,31 @@ function Get-RetireDecision {
     return [pscustomobject]@{ Remove = ($reasons.Count -eq 0); Reasons = $reasons }
 }
 
-function Test-HostFxrLoadFailure {
-    # CSPRLT-94 (2026-09-16): host\fxr\8.0.21 existed as a directory with no
-    # hostfxr.dll inside it. dotnet.exe resolves the HIGHEST host\fxr\<ver>
-    # folder and loads hostfxr.dll from it, so an empty/incomplete resolver
-    # folder is not skipped -- it breaks the muxer for EVERY installed major:
-    #   "Error: the required library hostfxr.dll could not be found in
-    #    [C:\Program Files\dotnet\host\fxr\8.0.21]"
+function Get-HostFxrFailure {
+    # '' when the muxer works, else which part of host\fxr is broken:
+    #   MissingDll    -- CSPRLT-94 (2026-09-16): host\fxr\8.0.21 existed with
+    #                    no hostfxr.dll in it. dotnet.exe resolves the HIGHEST
+    #                    host\fxr\<ver> folder and loads hostfxr.dll from it,
+    #                    so the muxer breaks for EVERY installed major:
+    #                    "the required library hostfxr.dll could not be found"
+    #   MissingFolder -- CSLT-015 (2026-10-28): host\fxr itself was gone:
+    #                    "The folder [C:\Program Files\dotnet\host\fxr] does
+    #                    not exist"
     # --list-runtimes then emits ONLY that error and matches no runtime lines,
     # which used to be indistinguishable from "no runtimes installed".
     param($Lines)
-    if (-not $Lines) { return $false }
+    if (-not $Lines) { return '' }
     foreach ($line in $Lines) {
-        if ([string]$line -match '(?i)required library hostfxr\.dll could not be found') { return $true }
+        $s = [string]$line
+        if ($s -match '(?i)required library hostfxr\.dll could not be found') { return 'MissingDll' }
+        if ($s -match '(?i)folder \[[^\]]*\\host\\fxr\] does not exist') { return 'MissingFolder' }
     }
-    return $false
+    return ''
+}
+
+function Test-HostFxrLoadFailure {
+    param($Lines)
+    return ((Get-HostFxrFailure -Lines $Lines) -ne '')
 }
 
 function Get-RuntimeVersionsFromDisk {
@@ -559,13 +578,29 @@ function Get-RuntimeVersionsFromDisk {
     return $out
 }
 
+function Invoke-DotNetListRuntimes {
+    # dotnet.exe writes host errors to stderr. Under ErrorActionPreference
+    # Stop, Windows PowerShell 5.1 turns a stderr line of a 2>&1 redirect into
+    # a terminating NativeCommandError, which ended the CSLT-015 run before
+    # the broken-host check could read it. Relaxed for this call only.
+    param([string]$Exe)
+    $saved = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = @(& $Exe --list-runtimes 2>&1 | ForEach-Object { '' + $_ })
+    } finally {
+        $ErrorActionPreference = $saved
+    }
+    return $out
+}
+
 function Get-InstalledMap {
     # Returns hashtable: '<arch>|<flavor>' -> list of [version] present on disk
     param($Roots)
     $map = @{}
     foreach ($root in $Roots) {
         if (-not (Test-Path $root.Exe)) { continue }
-        $lines = & $root.Exe --list-runtimes 2>&1
+        $lines = Invoke-DotNetListRuntimes -Exe $root.Exe
         $matched = 0
         foreach ($line in $lines) {
             if ($line -match '^(Microsoft\.(?:NETCore|WindowsDesktop|AspNetCore)\.App)\s+(\d+\.\d+\.\d+)') {
@@ -575,7 +610,9 @@ function Get-InstalledMap {
                 $matched++
             }
         }
-        if ($matched -eq 0 -and (Test-HostFxrLoadFailure -Lines $lines)) {
+        $failure = ''
+        if ($matched -eq 0) { $failure = Get-HostFxrFailure -Lines $lines }
+        if ($failure) {
             # Do NOT let a broken muxer masquerade as an empty root: every
             # later phase would read that as "nothing installed here" and
             # start installing/removing against bogus inventory.
@@ -583,12 +620,20 @@ function Get-InstalledMap {
             if ($script:MuxerBrokenRoots -notcontains $root.Arch) {
                 $script:MuxerBrokenRoots += $root.Arch
             }
-            Write-Log ('  ' + $root.Arch + ': dotnet.exe cannot load hostfxr.dll -- the host\fxr set is broken.') -Level ERROR
+            if ($script:MuxerFailures -notcontains $failure) { $script:MuxerFailures += $failure }
+            switch ($failure) {
+                'MissingDll'    { Write-Log ('  ' + $root.Arch + ': dotnet.exe cannot load hostfxr.dll -- the host\fxr set is broken.') -Level ERROR }
+                'MissingFolder' { Write-Log ('  ' + $root.Arch + ': dotnet.exe finds no host\fxr folder -- the .NET host resolver is missing.') -Level ERROR }
+                default         { throw ('Unknown host failure ' + $failure) }
+            }
             foreach ($line in $lines) {
-                if ([string]$line -match '(?i)hostfxr') { Write-Log ('    ' + ([string]$line).Trim()) -Level ERROR }
+                if ([string]$line -match '(?i)hostfxr|host\\fxr') { Write-Log ('    ' + ([string]$line).Trim()) -Level ERROR }
             }
             Write-Log '    Falling back to shared\ payload folders for inventory.' -Level WARN
-            foreach ($d in (Get-RuntimeVersionsFromDisk -Root (Split-Path -Parent $root.Exe))) {
+            $onDisk = @(Get-RuntimeVersionsFromDisk -Root (Split-Path -Parent $root.Exe))
+            if ($onDisk.Count -eq 0) { Write-Log '    No runtime folders under shared\ either.' -Level WARN }
+            foreach ($d in $onDisk) {
+                Write-Log ('    on disk: ' + $d.Flavor + ' ' + $d.Version) -Level WARN
                 $key = $root.Arch + '|' + $d.Flavor
                 if (-not $map.ContainsKey($key)) { $map[$key] = @() }
                 $map[$key] += $d.Version
@@ -1139,9 +1184,10 @@ if ($env:UPDATE_DOTNET_DOTSOURCE -eq '1') { return }
 # instead of the muxer and cannot be trusted for install decisions.
 $script:MuxerBroken      = $false
 $script:MuxerBrokenRoots = @()
+$script:MuxerFailures    = @()
 
 Write-Log '=============================================='
-Write-Log ' .NET Runtime Update (v3.9) -- 302122/307353/314679/320854/326863/+.NETCore-family'
+Write-Log ' .NET Runtime Update (v3.10) -- 302122/307353/314679/320854/326863/+.NETCore-family'
 Write-Log (' Host   : ' + $env:COMPUTERNAME)
 # Echo EVERY switch, so a log proves which arguments actually arrived. Endpoint
 # Central has a history in this environment of altering argument strings, and a
@@ -1203,19 +1249,33 @@ if ($script:MuxerBroken) {
     Write-Log '*** BROKEN .NET HOST -- STOPPING ***' -Level ERROR
     Write-Log ('*** Affected root(s): ' + ($script:MuxerBrokenRoots -join ', ')) -Level ERROR
     Write-Log '*** dotnet.exe resolves the HIGHEST host\fxr\<version> folder and loads' -Level ERROR
-    Write-Log '*** hostfxr.dll from it. That folder exists here but the DLL does not, so' -Level ERROR
+    if ($script:MuxerFailures -contains 'MissingFolder') {
+        Write-Log '*** hostfxr.dll from it. Here the host\fxr folder itself is gone, so' -Level ERROR
+    } else {
+        Write-Log '*** hostfxr.dll from it. That folder exists here but the DLL does not, so' -Level ERROR
+    }
     Write-Log '*** the muxer is broken for EVERY installed major -- not just that one.' -Level ERROR
-    Write-Log '*** Inventory above came from shared\ payload folders, not from the muxer,' -Level ERROR
-    Write-Log '*** so it is not safe to base install/removal decisions on it.' -Level ERROR
+    Write-Log '*** The on-disk list above came from shared\ payload folders, not from the' -Level ERROR
+    Write-Log '*** muxer, so it is not safe to base install/removal decisions on it.' -Level ERROR
     Write-Log '***' -Level ERROR
     Write-Log '*** Fix, in order:' -Level ERROR
     Write-Log '***   1. Reboot. A queued PendingFileRenameOperations entry replacing a' -Level ERROR
     Write-Log '***      locked hostfxr.dll only completes at boot; this often resolves it.' -Level ERROR
-    Write-Log '***   2. If it persists, reinstall the runtime for the version named above' -Level ERROR
-    Write-Log '***      (its installer restores host\fxr\<version>\hostfxr.dll).' -Level ERROR
+    if ($script:MuxerFailures -contains 'MissingFolder') {
+        Write-Log '***   2. If it persists, repair the NEWEST runtime in the on-disk list' -Level ERROR
+        Write-Log '***      (Apps > Installed apps > Microsoft .NET Runtime > Modify > Repair, or' -Level ERROR
+        Write-Log '***      its installer with /repair /quiet). That writes host\fxr\<version>.' -Level ERROR
+        Write-Log '***      If shared\ holds no runtimes at all, dotnet.exe is a leftover:' -Level ERROR
+        Write-Log '***      install any current .NET runtime, which brings its own host.' -Level ERROR
+    } else {
+        Write-Log '***   2. If it persists, reinstall the runtime for the version named above' -Level ERROR
+        Write-Log '***      (its installer restores host\fxr\<version>\hostfxr.dll).' -Level ERROR
+    }
     Write-Log '***   3. Re-run this script only after dotnet --list-runtimes works.' -Level ERROR
-    Write-Log '*** Do NOT delete the empty host\fxr folder as a workaround unless a HIGHER' -Level ERROR
-    Write-Log '*** version folder with a valid hostfxr.dll remains.' -Level ERROR
+    if ($script:MuxerFailures -contains 'MissingDll') {
+        Write-Log '*** Do NOT delete the empty host\fxr folder as a workaround unless a HIGHER' -Level ERROR
+        Write-Log '*** version folder with a valid hostfxr.dll remains.' -Level ERROR
+    }
     Write-Log '=============================================='
     exit 1
 }
@@ -1972,7 +2032,7 @@ Write-Log '=== Final runtime inventory ==='
 foreach ($root in $roots) {
     if (Test-Path $root.Exe) {
         Write-Log ('  [' + $root.Arch + ']')
-        & $root.Exe --list-runtimes 2>&1 | ForEach-Object { Write-Log ('    ' + $_) }
+        foreach ($line in (Invoke-DotNetListRuntimes -Exe $root.Exe)) { Write-Log ('    ' + $line) }
     }
 }
 Write-Log ''
