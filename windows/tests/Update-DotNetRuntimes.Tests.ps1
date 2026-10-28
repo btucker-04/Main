@@ -118,6 +118,49 @@ exit 1
     Remove-Item -LiteralPath $tmp2 -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+# --- CSLT-015 (2026-10-28): host\fxr folder missing entirely ----------------
+# Verbatim stderr. Windows PowerShell 5.1 turned it into a terminating
+# NativeCommandError under ErrorActionPreference Stop, so v3.9 died at
+# 'dotnet --list-runtimes' before the broken-host check ran.
+$cslt015 = @('A fatal error occurred. The folder [C:\Program Files\dotnet\host\fxr] does not exist')
+Assert-Eq (Get-HostFxrFailure -Lines $cslt015) 'MissingFolder' 'CSLT-015: missing host\fxr folder recognised'
+Assert-Eq (Get-HostFxrFailure -Lines $csprlt94) 'MissingDll' 'CSPRLT-94: missing hostfxr.dll recognised'
+Assert-Eq (Get-HostFxrFailure -Lines $healthy) '' 'healthy listing: no host failure'
+Assert-Eq (Get-HostFxrFailure -Lines @('The folder [C:\Program Files\dotnet\shared] does not exist')) '' 'other missing folder is not a host failure'
+Assert-True (Test-HostFxrLoadFailure -Lines $cslt015) 'CSLT-015 counts as a muxer failure'
+
+$tmp3 = Join-Path ([System.IO.Path]::GetTempPath()) ('dnfxr_' + [guid]::NewGuid().ToString('N'))
+try {
+    $rootDir = Join-Path $tmp3 'dotnet'
+    New-Item -ItemType Directory -Force -Path ($rootDir + '\shared\Microsoft.NETCore.App\8.0.21') | Out-Null
+    $fakeExe = Join-Path $rootDir 'dotnet.exe'
+    Set-Content -LiteralPath $fakeExe -Value @'
+#!/bin/sh
+printf '%s\n' 'A fatal error occurred. The folder [C:\Program Files\dotnet\host\fxr] does not exist' 1>&2
+exit 1
+'@
+    if ($IsLinux -or $IsMacOS) { & chmod +x $fakeExe }
+
+    $script:MuxerBroken = $false
+    $script:MuxerBrokenRoots = @()
+    $script:MuxerFailures = @()
+    # PowerShell 7 does not throw on native stderr; this preference makes it
+    # throw on the non-zero exit instead, standing in for 5.1's behaviour.
+    $PSNativeCommandUseErrorActionPreference = $true
+    $threw = ''
+    try { $map = Get-InstalledMap @(@{ Arch = 'x64'; Exe = $fakeExe }) } catch { $threw = $_.Exception.Message }
+    $PSNativeCommandUseErrorActionPreference = $false
+    Assert-Eq $threw '' 'CSLT-015: dotnet stderr under Stop does not end the run'
+    Assert-True $script:MuxerBroken 'CSLT-015: broken host flagged'
+    Assert-Eq ($script:MuxerFailures -join ',') 'MissingFolder' 'CSLT-015: failure kind recorded'
+    Assert-Eq ($map['x64|Microsoft.NETCore.App'] -join ',') '8.0.21' 'CSLT-015: inventory from disk'
+    $listed = @(Invoke-DotNetListRuntimes -Exe $fakeExe)
+    Assert-Eq $listed.Count 1 'final inventory listing returns the error as text'
+    Assert-True ($listed[0] -is [string]) 'listing lines are strings, not ErrorRecords'
+} finally {
+    Remove-Item -LiteralPath $tmp3 -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 # --- SDK DisplayName parsing (CSPC-004, 2026-10-06) --------------------------
 # The x86 SDK parsed as major 0 because the '(x86)' arch match overwrote
 # $matches, so Phase 1c fetched https://aka.ms/dotnet/0.0/dotnet-sdk-win-x86.exe.
