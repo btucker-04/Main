@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# update-nodejs-322793.sh  (v4)
+# update-nodejs-322793.sh  (v5)
 # Remediates : Node.js security updates. No pinned target version.
 #              Homebrew formulae are upgraded to the current formula.
 #              An official /usr/local pkg is raised to the latest stable
@@ -12,6 +12,15 @@
 #   A. Homebrew        -> <prefix>/Cellar/node*/<ver>            (csmb-010/-023/-033/-036)
 #   B. Official .pkg   -> /usr/local/bin/node                    (csmb-067)
 #   C. nvm / fnm / asdf-> per-user toolchains  (REPORTED, never modified)
+#
+# v5 (CSMB-011, 2026-10-27): ghcr.io reset every bottle download, then
+#   stopped resolving, and nodejs.org timed out. v4 waited 40 minutes in
+#   brew upgrade and ended "did not complete -- review the log". Each brew
+#   step now has a wall-clock limit (BREW_TIMEOUT) and its own log
+#   (nodejs_update_brew_<step>.log), a network failure is retried once, curl
+#   to nodejs.org has connect and total timeouts, and the RESULT line names
+#   a network failure and the hosts it could not reach. cleanup is skipped
+#   when the upgrade failed.
 #
 # v4 (CSMB-036, 2026-09-28): v3 still carried FIX_26=26.3.1, so a host on
 #   26.5.0 logged "OK >= 26.3.1" and skipped brew while Tenable wanted
@@ -51,7 +60,19 @@ set -uo pipefail
 HOME="${HOME:-/var/root}"
 export HOME
 
-LOG_DIR="/var/log/composecure"
+# =============================================================================
+# CONFIG -- Mosyle passes no environment variables. Edit here before paste,
+# or pass the same names from a terminal (BREW_TIMEOUT=900 ...).
+# Wall-clock limit in seconds for each brew step (update, upgrade, cleanup).
+CFG_BREW_TIMEOUT="1800"
+# Seconds to wait before retrying a brew step that failed on the network.
+CFG_RETRY_DELAY="60"
+# =============================================================================
+BREW_TIMEOUT="${BREW_TIMEOUT:-$CFG_BREW_TIMEOUT}"
+RETRY_DELAY="${RETRY_DELAY:-$CFG_RETRY_DELAY}"
+
+# BREW_PREFIXES and STANDALONE may be set for tests.
+LOG_DIR="${LOG_DIR:-/var/log/composecure}"
 LOG_FILE="$LOG_DIR/nodejs_update.log"
 WORK_DIR="/tmp/node_update_$$"
 NODE_DIST_INDEX="${NODE_DIST_INDEX:-https://nodejs.org/dist/index.json}"
@@ -133,6 +154,37 @@ sys.stdout.write(best[1])
 PY
 }
 
+# A failure caused by the network: DNS, refused, reset or timed-out
+# connections (CSMB-011 2026-10-27: ghcr.io reset, then stopped resolving).
+is_network_failure() {
+    grep -qiE 'Could not resolve host|Connection reset by peer|Failed to connect to|Operation timed out|Connection timed out|SSL connection timeout|Empty reply from server|SSL_ERROR_SYSCALL|unexpected disconnect|early EOF|curl: \((5|6|7|28|35|52|56)\)' "$1" 2>/dev/null
+}
+
+# curl exit codes for the same causes.
+curl_rc_is_network() {
+    case "$1" in 5|6|7|28|35|52|56) return 0 ;; esac
+    return 1
+}
+
+host_of_url() { echo "$1" | sed -n 's#^[A-Za-z]*://\([^/:]*\).*#\1#p'; }
+
+# Hosts a failed step's output names, space separated, in first-seen order.
+network_hosts() {
+    sed -n -e 's/.*Could not resolve host: \([A-Za-z0-9.-]*\).*/\1/p' \
+        -e 's/.*Failed to connect to \([A-Za-z0-9.-]*\).*/\1/p' \
+        -e 's#.*Download failed: [A-Za-z]*://\([A-Za-z0-9.-]*\).*#\1#p' "$1" 2>/dev/null \
+        | awk 'NF && !seen[$0]++' | tr '\n' ' ' | sed 's/ $//'
+}
+
+# PIDs below $1, children before their parents. A subshell, so the
+# recursion cannot clobber the caller's loop variable.
+descendants() (
+    for d_child in $(pgrep -P "$1" 2>/dev/null); do
+        descendants "$d_child"
+        echo "$d_child"
+    done
+)
+
 if [ "${NODE_SELFTEST:-0}" = "1" ]; then
     return 0 2>/dev/null || exit 0
 fi
@@ -142,6 +194,84 @@ version_ge() { [ "$(printf '%s\n' "$2" "$1" | sort -V | head -n1)" = "$2" ]; }
 
 node_major_of() { echo "$1" | cut -d. -f1; }
 
+NETWORK_FAIL=0
+NETWORK_HOSTS=""
+note_network() {
+    NETWORK_FAIL=1
+    for nn_h in $1; do
+        case " $NETWORK_HOSTS " in
+            *" $nn_h "*) ;;
+            *) NETWORK_HOSTS="${NETWORK_HOSTS:+$NETWORK_HOSTS }$nn_h" ;;
+        esac
+    done
+}
+
+# Run "$@" with a wall-clock limit ($1 seconds), output to $STEP_LOG.
+# Returns 124 on the limit, after stopping the whole process tree (killing
+# only sudo leaves brew's ruby and curl running).
+run_limited() {
+    rl_limit="$1"; shift
+    rl_start=$(date +%s)
+    "$@" >>"$STEP_LOG" 2>&1 </dev/null &
+    rl_pid=$!
+    while kill -0 "$rl_pid" 2>/dev/null; do
+        sleep 2
+        if [ $(( $(date +%s) - rl_start )) -ge "$rl_limit" ]; then
+            log "  TIME LIMIT (${rl_limit}s) reached -- stopping it."
+            rl_pids="$(descendants "$rl_pid") $rl_pid"
+            # shellcheck disable=SC2086
+            kill $rl_pids 2>/dev/null
+            sleep 5
+            rl_pids="$rl_pids $(descendants "$rl_pid")"
+            # shellcheck disable=SC2086
+            kill -9 $rl_pids 2>/dev/null
+            wait "$rl_pid" 2>/dev/null
+            return 124
+        fi
+    done
+    wait "$rl_pid"
+}
+
+# One brew command as the Homebrew user. $1 = step label, rest = brew args.
+# Output goes to $LOG_DIR/nodejs_update_brew_<label>.log and, filtered, to
+# the main log. A network failure is retried once after RETRY_DELAY, into
+# <label>_retry.log. $STEP_LOG names the last attempt's log afterwards.
+brew_step() {
+    bs_label="$1"; shift
+    STEP_LOG="$LOG_DIR/nodejs_update_brew_${bs_label}.log"
+    : > "$STEP_LOG"
+    log "  brew $* ..."
+    bs_try=1
+    while :; do
+        run_limited "$BREW_TIMEOUT" run_brew "$@"
+        bs_rc=$?
+        tr '\r' '\n' < "$STEP_LOG" | filter_brew_output | while IFS= read -r line; do
+            [ -n "$line" ] && log "  $line"
+        done
+        if [ "$bs_rc" -eq 0 ] || [ "$bs_rc" -eq 124 ] || [ "$bs_try" -ge 2 ] || ! is_network_failure "$STEP_LOG"; then
+            return "$bs_rc"
+        fi
+        log "  Network error -- retrying once in ${RETRY_DELAY}s."
+        sleep "$RETRY_DELAY"
+        bs_try=2
+        STEP_LOG="$LOG_DIR/nodejs_update_brew_${bs_label}_retry.log"
+        : > "$STEP_LOG"
+    done
+}
+
+# curl with limits; $1 = total seconds, rest = curl args. Network failures
+# are noted for the RESULT line.
+curl_limited() {
+    cl_max="$1"; shift
+    curl -fsSL --connect-timeout 20 --max-time "$cl_max" --retry 3 --retry-delay 5 "$@" 2>>"$LOG_FILE"
+    cl_rc=$?
+    if [ "$cl_rc" -ne 0 ]; then
+        log "  curl exit $cl_rc"
+        curl_rc_is_network "$cl_rc" && note_network "$(host_of_url "${!#}")"
+    fi
+    return "$cl_rc"
+}
+
 fetch_node_index() {
     if [ -n "$NODE_DIST_JSON" ] && [ -f "$NODE_DIST_JSON" ]; then
         return 0
@@ -149,7 +279,7 @@ fetch_node_index() {
     mkdir -p "$WORK_DIR"
     NODE_DIST_JSON="$WORK_DIR/node-index.json"
     log "  Fetching Node release index: $NODE_DIST_INDEX"
-    if ! curl -fL --retry 3 --retry-delay 5 -o "$NODE_DIST_JSON" "$NODE_DIST_INDEX" 2>>"$LOG_FILE"; then
+    if ! curl_limited 120 -o "$NODE_DIST_JSON" "$NODE_DIST_INDEX"; then
         log "  ERROR: could not download the Node release index."
         return 1
     fi
@@ -164,7 +294,7 @@ VULN_SEEN=0
 VULN_REMAINING=0
 UNMANAGED_NOTE=0
 
-log "===== update-nodejs-322793.sh (v4) START ====="
+log "===== update-nodejs-322793.sh (v5) START ====="
 log "Host: $(hostname)"
 log "No pinned target. Homebrew node* is upgraded; an official pkg goes to the latest stable release of its major."
 
@@ -172,7 +302,7 @@ log "No pinned target. Homebrew node* is upgraded; an official pkg goes to the l
 # 0a. Homebrew prefix (Apple Silicon vs Intel). Absence is normal.
 # -----------------------------------------------------------------------
 BREW_PREFIX=""
-for prefix in "/opt/homebrew" "/usr/local"; do
+for prefix in ${BREW_PREFIXES:-/opt/homebrew /usr/local}; do
     if [ -x "$prefix/bin/brew" ]; then
         BREW_PREFIX="$prefix"
         break
@@ -238,22 +368,24 @@ else
     done < <(find "$CELLAR" -mindepth 2 -maxdepth 2 -type d -path '*/node*' 2>/dev/null | sort)
 
     if [ -n "$BREW_USER" ]; then
-        log "  brew update..."
-        run_brew update 2>&1 | tr '\r' '\n' | filter_brew_output | while IFS= read -r line; do
-            [ -n "$line" ] && log "  $line"
-        done
+        if ! brew_step update update; then
+            log "  WARNING: brew update did not finish cleanly -- upgrading from the formulae it has."
+        fi
         for f in $NODE_FORMULAE; do
-            log "  brew upgrade $f ..."
-            if ! run_brew upgrade "$f" 2>&1 | tr '\r' '\n' | filter_brew_output | while IFS= read -r line; do
-                [ -n "$line" ] && log "  $line"
-            done; then
-                log "  ERROR: brew upgrade $f failed."
+            if brew_step "upgrade_$f" upgrade "$f"; then
+                brew_step "cleanup_$f" cleanup "$f" || log "  WARNING: brew cleanup $f failed -- $STEP_LOG"
+            else
+                bu_rc=$?
+                if [ "$bu_rc" -eq 124 ]; then
+                    log "  ERROR: brew upgrade $f hit its ${BREW_TIMEOUT}s limit -- $STEP_LOG"
+                else
+                    log "  ERROR: brew upgrade $f failed -- $STEP_LOG"
+                fi
+                if is_network_failure "$STEP_LOG"; then
+                    note_network "$(network_hosts "$STEP_LOG")"
+                fi
                 VULN_REMAINING=1
             fi
-            log "  brew cleanup $f ..."
-            run_brew cleanup "$f" 2>&1 | tr '\r' '\n' | filter_brew_output | while IFS= read -r line; do
-                [ -n "$line" ] && log "  $line"
-            done
         done
         VULN_SEEN=1
     else
@@ -290,7 +422,7 @@ fi
 log ""
 log "[B] Standalone Node.js (official .pkg)"
 
-STANDALONE="/usr/local/bin/node"
+STANDALONE="${STANDALONE:-/usr/local/bin/node}"
 if [ ! -e "$STANDALONE" ]; then
     log "  No $STANDALONE present."
 else
@@ -327,7 +459,7 @@ else
                         mkdir -p "$WORK_DIR"
                         DEST="$WORK_DIR/$PKG"
                         log "  Downloading $URL"
-                        if ! curl -fL --retry 3 --retry-delay 5 -o "$DEST" "$URL" 2>>"$LOG_FILE"; then
+                        if ! curl_limited 900 -o "$DEST" "$URL"; then
                             log "  ERROR: download failed. If Zscaler blocks nodejs.org, stage the pkg"
                             log "         locally and run: installer -pkg <path> -target /"
                             VULN_REMAINING=1
@@ -411,6 +543,14 @@ if [ -x "$STANDALONE" ]; then
 fi
 
 log ""
+if [ "$VULN_REMAINING" -eq 1 ] && [ "$NETWORK_FAIL" -eq 1 ]; then
+    log "RESULT: network failure -- could not reach ${NETWORK_HOSTS:-the download servers} (DNS, reset or timed-out connections)."
+    log "        The updates that failed above were not applied."
+    log "        Re-run when the Mac is online. If it repeats, check that Zscaler allows"
+    log "        ghcr.io, github.com and nodejs.org for this Mac."
+    log "===== END (incomplete) ====="
+    exit 1
+fi
 if [ "$VULN_REMAINING" -eq 1 ]; then
     log "RESULT: a Node.js update did not complete -- review the log above."
     log "===== END (incomplete) ====="
@@ -427,5 +567,5 @@ else
     log "RESULT: no Homebrew or official Node.js install needed an update."
 fi
 log "Re-run a Nessus scan to confirm the Node.js finding clears."
-log "===== update-nodejs-322793.sh (v4) END ====="
+log "===== update-nodejs-322793.sh (v5) END ====="
 exit 0
