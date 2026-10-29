@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Remediation: Microsoft .NET Core security updates (v3.12)
+    Remediation: Microsoft .NET Core security updates (v3.13)
     Nessus Plugin IDs : 302122, 307353 (+ 314679, 320854, 326863 -- same fix)
 
 .DESCRIPTION
@@ -13,6 +13,15 @@
          cleanup removed it (or anything else went sideways), reinstalls
          and re-verifies. Exits 1 if the machine does not end in a
          strictly better state than it started.
+
+    v3.13 (SHRBME-08, 2026-10-29): every download failed with Could not
+    establish trust relationship for the SSL/TLS secure channel, and the
+    run spent five minutes retrying seven installers 3 times each. All
+    downloads now go through Save-Installer. A TLS trust or handshake
+    failure is not retried; it logs the likely cause (Zscaler root CA
+    missing from LocalMachine\Root, system clock, out-of-date root store),
+    and every later download in the run is skipped. Phase 1a no longer says
+    the successor is present when all of its installs failed.
 
     v3.12 (CSLT-023, 2026-10-29): -RepairBrokenHost. CSLT-023 had no
     host\fxr folder, with .NET 6.0.21-6.0.32 and Windows Desktop 5.0.17
@@ -477,6 +486,8 @@ $LogFile = $LogDir + '\DotNetUpdate_' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '
 $TempDir = ($env:TEMP) + '\dotnet_update'
 if (-not (Test-Path $LogDir))  { New-Item -ItemType Directory -Path $LogDir  -Force -ErrorAction SilentlyContinue | Out-Null }
 if (-not (Test-Path $TempDir)) { New-Item -ItemType Directory -Path $TempDir -Force -ErrorAction SilentlyContinue | Out-Null }
+# Set by Save-Installer on the first TLS failure; every later download skips.
+$script:TlsFailure = ''
 
 function Write-Log {
     param([string]$Msg, [string]$Level = 'INFO')
@@ -721,6 +732,72 @@ function Get-InstalledMap {
     return $map
 }
 
+function Get-DownloadFailureKind {
+    # TLS failures come from this machine's certificate store or TLS setup,
+    # so retrying the same request cannot succeed. '' = retryable.
+    param([string]$Message)
+    if ($Message -match '(?i)trust relationship|remote certificate is invalid|UntrustedRoot|PartialChain|certificate chain') { return 'TlsTrust' }
+    if ($Message -match '(?i)Could not create SSL/TLS secure channel|SSL connection could not be established') { return 'TlsChannel' }
+    return ''
+}
+
+function Write-TlsFailureHelp {
+    param([string]$Kind, [string]$Url)
+    Write-Log '    *** TLS FAILURE -- no download can succeed on this machine as it is. ***' -Level ERROR
+    if ($Kind -eq 'TlsTrust') {
+        Write-Log '    The server certificate chain is not trusted by this machine. With' -Level ERROR
+        Write-Log '    Zscaler SSL inspection the chain ends at the Zscaler root CA, which' -Level ERROR
+        Write-Log '    must be in LocalMachine\Root (the SYSTEM account does not use the' -Level ERROR
+        Write-Log '    user store). Other causes: a wrong system clock, or an out-of-date' -Level ERROR
+        Write-Log '    root store (pending Windows Update reboot).' -Level ERROR
+        $z = @(Get-ChildItem 'Cert:\LocalMachine\Root' -ErrorAction SilentlyContinue | Where-Object { $_.Subject -match '(?i)zscaler' })
+        if ($z.Count -gt 0) {
+            foreach ($c in $z) { Write-Log ('    Zscaler root present: ' + $c.Subject + ' (expires ' + $c.NotAfter.ToString('yyyy-MM-dd') + ')') -Level ERROR }
+        } else {
+            Write-Log '    No Zscaler root CA in LocalMachine\Root.' -Level ERROR
+        }
+    } else {
+        Write-Log '    The TLS handshake itself failed: TLS 1.2 disabled in SCHANNEL, or a' -Level ERROR
+        Write-Log '    proxy/firewall resetting the connection.' -Level ERROR
+    }
+    Write-Log ('    System clock (UTC): ' + (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss')) -Level ERROR
+    Write-Log ('    Test as SYSTEM: Invoke-WebRequest ' + $Url + ' -UseBasicParsing -Method Head') -Level ERROR
+    Write-Log '    Skipping every remaining download this run.' -Level ERROR
+}
+
+function Save-Installer {
+    # Downloads with retries. Returns $true when $Dest was written.
+    param([string]$Url, [string]$Dest, [int]$TimeoutSec = 300, [int]$Attempts = 3)
+    if ($script:TlsFailure) {
+        Write-Log ('    Skipped -- an earlier download failed TLS (' + $script:TlsFailure + ').') -Level ERROR
+        return $false
+    }
+    foreach ($attempt in 1..$Attempts) {
+        try {
+            Invoke-WebRequest -Uri $Url -OutFile $Dest -UseBasicParsing -TimeoutSec $TimeoutSec
+            return $true
+        } catch {
+            $msgs = @()
+            $ex = $_.Exception
+            while ($ex) { $msgs += $ex.Message; $ex = $ex.InnerException }
+            $msg = $msgs -join ' | '
+            Remove-Item $Dest -Force -ErrorAction SilentlyContinue
+            $kind = Get-DownloadFailureKind -Message $msg
+            if ($kind) {
+                Write-Log ('    Download failed: ' + $msg) -Level ERROR
+                $script:TlsFailure = $kind
+                Write-TlsFailureHelp -Kind $kind -Url $Url
+                return $false
+            }
+            Write-Log ('    Download attempt ' + $attempt + ' of ' + $Attempts + ' failed: ' + $msg) -Level WARN
+            if ($attempt -lt $Attempts) { Start-Sleep -Seconds 10 }
+        }
+    }
+    Write-Log ('    Download failed after ' + $Attempts + ' attempts. If Zscaler is throttling large') -Level ERROR
+    Write-Log '    transfers, stage the installer locally and run it manually.' -Level ERROR
+    return $false
+}
+
 function Install-Runtime {
     # Downloads + installs one flavor/major/arch. Returns $true on success.
     # -Mode repair reruns the same bundle with /repair (-RepairBrokenHost).
@@ -737,23 +814,7 @@ function Install-Runtime {
     if ($DryRun) { Write-Log '    [DRYRUN] Would download + install.'; return $true }
     # v2.6: retry with an explicit timeout -- a single 5-minute stall used to
     # abandon the whole flavour (CSPC-004, 10.0 x86).
-    $downloaded = $false
-    foreach ($attempt in 1..3) {
-        try {
-            Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing -TimeoutSec 300
-            $downloaded = $true
-            break
-        } catch {
-            Write-Log ('    Download attempt ' + $attempt + ' of 3 failed: ' + $_) -Level WARN
-            Remove-Item $dest -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 10
-        }
-    }
-    if (-not $downloaded) {
-        Write-Log '    Download failed after 3 attempts. If Zscaler is throttling large' -Level ERROR
-        Write-Log '    transfers, stage the installer locally and run it manually.' -Level ERROR
-        return $false
-    }
+    if (-not (Save-Installer -Url $url -Dest $dest)) { return $false }
     $item = Get-Item $dest
     $szMB = [math]::Round($item.Length / 1MB, 1)
     # Sanity: must be a Windows executable (MZ header) and non-trivial size.
@@ -810,23 +871,7 @@ function Install-Sdk {
     $dest = Join-Path $TempDir ('dotnet-sdk-win-' + $Arch + '-' + $Major + '.exe')
     Write-Log ('  [SDK ' + $Major + '.0 ' + $Arch + '] ' + $url)
     if ($DryRun) { Write-Log '    [DRYRUN] Would download + install.'; return $true }
-    $downloaded = $false
-    foreach ($attempt in 1..3) {
-        try {
-            Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing -TimeoutSec 300
-            $downloaded = $true
-            break
-        } catch {
-            Write-Log ('    Download attempt ' + $attempt + ' of 3 failed: ' + $_) -Level WARN
-            Remove-Item $dest -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 10
-        }
-    }
-    if (-not $downloaded) {
-        Write-Log '    Download failed after 3 attempts. If Zscaler is throttling large' -Level ERROR
-        Write-Log '    transfers, stage the installer locally and run it manually.' -Level ERROR
-        return $false
-    }
+    if (-not (Save-Installer -Url $url -Dest $dest)) { return $false }
     $item = Get-Item $dest
     $szMB = [math]::Round($item.Length / 1MB, 1)
     $fs = [System.IO.File]::OpenRead($dest)
@@ -1014,8 +1059,7 @@ function Install-HostingBundle {
     $dest = Join-Path $TempDir ('dotnet-hosting-' + $Major + '-win.exe')
     Write-Log ('  [Hosting Bundle ' + $Major + '.0] ' + $url)
     if ($DryRun) { Write-Log '    [DRYRUN] Would download + install.'; return $true }
-    try { Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing }
-    catch { Write-Log ('    Download failed: ' + $_) -Level ERROR; return $false }
+    if (-not (Save-Installer -Url $url -Dest $dest)) { return $false }
     $item = Get-Item $dest
     $fs = [System.IO.File]::OpenRead($dest)
     $b1 = $fs.ReadByte(); $b2 = $fs.ReadByte()
@@ -1302,7 +1346,7 @@ $script:MuxerBrokenRoots = @()
 $script:MuxerFailures    = @()
 
 Write-Log '=============================================='
-Write-Log ' .NET Runtime Update (v3.12) -- 302122/307353/314679/320854/326863/+.NETCore-family'
+Write-Log ' .NET Runtime Update (v3.13) -- 302122/307353/314679/320854/326863/+.NETCore-family'
 Write-Log (' Host   : ' + $env:COMPUTERNAME)
 # Echo EVERY switch, so a log proves which arguments actually arrived. Endpoint
 # Central has a history in this environment of altering argument strings, and a
@@ -1601,6 +1645,10 @@ if ($retiring.Count -eq 0) {
             } else {
                 $Failed = $true
             }
+        }
+        if (-not ($SuccessorInstalled | Where-Object { $_.Major -eq $successor })) {
+            Write-Log ('  .NET ' + $successor + ' was NOT staged -- every install above failed.') -Level ERROR
+            continue
         }
         Write-Log ('  .NET ' + $successor + ' is now present alongside .NET ' + $eolMajor + '. Apps still') -Level WARN
         Write-Log ('  targeting net' + $eolMajor + '.0 are UNAFFECTED and keep running on .NET ' + $eolMajor + ' --') -Level WARN
@@ -2182,6 +2230,9 @@ if ($UninstallNoOp) {
     Write-Log 'AT LEAST ONE UNINSTALL WAS A NO-OP (exit 0, entry survived).' -Level ERROR
     Write-Log 'This host cannot progress by re-running the script. Resolve the holding' -Level ERROR
     Write-Log 'product named in the dependency diagnostics first.' -Level ERROR
+}
+if ($script:TlsFailure) {
+    Write-Log ('NOTHING WAS DOWNLOADED: TLS failure (' + $script:TlsFailure + '). Fix the certificate/TLS cause in the Phase 1 log, then re-run.') -Level ERROR
 }
 if ($Failed) {
     Write-Log 'One or more steps FAILED (install, SDK removal or verification). See the ERROR lines above.' -Level ERROR
