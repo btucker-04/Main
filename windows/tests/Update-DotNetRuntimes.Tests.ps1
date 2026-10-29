@@ -281,6 +281,81 @@ Assert-True (Test-ArpVersionOnDisk -DiskMap $disk174 -Prefix 'Microsoft Windows 
 Assert-True (Test-ArpVersionOnDisk -DiskMap $disk174 -Prefix 'Microsoft Unknown Runtime' -Arch 'x64' -Version ([version]'9.0.16')) `
     'unrecognised flavor is treated as on disk, never hard-removed'
 
+# --- CSLT-023 (2026-10-29): -RepairBrokenHost plan ----------------------------
+# host\fxr missing; shared\ held NETCore 6.0.21-6.0.32 and WindowsDesktop 5.0.17.
+$cslt023 = @(
+    [pscustomobject]@{ Flavor = 'Microsoft.NETCore.App'; Version = [version]'6.0.21' },
+    [pscustomobject]@{ Flavor = 'Microsoft.NETCore.App'; Version = [version]'6.0.32' },
+    [pscustomobject]@{ Flavor = 'Microsoft.WindowsDesktop.App'; Version = [version]'5.0.17' }
+)
+$plan = Get-HostRepairPlan -OnDisk $cslt023 -PendingRenames @() -Arch 'x64' -FallbackMajor 10
+Assert-Eq ('' + $plan.Action + '|' + $plan.Major) 'Install|6' 'CSLT-023: repair installs the newest major on disk (6)'
+$plan = Get-HostRepairPlan -OnDisk @([pscustomobject]@{ Flavor = 'Microsoft.WindowsDesktop.App'; Version = [version]'5.0.17' }) -PendingRenames @() -Arch 'x64' -FallbackMajor 10
+Assert-Eq ('' + $plan.Action + '|' + $plan.Major) 'Install|5' 'a Windows Desktop-only major is repaired through its own major'
+$plan = Get-HostRepairPlan -OnDisk @() -PendingRenames @() -Arch 'x64' -FallbackMajor 10
+Assert-Eq ('' + $plan.Action + '|' + $plan.Major) 'Install|10' 'empty shared\ installs the current major'
+$queued = @('\??\C:\Program Files\dotnet\host\fxr\6.0.32\hostfxr.dll', '', '\??\C:\Windows\Temp\x.tmp', '')
+$plan = Get-HostRepairPlan -OnDisk $cslt023 -PendingRenames $queued -Arch 'x64' -FallbackMajor 10
+Assert-Eq $plan.Action 'Reboot' 'a queued host\fxr rename means reboot, not reinstall'
+$plan = Get-HostRepairPlan -OnDisk $cslt023 -PendingRenames $queued -Arch 'x86' -FallbackMajor 10
+Assert-Eq $plan.Action 'Install' 'an x64 host\fxr rename does not block an x86 repair'
+$x86q = @('\??\C:\Program Files (x86)\dotnet\host\fxr\8.0.21\hostfxr.dll', '')
+$plan = Get-HostRepairPlan -OnDisk $cslt023 -PendingRenames $x86q -Arch 'x86' -FallbackMajor 10
+Assert-Eq $plan.Action 'Reboot' 'an x86 host\fxr rename blocks the x86 repair'
+$plan = Get-HostRepairPlan -OnDisk $cslt023 -PendingRenames @('\??\C:\Windows\Temp\x.tmp', '') -Arch 'x64' -FallbackMajor 10
+Assert-Eq $plan.Action 'Install' 'unrelated pending renames do not block the repair'
+
+# Repair loop against a fake host: Install-Runtime is mocked, and the fake
+# dotnet.exe starts listing runtimes once the mock drops a marker file.
+$tmp4 = Join-Path ([System.IO.Path]::GetTempPath()) ('dnrep_' + [guid]::NewGuid().ToString('N'))
+try {
+    $rootDir = Join-Path $tmp4 'dotnet'
+    New-Item -ItemType Directory -Force -Path ($rootDir + '\shared\Microsoft.NETCore.App\6.0.32') | Out-Null
+    New-Item -ItemType Directory -Force -Path ($rootDir + '\shared\Microsoft.WindowsDesktop.App\5.0.17') | Out-Null
+    $marker = Join-Path $tmp4 'fixed'
+    $fakeExe = Join-Path $rootDir 'dotnet.exe'
+    Set-Content -LiteralPath $fakeExe -Value (@'
+#!/bin/sh
+if [ -f 'MARKER' ]; then
+  printf '%s\n' 'Microsoft.NETCore.App 6.0.36 [C:\Program Files\dotnet\shared\Microsoft.NETCore.App]'
+  exit 0
+fi
+printf '%s\n' 'A fatal error occurred. The folder [C:\Program Files\dotnet\host\fxr] does not exist' 1>&2
+exit 1
+'@).Replace('MARKER', $marker)
+    if ($IsLinux -or $IsMacOS) { & chmod +x $fakeExe }
+    $fakeRoots = @(@{ Arch = 'x64'; Exe = $fakeExe })
+
+    $script:installCalls = @()
+    $script:fixOn = 'install'
+    function Install-Runtime {
+        param([string]$Flavor, [string]$Major, [string]$Arch, [string]$Mode = 'install')
+        $script:installCalls += ($Mode + ':' + $Flavor + ':' + $Major + ':' + $Arch)
+        if ($Mode -eq $script:fixOn) { New-Item -ItemType File -Force -Path $marker | Out-Null }
+        return $true
+    }
+
+    Repair-BrokenHostRoots -Roots $fakeRoots -PendingRenames @() -FallbackMajor 10
+    Assert-Eq ($script:installCalls -join ',') 'install:Microsoft.NETCore.App:6:x64' 'CSLT-023: one install of .NET 6 restores the host'
+    Assert-True (Test-DotNetHostWorks -Exe $fakeExe) 'host works after the install'
+
+    Remove-Item -LiteralPath $marker -Force
+    $script:installCalls = @()
+    $script:fixOn = 'repair'
+    Repair-BrokenHostRoots -Roots $fakeRoots -PendingRenames @() -FallbackMajor 10
+    Assert-Eq ($script:installCalls -join ',') 'install:Microsoft.NETCore.App:6:x64,repair:Microsoft.NETCore.App:6:x64' `
+        'install that leaves the host broken is followed by /repair'
+    Assert-True (Test-DotNetHostWorks -Exe $fakeExe) 'host works after the repair'
+
+    Remove-Item -LiteralPath $marker -Force
+    $script:installCalls = @()
+    Repair-BrokenHostRoots -Roots $fakeRoots -PendingRenames @('\??\C:\Program Files\dotnet\host\fxr\6.0.32\hostfxr.dll', '') -FallbackMajor 10
+    Assert-Eq $script:installCalls.Count 0 'queued host\fxr rename: nothing installed'
+    Assert-True (-not (Test-DotNetHostWorks -Exe $fakeExe)) 'queued host\fxr rename: host left for the reboot'
+} finally {
+    Remove-Item -LiteralPath $tmp4 -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 if ($failed -gt 0) {
     Write-Host "`n$failed test(s) failed"
     exit 1
