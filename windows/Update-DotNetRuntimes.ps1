@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Remediation: Microsoft .NET Core security updates (v3.8)
+    Remediation: Microsoft .NET Core security updates (v3.11)
     Nessus Plugin IDs : 302122, 307353 (+ 314679, 320854, 326863 -- same fix)
 
 .DESCRIPTION
@@ -13,6 +13,20 @@
          cleanup removed it (or anything else went sideways), reinstalls
          and re-verifies. Exits 1 if the machine does not end in a
          strictly better state than it started.
+
+    v3.11 (CSLT-174, 2026-10-29):
+      * Phase 1c called Invoke-Msi, which only existed in
+        Remove-DotNetEolChannel.ps1, so removing a superseded MSI-registered
+        SDK threw and failed the run. The helper is now defined here, and the
+        Phase 2 MSI uninstall uses it as well (full msiexec path, busy retry).
+      * Phase 2 kept older registrations whose uninstall exited 0 but left
+        the entry (9.0.16 and 8.0.27 on CSLT-174). Their files were already
+        gone; only the registration was left. With
+        -RemoveOrphanedRegistrations, an older entry whose exact version has
+        no files on disk and no live dependency holder is now stripped from
+        the registry, as Phase 1d already does for whole majors.
+      * The closing error now says a step failed instead of blaming the
+        runtime flavors, which on CSLT-174 had all passed verification.
 
     v3.10 (CSLT-015, 2026-10-28): host\fxr was missing entirely and
     dotnet.exe printed "The folder [...\host\fxr] does not exist" to stderr.
@@ -971,6 +985,42 @@ function Get-FlavorKeyForArpPrefix {
     return $null
 }
 
+# Is this exact ARP version present on disk for its flavor/arch? An
+# unrecognised flavor counts as present so it is never hard-removed.
+function Test-ArpVersionOnDisk {
+    param($DiskMap, [string]$Prefix, [string]$Arch, [version]$Version)
+    $flavorKey = Get-FlavorKeyForArpPrefix -Prefix $Prefix
+    if (-not $flavorKey) { return $true }
+    $diskKey = $Arch + '|' + $flavorKey
+    if (-not $DiskMap.ContainsKey($diskKey)) { return $false }
+    return [bool]($DiskMap[$diskKey] | Where-Object { $_ -eq $Version })
+}
+
+function Invoke-Msi {
+    # Full path + -NoNewWindow: a bare 'msiexec.exe' goes through ShellExecute
+    # under EC SYSTEM and fails. 1618/1601 = installer busy, retry.
+    param([string]$Arguments, [int]$Retries = 4)
+    $msiexec = 'msiexec.exe'
+    if ($env:SystemRoot) {
+        $full = Join-Path $env:SystemRoot 'System32\msiexec.exe'
+        if (Test-Path $full) { $msiexec = $full }
+    }
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        $p = Start-Process -FilePath $msiexec -ArgumentList $Arguments -Wait -PassThru -NoNewWindow
+        $code = $p.ExitCode
+        if ($code -ne 1618 -and $code -ne 1601) { return $code }
+        if ($attempt -ge $Retries) {
+            Write-Log ('    Still ' + $code + ' after ' + $attempt + ' attempts.') -Level ERROR
+            return $code
+        }
+        $wait = 30 * $attempt
+        Write-Log ('    ' + $code + ' = installer busy. Waiting ' + $wait + 's, retry ' + $attempt + '/' + $Retries + '...') -Level WARN
+        Start-Sleep -Seconds $wait
+    }
+}
+
 # Known non-zero uninstaller/msiexec exit codes worth naming explicitly,
 # because "the ARP entry survived" has more than one root cause and the
 # wrong one sends the operator looking for a holder that does not exist.
@@ -1003,7 +1053,7 @@ $script:KnownUninstallErrors = @{
 function Invoke-ArpHardRemoval {
     param($Entry)
     Write-Log '    -RemoveOrphanedRegistrations, no dependency holder, and no on-disk' -Level WARN
-    Write-Log '    payload anywhere for this flavor/arch/major: stripping the ARP entry' -Level WARN
+    Write-Log '    payload for this version: stripping the ARP entry' -Level WARN
     Write-Log '    directly (registry-only; there is nothing left for it to reference).' -Level WARN
     try {
         Remove-Item -Path $Entry.PSPath -Recurse -Force -ErrorAction Stop
@@ -1032,7 +1082,7 @@ function Invoke-ArpEntryRemoval {
             $argsQ = ($cmd.Substring($cmd.IndexOf($exeQ) + $exeQ.Length + 1)).Trim()
             $u = Start-Process $exeQ -ArgumentList $argsQ -Wait -PassThru
         } elseif ($Entry.PSChildName -match '^\{[0-9A-Fa-f-]+\}$') {
-            $u = Start-Process msiexec.exe -ArgumentList ('/x ' + $Entry.PSChildName + ' /qn /norestart') -Wait -PassThru
+            $u = @{ ExitCode = (Invoke-Msi ('/x ' + $Entry.PSChildName + ' /qn /norestart')) }
         } else {
             Write-Log '    No usable uninstall string.' -Level WARN
             return $false
@@ -1187,7 +1237,7 @@ $script:MuxerBrokenRoots = @()
 $script:MuxerFailures    = @()
 
 Write-Log '=============================================='
-Write-Log ' .NET Runtime Update (v3.10) -- 302122/307353/314679/320854/326863/+.NETCore-family'
+Write-Log ' .NET Runtime Update (v3.11) -- 302122/307353/314679/320854/326863/+.NETCore-family'
 Write-Log (' Host   : ' + $env:COMPUTERNAME)
 # Echo EVERY switch, so a log proves which arguments actually arrived. Endpoint
 # Central has a history in this environment of altering argument strings, and a
@@ -1754,11 +1804,13 @@ foreach ($key in $groups.Keys) {
             continue
         }
         Write-Log ('  Removing: ' + $e.DisplayName + '  [' + $e.DisplayVersion + ']') -Level WARN
-        # Not -AllowHardRemoval here: this group DOES have on-disk payload for
-        # the current version, so an older sibling entry surviving uninstall
-        # is plausibly a real SDK/hosting-bundle dependency reference, not
-        # dead metadata -- forcing a registry-only removal could hide that.
-        Invoke-ArpEntryRemoval -Entry $e -Version $it.NameVer.ToString() | Out-Null
+        # Hard removal only when THIS version has no files on disk: an older
+        # sibling that still has a payload may be a real SDK/hosting-bundle
+        # reference, and stripping its registration would hide that. A live
+        # dependency holder still blocks it inside Invoke-ArpEntryRemoval.
+        $arpOnly = -not (Test-ArpVersionOnDisk -DiskMap $diskNow -Prefix $prefix -Arch $groupArch -Version $it.NameVer)
+        if ($arpOnly) { Write-Log ('    ' + $it.NameVer + ' has no files on disk -- registry entry only.') }
+        Invoke-ArpEntryRemoval -Entry $e -Version $it.NameVer.ToString() -AllowHardRemoval:($arpOnly -and $RemoveOrphanedRegistrations) | Out-Null
     }
 }
 
@@ -2043,7 +2095,7 @@ if ($UninstallNoOp) {
     Write-Log 'product named in the dependency diagnostics first.' -Level ERROR
 }
 if ($Failed) {
-    Write-Log 'One or more flavors did NOT reach a patched state. Review log.' -Level ERROR
+    Write-Log 'One or more steps FAILED (install, SDK removal or verification). See the ERROR lines above.' -Level ERROR
     Write-Log '=============================================='
     exit 1
 }
