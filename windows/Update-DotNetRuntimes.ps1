@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Remediation: Microsoft .NET Core security updates (v3.11)
+    Remediation: Microsoft .NET Core security updates (v3.12)
     Nessus Plugin IDs : 302122, 307353 (+ 314679, 320854, 326863 -- same fix)
 
 .DESCRIPTION
@@ -13,6 +13,16 @@
          cleanup removed it (or anything else went sideways), reinstalls
          and re-verifies. Exits 1 if the machine does not end in a
          strictly better state than it started.
+
+    v3.12 (CSLT-023, 2026-10-29): -RepairBrokenHost. CSLT-023 had no
+    host\fxr folder, with .NET 6.0.21-6.0.32 and Windows Desktop 5.0.17
+    under shared\, so the run stopped and asked for a manual repair. With
+    the switch, each broken root gets the latest runtime patch of the newest
+    major on disk (current major if shared\ is empty), then /repair of the
+    same bundle if dotnet --list-runtimes still fails. The run continues
+    once it works and stops as before if not. A host\fxr rename already
+    queued in PendingFileRenameOperations skips the repair for that root,
+    since only a reboot completes it.
 
     v3.11 (CSLT-174, 2026-10-29):
       * Phase 1c called Invoke-Msi, which only existed in
@@ -449,7 +459,13 @@ param(
     # SDK or hosting bundle of that major is installed, or when the run is
     # not otherwise clean. That script's own foreign-WiX-holder check also
     # still applies.
-    [switch]$RemoveRetiredMajor
+    [switch]$RemoveRetiredMajor,
+    # v3.12: when dotnet.exe cannot load its host (host\fxr folder or
+    # hostfxr.dll missing), install the latest patch of the newest major on
+    # disk, then /repair it if the host is still broken, and continue only
+    # once dotnet --list-runtimes works. Skipped when a host\fxr rename is
+    # already queued for the next boot -- that host needs a reboot instead.
+    [switch]$RepairBrokenHost
 )
 if ($RemoveRetiredMajor) { $InstallSuccessorMajor = [switch]$true }
 
@@ -592,6 +608,54 @@ function Get-RuntimeVersionsFromDisk {
     return $out
 }
 
+function Get-HostRepairPlan {
+    # -RepairBrokenHost: what to do for one broken root. A host\fxr rename
+    # already queued for boot means the fix is a reboot; installing now would
+    # only queue another. Otherwise install the newest major on disk (its
+    # runtime installer carries host\fxr), or the current major if none.
+    param($OnDisk, [string[]]$PendingRenames, [string]$Arch, [int]$FallbackMajor)
+    $hostDir = if ($Arch -eq 'x86') { '\\Program Files \(x86\)\\dotnet\\host\\fxr' } else { '\\Program Files\\dotnet\\host\\fxr' }
+    $queued = @($PendingRenames | Where-Object { $_ -and ($_ -match ('(?i)' + $hostDir)) })
+    if ($queued.Count -gt 0) {
+        return [pscustomobject]@{ Action = 'Reboot'; Major = 0; Reason = ($queued[0] -replace '^\\\?\?\\', '') }
+    }
+    $majors = @($OnDisk | ForEach-Object { $_.Version.Major } | Sort-Object -Unique -Descending)
+    if ($majors.Count -eq 0) {
+        return [pscustomobject]@{ Action = 'Install'; Major = $FallbackMajor; Reason = 'no runtimes under shared\' }
+    }
+    return [pscustomobject]@{ Action = 'Install'; Major = [int]$majors[0]; Reason = ('newest major on disk is ' + $majors[0]) }
+}
+
+function Test-DotNetHostWorks {
+    param([string]$Exe)
+    return (@(Invoke-DotNetListRuntimes -Exe $Exe | Where-Object { $_ -match '^Microsoft\.(?:NETCore|WindowsDesktop|AspNetCore)\.App\s+\d' }).Count -gt 0)
+}
+
+function Repair-BrokenHostRoots {
+    param($Roots, [string[]]$PendingRenames, [int]$FallbackMajor)
+    foreach ($root in $Roots) {
+        $onDisk = @(Get-RuntimeVersionsFromDisk -Root (Split-Path -Parent $root.Exe))
+        $plan = Get-HostRepairPlan -OnDisk $onDisk -PendingRenames $PendingRenames -Arch $root.Arch -FallbackMajor $FallbackMajor
+        if ($plan.Action -eq 'Reboot') {
+            Write-Log ('  ' + $root.Arch + ': a host\fxr replacement is already queued for the next boot:') -Level WARN
+            Write-Log ('    ' + $plan.Reason) -Level WARN
+            Write-Log '    Not reinstalling -- reboot to let it complete, then re-run.' -Level WARN
+            continue
+        }
+        Write-Log ('  ' + $root.Arch + ': installing .NET ' + $plan.Major + ' runtime (' + $plan.Reason + ').')
+        $ok = Install-Runtime -Flavor 'Microsoft.NETCore.App' -Major $plan.Major -Arch $root.Arch
+        if ($DryRun) { continue }
+        if ($ok -and (Test-DotNetHostWorks -Exe $root.Exe)) { continue }
+        Write-Log ('  ' + $root.Arch + ': host still broken after install -- running the installer with /repair.') -Level WARN
+        Install-Runtime -Flavor 'Microsoft.NETCore.App' -Major $plan.Major -Arch $root.Arch -Mode repair | Out-Null
+    }
+}
+
+function Get-PendingFileRenames {
+    $v = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations
+    return @($v | Where-Object { $_ })
+}
+
 function Invoke-DotNetListRuntimes {
     # dotnet.exe writes host errors to stderr. Under ErrorActionPreference
     # Stop, Windows PowerShell 5.1 turns a stderr line of a 2>&1 redirect into
@@ -659,7 +723,8 @@ function Get-InstalledMap {
 
 function Install-Runtime {
     # Downloads + installs one flavor/major/arch. Returns $true on success.
-    param([string]$Flavor, [string]$Major, [string]$Arch)
+    # -Mode repair reruns the same bundle with /repair (-RepairBrokenHost).
+    param([string]$Flavor, [string]$Major, [string]$Arch, [ValidateSet('install', 'repair')][string]$Mode = 'install')
     $stems = @{
         'Microsoft.NETCore.App'        = 'dotnet-runtime-win-'
         'Microsoft.WindowsDesktop.App' = 'windowsdesktop-runtime-win-'
@@ -704,8 +769,8 @@ function Install-Runtime {
         return $false
     }
     # v2.6: /log so a 1603 leaves something to read.
-    $bundleLog = Join-Path $LogDir ('dotnet_bundle_' + $Flavor + '_' + $Major + '_' + $Arch + '.log')
-    $p = Start-Process $dest -ArgumentList ('/install /quiet /norestart /log "' + $bundleLog + '"') -Wait -PassThru
+    $bundleLog = Join-Path $LogDir ('dotnet_bundle_' + $Flavor + '_' + $Major + '_' + $Arch + $(if ($Mode -eq 'repair') { '_repair' } else { '' }) + '.log')
+    $p = Start-Process $dest -ArgumentList ('/' + $Mode + ' /quiet /norestart /log "' + $bundleLog + '"') -Wait -PassThru
     Write-Log ('    Installer exit: ' + $p.ExitCode)
     Remove-Item $dest -Force -ErrorAction SilentlyContinue
     if ($p.ExitCode -eq 3010) { $script:Reboot = $true; return $true }
@@ -1237,7 +1302,7 @@ $script:MuxerBrokenRoots = @()
 $script:MuxerFailures    = @()
 
 Write-Log '=============================================='
-Write-Log ' .NET Runtime Update (v3.11) -- 302122/307353/314679/320854/326863/+.NETCore-family'
+Write-Log ' .NET Runtime Update (v3.12) -- 302122/307353/314679/320854/326863/+.NETCore-family'
 Write-Log (' Host   : ' + $env:COMPUTERNAME)
 # Echo EVERY switch, so a log proves which arguments actually arrived. Endpoint
 # Central has a history in this environment of altering argument strings, and a
@@ -1250,6 +1315,7 @@ Write-Log ('   -RemoveSupersededSdks        : ' + $RemoveSupersededSdks)
 Write-Log ('   -RemoveOrphanedRegistrations : ' + $RemoveOrphanedRegistrations)
 Write-Log ('   -InstallSuccessorMajor       : ' + $InstallSuccessorMajor + $(if ($RemoveRetiredMajor) { '  (implied by -RemoveRetiredMajor)' } else { '' }))
 Write-Log ('   -RemoveRetiredMajor          : ' + $RemoveRetiredMajor)
+Write-Log ('   -RepairBrokenHost            : ' + $RepairBrokenHost)
 if ($MyInvocation.Line) {
     Write-Log (' Invoked as: ' + $MyInvocation.Line.Trim())
 }
@@ -1294,8 +1360,28 @@ if ($rebootReasons.Count -gt 0) {
 
 $before = Get-InstalledMap $roots
 
+$hostRepairTried = $false
+if ($script:MuxerBroken -and $RepairBrokenHost) {
+    Write-Log ''
+    Write-Log '=== Repairing the broken .NET host (-RepairBrokenHost) ==='
+    $hostRepairTried = $true
+    $currentMajor = [int](($EolDates.Keys | Measure-Object -Maximum).Maximum)
+    Repair-BrokenHostRoots -Roots ($roots | Where-Object { $script:MuxerBrokenRoots -contains $_.Arch }) `
+        -PendingRenames (Get-PendingFileRenames) -FallbackMajor $currentMajor
+    $script:MuxerBroken      = $false
+    $script:MuxerBrokenRoots = @()
+    $script:MuxerFailures    = @()
+    $before = Get-InstalledMap $roots
+    if (-not $script:MuxerBroken) {
+        Write-Log '  Host repaired: dotnet --list-runtimes works again. Continuing the normal run.'
+    }
+}
+
 if ($script:MuxerBroken) {
     Write-Log ''
+    if ($hostRepairTried) {
+        Write-Log '*** -RepairBrokenHost did not restore the host (see the repair section above).' -Level ERROR
+    }
     Write-Log '*** BROKEN .NET HOST -- STOPPING ***' -Level ERROR
     Write-Log ('*** Affected root(s): ' + ($script:MuxerBrokenRoots -join ', ')) -Level ERROR
     Write-Log '*** dotnet.exe resolves the HIGHEST host\fxr\<version> folder and loads' -Level ERROR
@@ -1322,6 +1408,9 @@ if ($script:MuxerBroken) {
         Write-Log '***      (its installer restores host\fxr\<version>\hostfxr.dll).' -Level ERROR
     }
     Write-Log '***   3. Re-run this script only after dotnet --list-runtimes works.' -Level ERROR
+    if (-not $hostRepairTried) {
+        Write-Log '*** Or re-run with -RepairBrokenHost to let this script do step 2.' -Level ERROR
+    }
     if ($script:MuxerFailures -contains 'MissingDll') {
         Write-Log '*** Do NOT delete the empty host\fxr folder as a workaround unless a HIGHER' -Level ERROR
         Write-Log '*** version folder with a valid hostfxr.dll remains.' -Level ERROR
