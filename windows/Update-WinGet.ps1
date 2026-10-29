@@ -119,6 +119,12 @@
     and STILL misses the target, that is a target/advisory mismatch and it
     fails closed rather than guessing.
 
+    v7 (cslt-183, 2026-10-29): the default target was 1.30.80, but plugin
+    334617 flags versions below 1.29.280, and no stable WinGet release is 1.30.x:
+    aka.ms/getwinget served 1.29.290 and the latest GitHub release was
+    1.29.380. Every default run therefore refused the current build and
+    exited 1. The default is now 1.29.280.
+
     DEPENDENCY NOTE: the App Installer bundle depends on the Microsoft.VCLibs
     and Microsoft.UI.Xaml frameworks. These ship with current Windows 10/11
     builds and the Microsoft Store, so they are normally already present. If
@@ -127,8 +133,8 @@
     around by disabling checks.
 
 .PARAMETER TargetVersion
-    Minimum acceptable version. Default 1.30.80 (the fixed version for
-    CVE-2026-68821).
+    Minimum acceptable version. Default 1.29.280, the fixed version in
+    Tenable plugin 334617 (CVE-2026-68821).
 
 .PARAMETER InstallerPath
     Path to a staged Microsoft.DesktopAppInstaller*.msixbundle.
@@ -156,7 +162,7 @@
 
 [CmdletBinding()]
 param(
-    [string]$TargetVersion = '1.30.80',
+    [string]$TargetVersion = '1.29.280',
     [string]$InstallerPath = '',
     [switch]$DryRun,
     # Provision even if the staged bundle's contained app version is below
@@ -339,7 +345,7 @@ if (-not (Test-InstallerIsArchive -Path $InstallerPath)) {
 #
 # NOTE the bundle's OWN Identity version is NOT the app version: CSLT-001's
 # provisioned entry read 2026.728.1707.0 (a date-style bundle version) while
-# the target is 1.30.80. The versions that matter are the contained
+# the target was 1.30.80. The versions that matter are the contained
 # Type="application" packages in AppxMetadata/AppxBundleManifest.xml.
 #
 # Risk posture: a DEFINITE mismatch (manifest parsed, contained version below

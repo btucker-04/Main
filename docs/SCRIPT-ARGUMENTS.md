@@ -6,7 +6,7 @@ For deployment conventions (Endpoint Central / Mosyle), exit-code meanings, and 
 
 ## How arguments are passed
 
-- **Windows (PowerShell / Endpoint Central):** arguments are real PowerShell `param()` entries. They are passed as bare switches (e.g. `-DryRun`) or named values (e.g. `-TargetVersion 1.30.80`). EC invokes scripts with `-File`, so pass switches only (no `$` or quotes). Most scripts that change state accept `-DryRun` (or `-WhatIf`) to preview.
+- **Windows (PowerShell / Endpoint Central):** arguments are real PowerShell `param()` entries. They are passed as bare switches (e.g. `-DryRun`) or named values (e.g. `-TargetVersion 1.29.280`). EC invokes scripts with `-File`, so pass switches only (no `$` or quotes). Most scripts that change state accept `-DryRun` (or `-WhatIf`) to preview.
 - **macOS (bash / Mosyle):** **Mosyle passes no environment variables.** Scripts that take configuration expose either an in-script `CONFIG`/constant block you edit before deploying, and/or read environment variables when run from a terminal. A few also accept positional arguments. Each script below notes which mechanism it uses.
 - Wherever a script reads a value as `${VAR:-default}` it is listed as an **environment variable**; where it is a plain top-of-file assignment it is listed as an **in-script constant** (edit before deploying — it cannot be overridden at runtime under Mosyle).
 
@@ -30,7 +30,7 @@ Updates WinGet / App Installer (Microsoft.DesktopAppInstaller) via the AppX/DISM
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
-| `-TargetVersion` | string | `1.30.80` | Minimum acceptable version (the fix for CVE-2026-68821). |
+| `-TargetVersion` | string | `1.29.280` | Minimum acceptable version (plugin 334617 / CVE-2026-68821: WinGet < 1.29.280). |
 | `-InstallerPath` | string | `''` | Path to a staged `Microsoft.DesktopAppInstaller*.msixbundle`. If empty, searches beside the script then `C:\`, then downloads from `https://aka.ms/getwinget`. |
 | `-DryRun` | switch | off | Report current version and the resolved installer without installing. |
 
@@ -389,7 +389,7 @@ Read-only: reports which version(s) an `.msixbundle`/`.msix` actually contains, 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
 | `-BundlePath` | string | `''` | Path to the `.msixbundle`/`.msix` to inspect. If empty, searches beside the script then `C:\` for `Microsoft.DesktopAppInstaller*.msixbundle`. |
-| `-TargetVersion` | string | `1.30.80` | Version the contained application packages are judged against (the fix for plugin 334617 / CVE-2026-68821). |
+| `-TargetVersion` | string | `1.29.280` | Version the contained application packages are judged against (the fix for plugin 334617 / CVE-2026-68821). |
 | `-ExpectedName` | string | `Microsoft.DesktopAppInstaller` | Package Identity name to sanity-check, so a completely wrong artifact is called out. |
 
 ## Repair-ZscalerAgent.ps1
