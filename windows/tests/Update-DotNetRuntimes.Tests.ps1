@@ -248,6 +248,39 @@ Assert-True (($d.Reasons -join ';') -match 'not staged') 'missing Remove-DotNetE
 $d = Get-RetireDecision -Major 10 -Successor 12 -KeysWithMajor @() -After @{} -AppPinCount 0 -Sdks @() -HostingBundles @() -RunFailed $false -RebootPending $false -RemoverFound $true
 Assert-True (-not $d.Remove) 'a major the remover has no switch for is refused'
 
+# --- CSLT-174 (2026-10-29): Phase 1c called an undefined Invoke-Msi ----------
+# Every Verb-Noun command the script calls must be defined in it or be a cmdlet.
+$tokens = $null; $parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$parseErrors)
+$defined = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
+             ForEach-Object { $_.Name })
+$called = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) |
+            ForEach-Object { $_.GetCommandName() } | Where-Object { $_ -match '^[A-Za-z]+-[A-Za-z]+$' } | Sort-Object -Unique)
+$windowsOnly = @('Get-CimInstance', 'Get-WmiObject')
+$unknown = @($called | Where-Object {
+    $defined -notcontains $_ -and $windowsOnly -notcontains $_ -and -not (Get-Command $_ -ErrorAction SilentlyContinue)
+})
+Assert-Eq ($unknown -join ',') '' 'every Verb-Noun command the script calls exists'
+Assert-True ($defined -contains 'Invoke-Msi') 'Invoke-Msi is defined in this script'
+
+# --- CSLT-174: Phase 2 ARP entries whose exact version has no files ----------
+# Runtime 9.0.16 / 8.0.27 were registered in ARP but not on disk; their
+# uninstall exited 0 and left the entry, and Phase 2 had no fallback.
+$disk174 = @{
+    'x64|Microsoft.NETCore.App'        = @([version]'8.0.33', [version]'9.0.22', [version]'10.0.14')
+    'x86|Microsoft.WindowsDesktop.App' = @([version]'8.0.33', [version]'9.0.22')
+}
+Assert-True (-not (Test-ArpVersionOnDisk -DiskMap $disk174 -Prefix 'Microsoft .NET Runtime' -Arch 'x64' -Version ([version]'9.0.16'))) `
+    'CSLT-174: .NET Runtime 9.0.16 x64 has no files on disk'
+Assert-True (Test-ArpVersionOnDisk -DiskMap $disk174 -Prefix 'Microsoft .NET Runtime' -Arch 'x64' -Version ([version]'9.0.22')) `
+    'kept 9.0.22 x64 is on disk'
+Assert-True (-not (Test-ArpVersionOnDisk -DiskMap $disk174 -Prefix 'Microsoft Windows Desktop Runtime' -Arch 'x86' -Version ([version]'8.0.27'))) `
+    'CSLT-174: Windows Desktop 8.0.27 x86 has no files on disk'
+Assert-True (Test-ArpVersionOnDisk -DiskMap $disk174 -Prefix 'Microsoft Windows Desktop Runtime' -Arch 'x86' -Version ([version]'8.0.33')) `
+    'Windows Desktop 8.0.33 x86 is on disk'
+Assert-True (Test-ArpVersionOnDisk -DiskMap $disk174 -Prefix 'Microsoft Unknown Runtime' -Arch 'x64' -Version ([version]'9.0.16')) `
+    'unrecognised flavor is treated as on disk, never hard-removed'
+
 if ($failed -gt 0) {
     Write-Host "`n$failed test(s) failed"
     exit 1
