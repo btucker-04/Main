@@ -356,6 +356,35 @@ exit 1
     Remove-Item -LiteralPath $tmp4 -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+# --- SHRBME-08 (2026-10-29): TLS trust failure on every download ------------
+# Verbatim Windows PowerShell 5.1 text, plus the PowerShell 7 wording.
+$ps51 = 'The underlying connection was closed: Could not establish trust relationship for the SSL/TLS secure channel.'
+Assert-Eq (Get-DownloadFailureKind -Message $ps51) 'TlsTrust' 'SHRBME-08: 5.1 trust failure recognised'
+Assert-Eq (Get-DownloadFailureKind -Message 'The remote certificate is invalid because of errors in the certificate chain: UntrustedRoot') 'TlsTrust' 'PS7 UntrustedRoot recognised'
+Assert-Eq (Get-DownloadFailureKind -Message 'The request was aborted: Could not create SSL/TLS secure channel.') 'TlsChannel' 'TLS handshake failure recognised'
+Assert-Eq (Get-DownloadFailureKind -Message 'The operation has timed out.') '' 'timeout is retryable'
+Assert-Eq (Get-DownloadFailureKind -Message 'The remote name could not be resolved: aka.ms') '' 'DNS failure is retryable'
+
+# Save-Installer: a TLS failure is not retried, and later downloads skip.
+$script:iwrCalls = 0
+function Invoke-WebRequest { $script:iwrCalls++; throw $ps51 }
+function Write-TlsFailureHelp { param($Kind, $Url) }
+function Start-Sleep { }
+$script:TlsFailure = ''
+$tmpDl = Join-Path ([System.IO.Path]::GetTempPath()) ('dndl_' + [guid]::NewGuid().ToString('N') + '.exe')
+Assert-True (-not (Save-Installer -Url 'https://aka.ms/dotnet/8.0/windowsdesktop-runtime-win-x86.exe' -Dest $tmpDl)) 'TLS failure: download reported failed'
+Assert-Eq $script:iwrCalls 1 'TLS failure: not retried'
+Assert-Eq $script:TlsFailure 'TlsTrust' 'TLS failure: kind recorded for the run'
+Assert-True (-not (Save-Installer -Url 'https://aka.ms/dotnet/10.0/dotnet-runtime-win-x64.exe' -Dest $tmpDl)) 'next download: reported failed'
+Assert-Eq $script:iwrCalls 1 'next download: skipped without a request'
+
+$script:iwrCalls = 0
+$script:TlsFailure = ''
+function Invoke-WebRequest { $script:iwrCalls++; if ($script:iwrCalls -lt 2) { throw 'The operation has timed out.' } }
+Assert-True (Save-Installer -Url 'https://aka.ms/x.exe' -Dest $tmpDl) 'timeout then success: download succeeds'
+Assert-Eq $script:iwrCalls 2 'timeout is retried'
+Remove-Item Function:\Invoke-WebRequest, Function:\Write-TlsFailureHelp, Function:\Start-Sleep
+
 if ($failed -gt 0) {
     Write-Host "`n$failed test(s) failed"
     exit 1
