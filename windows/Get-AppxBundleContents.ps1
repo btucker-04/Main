@@ -34,7 +34,7 @@
 .PARAMETER TargetVersion
     Optional. When given, the contained application-package versions are
     compared against it and a pass/fail verdict is reported. Defaults to
-    1.30.80, the fixed version for plugin 334617 / CVE-2026-68821.
+    1.29.280, the fixed version for plugin 334617 / CVE-2026-68821.
 
 .PARAMETER ExpectedName
     Optional package Identity name to sanity-check, so a completely wrong
@@ -54,7 +54,7 @@
 [CmdletBinding()]
 param(
     [string]$BundlePath    = '',
-    [string]$TargetVersion = '1.30.80',
+    [string]$TargetVersion = '1.29.280',
     [string]$ExpectedName  = 'Microsoft.DesktopAppInstaller'
 )
 
