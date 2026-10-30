@@ -58,11 +58,12 @@ Updates every installed Notepad++ to the **latest release**, resolved at run tim
 | `-TargetVersion` | string | latest release | Install a specific version (e.g. `8.9.8.1`). Not needed for EC; leave blank. |
 
 ## Update-OracleJava8.ps1
-Updates Oracle Java SE 8 JRE to 8u491+ from a staged installer.
+Updates Oracle Java SE 8 JRE, both 64-bit (`C:\Program Files\Java`) and 32-bit (`C:\Program Files (x86)\Java`), to 8u511 b32 (BPR) or later from staged installers (plugin 371349, CVE-2026-91403). Versions are read from `bin\java.exe`, because the vulnerable 8u511 GA build and the fixed b32 BPR share the `jre1.8.0_511` folder. A staged installer below 8u511 b32 is refused with exit `1` before anything is installed.
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
-| `-InstallerPath` | string | `''` | Full path to `jre-8u491(or later)-windows-x64.exe`. Defaults to the first `jre-8u*-windows-x64.exe` found beside the script (then `C:\`). Never downloads. |
+| `-InstallerPath` | string | `''` | Full path to the 64-bit `jre-8u511-windows-x64.exe` (b32 BPR or later). Defaults to the newest `jre-8u*-windows-x64.exe` beside the script (then `C:\`). Never downloads. |
+| `-InstallerPathX86` | string | `''` | Full path to the 32-bit `jre-8u511-windows-i586.exe` (b32 BPR or later). Defaults to the newest `jre-8u*-windows-i586.exe` beside the script (then `C:\`). Only needed when a 32-bit JRE is installed. |
 | `-ForceCloseJava` | switch | off | Kill running `java.exe` / `javaw.exe` before installing. Default is to abort (exit 2) if Java is running so a human decides. |
 | `-DryRun` | switch | off | Report what would happen without changing anything. |
 
