@@ -30,6 +30,8 @@ Assert-True (-not (Test-AttackerKeyText -Text '')) 'empty file does not match'
 Assert-True (Test-BadVersionText -Text '{"identifier":{"id":"anthropic.claude-code"},"version":"2.1.312","location":{"path":"/c:/Users/alowe/.cursor/extensions/anthropic.claude-code-2.1.312-win32-x64"}}') 'extensions.json entry for 2.1.312'
 Assert-True (Test-BadVersionText -Text '{"anthropic.claude-code-2.1.313-win32-x64":true}') '.obsolete entry for 2.1.313'
 Assert-True (Test-BadVersionText -Text '2026-10-29 10:14:02.118 [info] Extension installed successfully: anthropic.claude-code@2.1.312') 'log line with id@version'
+Assert-True (Test-BadVersionText -Text '[{"identifier":{"id":"anthropic.claude-code","uuid":"5c1b6f5e"},"version":"2.1.313","metadata":{}}]') 'extensions.json id + version fields'
+Assert-True (-not (Test-BadVersionText -Text '[{"identifier":{"id":"anthropic.claude-code"},"version":"2.1.314"},{"identifier":{"id":"ms-python.python"},"version":"2.1.312"}]')) 'another extension at 2.1.312 is not claude-code'
 Assert-True (-not (Test-BadVersionText -Text 'anthropic.claude-code-2.1.314-win32-x64')) '2.1.314 is not affected'
 Assert-True (-not (Test-BadVersionText -Text 'anthropic.claude-code-2.1.3120-win32-x64')) '2.1.3120 is not 2.1.312'
 Assert-True (-not (Test-BadVersionText -Text 'anthropic.claude-code-2.1.31-win32-x64')) '2.1.31 is not affected'
@@ -59,6 +61,53 @@ Assert-True (-not (Test-PayloadText -Text 'C:\Users\x\.config\smtp-relay.json'))
 Assert-Eq (Get-ResultSummary -Findings @()).Code 0 'no findings is clean'
 Assert-Eq (Get-ResultSummary -Findings @([pscustomobject]@{ Kind = 'REVIEW'; Msg = 'x' })).Code 2 'review alone needs attention'
 Assert-True ((Get-ResultSummary -Findings @([pscustomobject]@{ Kind = 'EXPOSED'; Msg = 'x' }, [pscustomobject]@{ Kind = 'IMPACTED'; Msg = 'y' })).Text -like 'RESULT: IMPACTED*') 'impacted outranks exposed'
+
+# --- Key removal (bytes in, bytes out) -------------------------------------------------
+$u8 = [Text.Encoding]::UTF8
+$l1 = [Text.Encoding]::GetEncoding(28591)
+function Show { param([byte[]]$b) return (($l1.GetString($b) -replace "`r", '\r') -replace "`n", '\n') -replace "`0", '' }
+$own = 'ssh-ed25519 AAAAown me@pc'
+$cases = @(
+    @{ Name = 'LF'; In = $u8.GetBytes("$own`n$keyLine`n"); Out = "$own\n" },
+    @{ Name = 'CRLF'; In = $u8.GetBytes("$own`r`n$keyLine`r`n"); Out = "$own\r\n" },
+    @{ Name = 'same line as own key'; In = $u8.GetBytes("$own$keyLine`n"); Out = "$own\n" },
+    @{ Name = 'key first, own key after'; In = $u8.GetBytes("$keyLine`n$own`n"); Out = "$own\n" },
+    @{ Name = 'comment stripped'; In = $u8.GetBytes("$own`nssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDdvylCEJ/k2TpezcTfedrkHyFSK9IZ3vmP6vhY4Ss0P`n"); Out = "$own\n" },
+    @{ Name = 'UTF-16 file + UTF-8 append'; In = ([Text.Encoding]::Unicode.GetPreamble() + [Text.Encoding]::Unicode.GetBytes("$own`n") + $u8.GetBytes("$keyLine`n")); Out = ([char]0xFF + [char]0xFE + "$own\n") },
+    @{ Name = 'fully UTF-16'; In = ([Text.Encoding]::Unicode.GetPreamble() + [Text.Encoding]::Unicode.GetBytes("$own`r`n$keyLine`r`n")); Out = ([char]0xFF + [char]0xFE + "$own\r\n") }
+)
+foreach ($c in $cases) {
+    $r = Remove-AttackerKeyFromBytes -Bytes ([byte[]]$c.In)
+    Assert-True $r.Changed ('key removal changed: ' + $c.Name)
+    Assert-Eq (Show $r.Bytes) $c.Out ('key removal output: ' + $c.Name)
+}
+$r = Remove-AttackerKeyFromBytes -Bytes $u8.GetBytes("$own`n")
+Assert-True (-not $r.Changed) 'key removal: file without the key is unchanged'
+
+# --- Plan, names, grading ---------------------------------------------------------------
+$fs = @(
+    [pscustomobject]@{ Kind = 'IMPACTED'; Action = 'CleanKey'; Target = 'C:\Users\a\.ssh\authorized_keys' },
+    [pscustomobject]@{ Kind = 'IMPACTED'; Action = 'RemoveExtension'; Target = 'C:\Users\a\.cursor\extensions\anthropic.claude-code-2.1.312-win32-x64' },
+    [pscustomobject]@{ Kind = 'IMPACTED'; Action = 'RemoveExtension'; Target = 'C:\Users\a\.cursor\extensions\anthropic.claude-code-2.1.312-win32-x64' },
+    [pscustomobject]@{ Kind = 'IMPACTED'; Action = 'KillProcess'; Target = '4242' },
+    [pscustomobject]@{ Kind = 'IMPACTED'; Action = 'RemoveTask'; Target = '\SysMon' },
+    [pscustomobject]@{ Kind = 'REVIEW'; Action = ''; Target = '' },
+    [pscustomobject]@{ Kind = 'EXPOSED'; Action = ''; Target = '' }
+)
+$plan = @(Get-RemediationPlan -Findings $fs)
+Assert-Eq (($plan | ForEach-Object { $_.Action }) -join ',') 'RemoveTask,KillProcess,RemoveExtension,CleanKey' 'plan: tasks, then processes, then files; duplicates and REVIEW dropped'
+Assert-Eq (Get-EditorProcessName -ExtensionPath 'C:\Users\a\.cursor\extensions\anthropic.claude-code-2.1.312-win32-x64') 'Cursor' 'editor for .cursor is Cursor'
+Assert-Eq (Get-EditorProcessName -ExtensionPath 'C:\Users\a\.vscode\extensions\anthropic.claude-code-2.1.312') 'Code' 'editor for .vscode is Code'
+Assert-Eq (Get-EditorProcessName -ExtensionPath 'C:\Users\a\.vscode-insiders\extensions\x') 'Code - Insiders' 'editor for .vscode-insiders'
+Assert-Eq (Get-QuarantineName -Path 'C:\Users\alowe\.config\smt.cmd') 'Users_alowe_.config_smt.cmd' 'quarantine name flattens the path'
+$imp = [pscustomobject]@{ Kind = 'IMPACTED'; Msg = 'x' }
+$expo = [pscustomobject]@{ Kind = 'EXPOSED'; Msg = 'x' }
+Assert-Eq (Get-RemediationResult -Before @() -After @() -Done 0 -Failed 0).Code 0 'remediate result: clean is 0'
+Assert-Eq (Get-RemediationResult -Before @($imp) -After @($imp) -Done 1 -Failed 1).Code 3 'remediate result: IMPACTED left is 3'
+Assert-Eq (Get-RemediationResult -Before @($imp, $expo) -After @($expo) -Done 3 -Failed 0).Code 2 'remediate result: removed backdoor is 2'
+Assert-True ((Get-RemediationResult -Before @($expo) -After @($expo) -Done 1 -Failed 0).Text -like 'RESULT: NO BACKDOOR - EXPOSED*') 'remediate result: exposed only'
+$ra = Get-RelaunchArguments -ScriptPath 'C:\x.ps1' -Bound @{ Remediate = [switch]$true; ForceCloseEditors = [switch]$false; DisableSshd = [switch]$true }
+Assert-Eq ($ra -join ' ') '-NoProfile -ExecutionPolicy Bypass -File C:\x.ps1 -DisableSshd -Remediate' 'relaunch passes set switches only'
 
 # --- Fixture profiles ----------------------------------------------------------------
 function New-FixtureFile {
@@ -148,6 +197,64 @@ try {
     $script:Findings.Clear()
     Invoke-ProfileScan -ProfilePath $e
     Assert-Eq $script:Findings.Count 0 'fixture: clean UTF-16 authorized_keys has no findings'
+
+    # --- Remediation: end to end on an impacted profile ---------------------------
+    $r1 = Join-Path $tmp 'remed'
+    New-FixtureFile $r1 @('.ssh', 'authorized_keys') ("ssh-ed25519 AAAAown remed@pc`r`n" + $keyLine + "`r`n") | Out-Null
+    New-FixtureFile $r1 @('.cursor', 'extensions', 'anthropic.claude-code-2.1.313-win32-x64', 'extension.js') 'var h="134.209.82.225";' | Out-Null
+    New-FixtureFile $r1 @('.cursor', 'extensions', 'anthropic.claude-code-2.1.313-win32-x64', 'package.json') '{}' | Out-Null
+    New-FixtureFile $r1 @('.cursor', 'extensions', 'extensions.json') '[{"identifier":{"id":"anthropic.claude-code"},"version":"2.1.313"}]' | Out-Null
+    New-FixtureFile $r1 @('.config', 'smt.cmd') '@echo off' | Out-Null
+    New-FixtureFile $r1 @('.config', 'smtk') 'PRIVATE KEY' | Out-Null
+    New-FixtureFile $r1 @('AppData', 'Local', 'Temp', '2', '.stk_00aa11bb22') 'x' | Out-Null
+    New-FixtureFile $r1 @('AppData', 'Roaming', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'sysmon.cmd') '@echo off' | Out-Null
+    New-FixtureFile $r1 @('AppData', 'Roaming', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'mapdrives.cmd') 'net use S: \\fs01\shared' | Out-Null
+    New-FixtureFile $r1 @('AppData', 'Roaming', 'Cursor', 'CachedExtensionVSIXs', 'anthropic.claude-code-2.1.313-win32-x64') 'PK' | Out-Null
+    $script:QuarantineDir = Join-Path $tmp 'quarantine'
+    $script:Findings.Clear()
+    Invoke-ProfileScan -ProfilePath $r1
+    $before = @($script:Findings)
+    Assert-True (@($before | Where-Object { $_.Kind -eq 'IMPACTED' }).Count -ge 5) 'remediate: fixture starts IMPACTED'
+    $res = Invoke-Remediation -Findings $before
+    Assert-Eq $res.Failed 0 'remediate: no failed actions'
+    $script:Findings.Clear()
+    Invoke-ProfileScan -ProfilePath $r1
+    $after = @($script:Findings)
+    Assert-Eq @($after | Where-Object { $_.Kind -eq 'IMPACTED' }).Count 0 'remediate: re-scan has no IMPACTED'
+    Assert-True (@($after | Where-Object { $_.Msg -like '*extensions.json' }).Count -eq 1) 'remediate: extensions.json evidence kept (EXPOSED)'
+    $akText = [IO.File]::ReadAllText((Join-Path $r1 '.ssh/authorized_keys'))
+    Assert-Eq $akText "ssh-ed25519 AAAAown remed@pc`r`n" 'remediate: own key kept, attacker line removed'
+    Assert-True (-not (Test-Path (Join-Path $r1 '.cursor/extensions/anthropic.claude-code-2.1.313-win32-x64'))) 'remediate: tampered extension folder removed'
+    Assert-True (Test-Path (Join-Path $r1 'AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup/mapdrives.cmd')) 'remediate: unrelated Startup script kept'
+    Assert-True (-not (Test-Path (Join-Path $r1 'AppData/Roaming/Cursor/CachedExtensionVSIXs/anthropic.claude-code-2.1.313-win32-x64'))) 'remediate: cached malicious VSIX removed'
+    Assert-True (-not (Test-Path (Join-Path $r1 'AppData/Local/Temp/2/.stk_00aa11bb22'))) 'remediate: per-session Temp .stk_ removed'
+    $qNames = @(Get-ChildItem -LiteralPath $script:QuarantineDir -Force | ForEach-Object { $_.Name })
+    Assert-True (@($qNames | Where-Object { $_ -like '*_.config_smt.cmd' }).Count -eq 1) 'remediate: smt.cmd quarantined'
+    Assert-True (@($qNames | Where-Object { $_ -like '*_.ssh_authorized_keys' }).Count -eq 1) 'remediate: authorized_keys backed up before edit'
+    Assert-True (@($qNames | Where-Object { $_ -like '*extension.js.quarantine' }).Count -eq 1) 'remediate: extension.js kept as .quarantine'
+    $rr = Get-RemediationResult -Before $before -After $after -Done $res.Done -Failed $res.Failed
+    Assert-Eq $rr.Code 2 'remediate: REMEDIATED exits 2 so EC flags it for credential rotation'
+    Assert-True ($rr.Text -like 'RESULT: REMEDIATED*') 'remediate: result text REMEDIATED'
+
+    # Locked extension folder (stands in for Cursor holding it open): result must be INCOMPLETE.
+    if ((& id -u) -ne '0') {
+        $r2 = Join-Path $tmp 'locked'
+        New-FixtureFile $r2 @('.cursor', 'extensions', 'anthropic.claude-code-2.1.312-win32-x64', 'extension.js') 'svc-telemetry' | Out-Null
+        $extRoot = Join-Path $r2 '.cursor/extensions/anthropic.claude-code-2.1.312-win32-x64'
+        & chmod 555 $extRoot
+        try {
+            $script:Findings.Clear()
+            Invoke-ProfileScan -ProfilePath $r2
+            $b2 = @($script:Findings)
+            $res2 = Invoke-Remediation -Findings $b2
+            $script:Findings.Clear()
+            Invoke-ProfileScan -ProfilePath $r2
+            $rr2 = Get-RemediationResult -Before $b2 -After @($script:Findings) -Done $res2.Done -Failed $res2.Failed
+            Assert-Eq $res2.Failed 1 'locked: removal reported as failed'
+            Assert-Eq $rr2.Code 3 'locked: REMEDIATION INCOMPLETE exits 3'
+        } finally { & chmod 755 $extRoot }
+    }
+    $script:QuarantineDir = $null
 
     # Startup item (not named sysmon.cmd) that launches the payload.
     $d = Join-Parts @($tmp, 'startup-only')

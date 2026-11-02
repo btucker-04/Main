@@ -386,7 +386,27 @@ Remediates per-user Claude Code installs (plugin 322792 / CVE-2026-54316). Becau
 | `-DryRun` | switch | off | Report every install found and the intended action without changing anything. |
 
 ## Detect-CursorClaudeCodeIOC.ps1
-Read-only check for the malicious Anthropic.claude-code 2.1.312 / 2.1.313 extension from the Cursor marketplace (Cursor security notice, Oct 29, 2026). **No arguments.** Scans every user profile, not SYSTEM's `$HOME`. It reports **IMPACTED** (the svc-telemetry key, smt/stk payload files, a SysMon task or Startup script that runs them, a tunnel process or connection to 134.209.82.225, or the malicious `extension.js`), **EXPOSED** (the affected version was installed but no backdoor artifact was found; detected from the extension folder, `extensions.json`, `.obsolete`, Cursor's VSIX cache or Cursor logs, because auto-update deletes the old folder) or **REVIEW** (a SysMon task with no payload reference, or a location it could not read). Exit `0` = clean, `2` = any finding, `1` = could not run. Remediation is the vendor's `remediate-windows.ps1`.
+Check, and optional removal, for the malicious Anthropic.claude-code 2.1.312 / 2.1.313 extension from the Cursor marketplace (Cursor security notice, Oct 29, 2026). Read-only by default. Scans every user profile, not SYSTEM's `$HOME`. It reports **IMPACTED** (the svc-telemetry key, smt/stk payload files, a SysMon task or Startup script that runs them, a tunnel process or connection to 134.209.82.225, or the malicious `extension.js`), **EXPOSED** (the affected version was installed but no backdoor artifact was found; detected from the extension folder, `extensions.json`, `.obsolete`, Cursor's VSIX cache or Cursor logs, because auto-update deletes the old folder) or **REVIEW** (a SysMon task with no payload reference, or a location it could not read).
+
+`-Remediate` removes what the vendor's `remediate-windows.ps1` removes, plus the gaps that script leaves:
+- `administrators_authorized_keys`
+- `C:\Windows\Temp\.stk_*`
+- payload tasks in any task folder
+- the cached malicious VSIX
+
+It copies each removed file, and each `authorized_keys` before editing, to `C:\Logs\CompoSecure\CursorClaudeCodeIOC_Quarantine_<stamp>` (SYSTEM and Administrators only). It then re-scans and grades on the second scan. REVIEW items and EXPOSED log traces are never removed.
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `-Remediate` | switch | off | Remove IMPACTED items (and the cached malicious VSIX), then re-scan. |
+| `-ForceCloseEditors` | switch | off | With `-Remediate`: close Cursor / VS Code (every instance on the machine) when a tampered extension folder must be deleted. Unsaved work can be lost. Without it a locked folder makes the run INCOMPLETE. |
+| `-DisableSshd` | switch | off | With `-Remediate`: stop the OpenSSH Server service and set it to Disabled. Leave off on hosts that use sshd on purpose. |
+
+Exit codes:
+- `0`: clean.
+- `2`: needs attention. Detect mode found something, `-Remediate` removed a backdoor (rotate credentials), or only EXPOSED / REVIEW items exist.
+- `3`: `-Remediate` ran, but IMPACTED items remain.
+- `1`: could not run.
 
 ## Get-AppxBundleContents.ps1
 Read-only: reports which version(s) an `.msixbundle`/`.msix` actually contains, so a staged installer can be verified before or after provisioning. Note the bundle's own Identity version is *not* the app version.

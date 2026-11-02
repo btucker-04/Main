@@ -1,7 +1,8 @@
 <#
 .SYNOPSIS
-  READ-ONLY detection for the malicious Anthropic.claude-code 2.1.312 / 2.1.313 extension
-  (Cursor VS Code Extension Marketplace incident, Oct 29, 2026) (v2).
+  Detection (default, read-only) and optional remediation for the malicious
+  Anthropic.claude-code 2.1.312 / 2.1.313 extension (Cursor VS Code Extension
+  Marketplace incident, Oct 29, 2026) (v3).
 
 .DESCRIPTION
   Advisory: https://cursor.com/blog/claude-code-extension-security-notice
@@ -40,15 +41,59 @@
     * Files are read both BOM-decoded and byte-for-byte: the payload appends the key as
       UTF-8 even to a UTF-16 authorized_keys, which a plain decode garbles.
 
-.NOTES
-  Platform / Deploy : Windows, ManageEngine Endpoint Central, runs as SYSTEM. No arguments.
-  EC command field  : powershell -ExecutionPolicy Bypass -File Detect-CursorClaudeCodeIOC.ps1
-  This script makes NO changes. Remediation is a separate step (vendor remediate-windows.ps1).
-  Log: C:\Logs\CompoSecure\CursorClaudeCodeIOC_<stamp>.log (+ _latest.log)
+  v3 (Nov 2, 2026): -Remediate covers what the vendor's remediate-windows.ps1 removes,
+  plus its gaps:
+    * Removes only IMPACTED items: payload tasks (any folder), tunnel/payload processes,
+      tampered extension folders (by content, as the vendor does), dropped smt/stk files,
+      Startup scripts that run the payload, and the attacker key.
+    * Also cleans C:\ProgramData\ssh\administrators_authorized_keys and
+      C:\Windows\Temp\.stk_*, which the vendor script skips, and deletes the affected
+      VSIX from Cursor's download cache so it cannot be reinstalled from there.
+    * Every removed file, and every authorized_keys before it is edited, is copied to a
+      quarantine folder under C:\Logs\CompoSecure readable only by SYSTEM and
+      Administrators.
+    * Key removal keeps the file's encoding. It handles the raw UTF-8 append the vendor
+      describes, a key on the same line as a real key, and a fully UTF-16 file.
+    * After acting it re-scans and grades on that second scan, not on what it tried.
+    * A REVIEW item (a SysMon task with no payload reference) is never removed.
+    * Exit 2 (not 0) when it removed a backdoor, so EC shows which hosts need
+      credential rotation.
 
-  Exit codes: 0 = no indicators found, 2 = IMPACTED / EXPOSED / REVIEW (needs attention),
-  1 = script error. Leave EC success codes at 0 so exit 2 shows up as a failed target.
+.PARAMETER Remediate
+  Remove the IMPACTED items, then re-scan. Without it the script changes nothing.
+
+.PARAMETER ForceCloseEditors
+  With -Remediate: close Cursor (or VS Code) before deleting a tampered extension
+  folder it has locked. Closes every instance on the machine; unsaved work can be lost.
+  Without it a locked folder is reported and the result is REMEDIATION INCOMPLETE.
+
+.PARAMETER DisableSshd
+  With -Remediate: stop the OpenSSH Server service and set it to Disabled. The payload
+  tries to enable it (that needs admin). Leave off on hosts that use sshd on purpose.
+
+.NOTES
+  Platform / Deploy : Windows, ManageEngine Endpoint Central, runs as SYSTEM.
+  EC command field  : powershell -ExecutionPolicy Bypass -File Detect-CursorClaudeCodeIOC.ps1
+  EC arguments      : none (detect), or -Remediate [-ForceCloseEditors] [-DisableSshd]
+  Log: C:\Logs\CompoSecure\CursorClaudeCodeIOC_<stamp>.log (+ _latest.log)
+  Quarantine (-Remediate): C:\Logs\CompoSecure\CursorClaudeCodeIOC_Quarantine_<stamp>
+
+  Exit codes (leave EC success codes at 0 so anything else shows up as a failed target):
+    0 = clean (nothing found)
+    2 = needs attention: detect mode found IMPACTED / EXPOSED / REVIEW, or -Remediate
+        removed a backdoor (rotate credentials), or only EXPOSED / REVIEW items exist
+    3 = -Remediate ran but IMPACTED items remain (see the VERIFY section of the log)
+    1 = script error
+  EXPOSED traces (Cursor logs, extensions.json) are evidence, not payload, and are left
+  in place, so a remediated host keeps reporting EXPOSED on later detect runs.
 #>
+
+[CmdletBinding()]
+param(
+    [switch]$Remediate,
+    [switch]$ForceCloseEditors,
+    [switch]$DisableSshd
+)
 
 $ErrorActionPreference = 'Continue'
 
@@ -81,8 +126,14 @@ function Write-Log {
 }
 
 function Add-Finding {
-    param([ValidateSet('IMPACTED', 'EXPOSED', 'REVIEW')][string]$Kind, [string]$Msg)
-    [void]$script:Findings.Add([pscustomobject]@{ Kind = $Kind; Msg = $Msg })
+    # Action/Target tell -Remediate what to do; findings without an Action are report-only.
+    param(
+        [ValidateSet('IMPACTED', 'EXPOSED', 'REVIEW')][string]$Kind,
+        [string]$Msg,
+        [ValidateSet('', 'RemoveTask', 'KillProcess', 'RemoveExtension', 'RemoveFile', 'CleanKey', 'RemovePackage')][string]$Action = '',
+        [string]$Target = ''
+    )
+    [void]$script:Findings.Add([pscustomobject]@{ Kind = $Kind; Msg = $Msg; Action = $Action; Target = $Target })
     Write-Log ($Kind + ': ' + $Msg) -Level 'IOC'
 }
 
@@ -103,9 +154,15 @@ function Get-BadVersionPattern {
 }
 
 function Test-BadVersionText {
+    # Folder-style names (anthropic.claude-code-2.1.312-win32-x64, id@version) and the
+    # extensions.json form, where id and version are separate fields of one entry.
     param([string]$Text)
     if ([string]::IsNullOrEmpty($Text)) { return $false }
-    return ($Text -match (Get-BadVersionPattern))
+    if ($Text -match (Get-BadVersionPattern)) { return $true }
+    $q = [char]34
+    $alts = ($BadExtVersions | ForEach-Object { [regex]::Escape($_) }) -join '|'
+    $json = '(?i)' + $q + 'anthropic\.claude-code' + $q + '(?:(?!' + $q + 'version' + $q + ').){0,300}' + $q + 'version' + $q + '\s*:\s*' + $q + '(' + $alts + ')' + $q
+    return ($Text -match $json)
 }
 
 function Get-ClaudeFolderVersion {
@@ -123,6 +180,7 @@ function Test-PayloadText {
     if ($Text -match '(?i)tunnel@') { return $true }
     if ($Text -match '(?i)\.config[\\/](smt\.cmd|\.?smtk?)(?![\w.])') { return $true }
     if ($Text -match '(?i)\.stk_[0-9a-f]{10}') { return $true }
+    if ($Text -match '(?i)\\Startup\\sysmon\.cmd') { return $true }
     return $false
 }
 
@@ -179,22 +237,217 @@ function Test-ScriptFolderForPayload {
     param([string]$Folder)
     if (-not (Test-Path -LiteralPath $Folder)) { return }
     $sys = Join-Parts @($Folder, 'sysmon.cmd')
-    if (Test-Path -LiteralPath $sys) { Add-Finding IMPACTED ('Startup persistence script: ' + $sys) }
+    if (Test-Path -LiteralPath $sys) { Add-Finding IMPACTED ('Startup persistence script: ' + $sys) -Action RemoveFile -Target $sys }
     foreach ($f in @(Get-ChildItem -LiteralPath $Folder -File -Force -ErrorAction SilentlyContinue)) {
         if ($f.Name -ieq 'sysmon.cmd') { continue }
         if ($f.Extension -notmatch '^(?i)\.(cmd|bat|ps1|vbs|js|lnk)$') { continue }
         $t = Get-FileTextSafe -Path $f.FullName
         if ($t) { $t = $t -replace [char]0, '' }
-        if (Test-PayloadText -Text $t) { Add-Finding IMPACTED ('Startup item runs the payload: ' + $f.FullName) }
+        if (Test-PayloadText -Text $t) { Add-Finding IMPACTED ('Startup item runs the payload: ' + $f.FullName) -Action RemoveFile -Target $f.FullName }
     }
 }
 
 function Test-TempForStk {
+    # Depth 1 also covers the per-session Temp\<n> folders on RDP hosts.
     param([string]$Folder)
     if (-not (Test-Path -LiteralPath $Folder)) { return }
-    foreach ($i in @(Get-ChildItem -LiteralPath $Folder -Force -Filter '.stk_*' -ErrorAction SilentlyContinue)) {
-        if (Test-StkArtifactName -Name $i.Name) { Add-Finding IMPACTED ('Temp payload artifact: ' + $i.FullName) }
+    foreach ($i in @(Get-ChildItem -LiteralPath $Folder -Recurse -Depth 1 -Force -Filter '.stk_*' -ErrorAction SilentlyContinue)) {
+        if (Test-StkArtifactName -Name $i.Name) { Add-Finding IMPACTED ('Temp payload artifact: ' + $i.FullName) -Action RemoveFile -Target $i.FullName }
     }
+}
+
+function Test-KeyFile {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $t = Get-FileTextSafe -Path $Path
+    if ($null -eq $t) { Add-Finding REVIEW ('Could not read ' + $Path) }
+    elseif (Test-AttackerKeyText -Text $t) { Add-Finding IMPACTED ('Attacker svc-telemetry key in ' + $Path) -Action CleanKey -Target $Path }
+    else { Write-Log ('  ' + $Path + ' present, no attacker key') }
+}
+
+function Get-AttackerKeyPattern {
+    return ('ssh-ed25519 ' + [regex]::Escape($BadKeyMaterial) + '(?: ' + [regex]::Escape($BadKeyLabel) + ')?')
+}
+
+function Remove-AttackerKeyFromBytes {
+    # Returns @{ Changed; Bytes }. Edits in the file's own encoding so sshd still reads it.
+    # The payload appends raw UTF-8 with no leading newline: Latin-1 round-trips those
+    # bytes 1:1, and the \x00 lookbehind handles a UTF-16 newline (0A 00) before the key.
+    param([byte[]]$Bytes)
+    $keyRx = Get-AttackerKeyPattern
+    if ($null -eq $Bytes -or $Bytes.Length -eq 0) { return @{ Changed = $false; Bytes = $Bytes } }
+    $latin1 = [Text.Encoding]::GetEncoding(28591)
+    $text = $latin1.GetString($Bytes)
+    if ($text -match $keyRx) {
+        $new = ($text -replace ('(?m)(?<=^|\x00)' + $keyRx + '\r?\n'), '') -replace $keyRx, ''
+        return @{ Changed = $true; Bytes = $latin1.GetBytes($new) }
+    }
+    foreach ($enc in @([Text.Encoding]::Unicode, [Text.Encoding]::BigEndianUnicode)) {
+        $pre = $enc.GetPreamble()
+        if ($Bytes.Length -lt $pre.Length) { continue }
+        $hasBom = $true
+        for ($i = 0; $i -lt $pre.Length; $i++) { if ($Bytes[$i] -ne $pre[$i]) { $hasBom = $false; break } }
+        if (-not $hasBom) { continue }
+        $body = $enc.GetString($Bytes, $pre.Length, $Bytes.Length - $pre.Length)
+        if ($body -notmatch $keyRx) { continue }
+        $new = ($body -replace ('(?m)^' + $keyRx + '\r?\n'), '') -replace $keyRx, ''
+        return @{ Changed = $true; Bytes = [byte[]]($pre + $enc.GetBytes($new)) }
+    }
+    return @{ Changed = $false; Bytes = $Bytes }
+}
+
+function Get-EditorProcessName {
+    # Which editor locks an extension folder, from the root it lives under.
+    param([string]$ExtensionPath)
+    if ($ExtensionPath -match '(?i)[\\/]\.cursor[\\/]extensions[\\/]') { return 'Cursor' }
+    if ($ExtensionPath -match '(?i)[\\/]\.vscode-insiders[\\/]extensions[\\/]') { return 'Code - Insiders' }
+    if ($ExtensionPath -match '(?i)[\\/]\.vscode[\\/]extensions[\\/]') { return 'Code' }
+    return $null
+}
+
+function Get-RemediationPlan {
+    # Unique actions in a safe order: stop what respawns the tunnel (tasks), stop the
+    # tunnels, then delete files and the key. REVIEW / EXPOSED-only items have no Action
+    # except RemovePackage (the cached malicious VSIX).
+    param($Findings)
+    $order = @('RemoveTask', 'KillProcess', 'RemoveExtension', 'RemoveFile', 'CleanKey', 'RemovePackage')
+    $seen = @{}
+    $plan = New-Object System.Collections.ArrayList
+    foreach ($a in $order) {
+        foreach ($f in @($Findings | Where-Object { $_.Action -eq $a })) {
+            $k = ($a + '|' + $f.Target).ToLowerInvariant()
+            if ($seen.ContainsKey($k)) { continue }
+            $seen[$k] = $true
+            [void]$plan.Add([pscustomobject]@{ Action = $a; Target = $f.Target })
+        }
+    }
+    return @($plan)
+}
+
+function Get-QuarantineName {
+    param([string]$Path)
+    return (($Path -replace '^[A-Za-z]:', '') -replace '[\\/:]+', '_').TrimStart('_')
+}
+
+function Save-ToQuarantine {
+    param([string]$Path)
+    if (-not $script:QuarantineDir) { return $null }
+    if (-not (Test-Path -LiteralPath $script:QuarantineDir)) {
+        New-Item -ItemType Directory -Path $script:QuarantineDir -Force | Out-Null
+        if ([Environment]::OSVersion.Platform -eq 'Win32NT') {
+            $icacls = $env:WINDIR + '\System32\icacls.exe'
+            $null = & $icacls $script:QuarantineDir '/inheritance:r' '/grant:r' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' 2>&1
+        }
+    }
+    $dest = Join-Parts @($script:QuarantineDir, (Get-QuarantineName -Path $Path))
+    Copy-Item -LiteralPath $Path -Destination $dest -Recurse -Force -ErrorAction Stop
+    return $dest
+}
+
+function Invoke-RemoveItemAction {
+    param([string]$Path, [switch]$Quarantine)
+    if (-not (Test-Path -LiteralPath $Path)) { Write-Log ('  already gone: ' + $Path); return $true }
+    if ($Quarantine) {
+        try { $q = Save-ToQuarantine -Path $Path; if ($q) { Write-Log ('  quarantined copy: ' + $q) } }
+        catch { Write-Log ('  could not quarantine ' + $Path + ': ' + $_.Exception.Message + ' (removing anyway)') -Level WARN }
+    }
+    Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $Path) { Write-Log ('  could not remove ' + $Path) -Level ERROR; return $false }
+    Write-Log ('  removed ' + $Path) -Level FIXED
+    return $true
+}
+
+function Invoke-CleanKeyAction {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { Write-Log ('  already gone: ' + $Path); return $true }
+    try {
+        $q = Save-ToQuarantine -Path $Path
+        if ($q) { Write-Log ('  backup before edit: ' + $q) }
+        $r = Remove-AttackerKeyFromBytes -Bytes ([IO.File]::ReadAllBytes($Path))
+        if ($r.Changed) { [IO.File]::WriteAllBytes($Path, [byte[]]$r.Bytes) }
+    } catch {
+        Write-Log ('  could not edit ' + $Path + ': ' + $_.Exception.Message) -Level ERROR
+        return $false
+    }
+    if (Test-AttackerKeyText -Text (Get-FileTextSafe -Path $Path)) {
+        Write-Log ('  attacker key still in ' + $Path + ' - remove the svc-telemetry line by hand') -Level ERROR
+        return $false
+    }
+    Write-Log ('  removed attacker key from ' + $Path) -Level FIXED
+    return $true
+}
+
+function Invoke-Remediation {
+    # Returns @{ Done; Failed }. Windows-only actions (tasks, processes, editors) run only
+    # when such findings exist, so the file actions can be exercised on any platform.
+    param($Findings)
+    $done = 0; $failed = 0
+    $plan = @(Get-RemediationPlan -Findings $Findings)
+    if ($plan.Count -eq 0) { Write-Log 'Nothing to remove.'; return @{ Done = 0; Failed = 0 } }
+    $closed = @{}
+    foreach ($p in $plan) {
+        Write-Log ('[' + $p.Action + '] ' + $p.Target)
+        $ok = $true
+        switch ($p.Action) {
+            'RemoveTask' {
+                $schtasks = $env:WINDIR + '\System32\schtasks.exe'
+                $null = & $schtasks '/End' '/TN' $p.Target 2>&1
+                $out = & $schtasks '/Delete' '/TN' $p.Target '/F' 2>&1
+                $rc = $LASTEXITCODE
+                $null = & $schtasks '/Query' '/TN' $p.Target 2>&1
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Log ('  task still registered (schtasks /Delete rc ' + $rc + '): ' + (($out | Out-String).Trim())) -Level ERROR
+                    $ok = $false
+                } else { Write-Log ('  removed task ' + $p.Target) -Level FIXED }
+            }
+            'KillProcess' {
+                $procId = [int]$p.Target
+                Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
+                Start-Sleep -Milliseconds 500
+                if (Get-Process -Id $procId -ErrorAction SilentlyContinue) { Write-Log ('  PID ' + $procId + ' still running') -Level ERROR; $ok = $false }
+                else { Write-Log ('  stopped PID ' + $procId) -Level FIXED }
+            }
+            'RemoveExtension' {
+                $editor = Get-EditorProcessName -ExtensionPath $p.Target
+                if ($ForceCloseEditors -and $editor -and -not $closed.ContainsKey($editor)) {
+                    $running = @(Get-Process -Name $editor -ErrorAction SilentlyContinue)
+                    if ($running.Count -gt 0) {
+                        Write-Log ('  closing ' + $running.Count + ' ' + $editor + ' process(es) (-ForceCloseEditors)') -Level WARN
+                        $running | Stop-Process -Force -ErrorAction SilentlyContinue
+                        Start-Sleep -Seconds 3
+                    }
+                    $closed[$editor] = $true
+                }
+                $js = Join-Parts @($p.Target, 'extension.js')
+                if (Test-Path -LiteralPath $js) {
+                    try { $q = Save-ToQuarantine -Path $js; if ($q) { Rename-Item -LiteralPath $q -NewName ((Split-Path -Leaf $q) + '.quarantine') -Force; Write-Log ('  quarantined extension.js as ' + $q + '.quarantine') } }
+                    catch { Write-Log ('  could not quarantine extension.js: ' + $_.Exception.Message) -Level WARN }
+                }
+                $ok = Invoke-RemoveItemAction -Path $p.Target
+                if (-not $ok -and $editor) {
+                    Write-Log ('  ' + $editor + ' probably has it open. Close ' + $editor + ' and re-run, or add -ForceCloseEditors.') -Level ERROR
+                }
+            }
+            'RemoveFile' { $ok = Invoke-RemoveItemAction -Path $p.Target -Quarantine }
+            'CleanKey' { $ok = Invoke-CleanKeyAction -Path $p.Target }
+            'RemovePackage' { $ok = Invoke-RemoveItemAction -Path $p.Target }
+        }
+        if ($ok) { $done++ } else { $failed++ }
+    }
+    return @{ Done = $done; Failed = $failed }
+}
+
+function Get-RemediationResult {
+    param($Before, $After, [int]$Done, [int]$Failed)
+    $impBefore = @($Before | Where-Object { $_.Kind -eq 'IMPACTED' }).Count
+    $impAfter = @($After | Where-Object { $_.Kind -eq 'IMPACTED' }).Count
+    $verify = Get-ResultSummary -Findings $After
+    $tail = ' (actions ok ' + $Done + ', failed ' + $Failed + ')'
+    if (@($Before).Count -eq 0) { return @{ Code = 0; Text = 'RESULT: CLEAN - no indicators found; nothing removed' } }
+    if ($impAfter -gt 0) { return @{ Code = 3; Text = 'RESULT: REMEDIATION INCOMPLETE - ' + $impAfter + ' IMPACTED item(s) remain after re-scan' + $tail + '. See VERIFY lines.' } }
+    if ($impBefore -gt 0) { return @{ Code = 2; Text = 'RESULT: REMEDIATED - backdoor removed and re-scan shows none left' + $tail + '. Rotate credentials for this host (advisory step 5). EXPOSED traces are kept as evidence.' } }
+    $verifyText = $verify.Text -replace '^RESULT: ', ''
+    return @{ Code = 2; Text = 'RESULT: NO BACKDOOR - ' + $verifyText + $tail }
 }
 
 function Invoke-ProfileScan {
@@ -202,13 +455,7 @@ function Invoke-ProfileScan {
     $h = $ProfilePath
 
     # 1. Attacker SSH key
-    $ak = Join-Parts @($h, '.ssh', 'authorized_keys')
-    if (Test-Path -LiteralPath $ak) {
-        $t = Get-FileTextSafe -Path $ak
-        if ($null -eq $t) { Add-Finding REVIEW ('Could not read ' + $ak) }
-        elseif (Test-AttackerKeyText -Text $t) { Add-Finding IMPACTED ('Attacker svc-telemetry key in ' + $ak) }
-        else { Write-Log ('  authorized_keys present, no attacker key: ' + $ak) }
-    }
+    Test-KeyFile -Path (Join-Parts @($h, '.ssh', 'authorized_keys'))
 
     # 2. Extension folders, manifests and the pending-delete list
     foreach ($root in @((Join-Parts @($h, '.cursor', 'extensions')), (Join-Parts @($h, '.vscode', 'extensions')), (Join-Parts @($h, '.vscode-insiders', 'extensions')))) {
@@ -221,12 +468,12 @@ function Invoke-ProfileScan {
             }
             foreach ($js in @(Get-ChildItem -LiteralPath $d.FullName -Recurse -Depth 3 -File -Filter 'extension.js' -Force -ErrorAction SilentlyContinue)) {
                 if ((Get-Sha256Lower -Path $js.FullName) -eq $BadPayloadSha) {
-                    Add-Finding IMPACTED ('extension.js SHA-256 matches the malicious payload: ' + $js.FullName)
+                    Add-Finding IMPACTED ('extension.js SHA-256 matches the malicious payload: ' + $js.FullName) -Action RemoveExtension -Target $d.FullName
                     continue
                 }
                 $t = Get-FileTextSafe -Path $js.FullName
                 if ($t -and ($t.Contains($BadIP) -or $t.Contains($BadKeyLabel))) {
-                    Add-Finding IMPACTED ('extension.js contains the payload IOC strings: ' + $js.FullName)
+                    Add-Finding IMPACTED ('extension.js contains the payload IOC strings: ' + $js.FullName) -Action RemoveExtension -Target $d.FullName
                 }
             }
         }
@@ -246,9 +493,9 @@ function Invoke-ProfileScan {
         foreach ($f in @(Get-ChildItem -LiteralPath $cache -File -Force -ErrorAction SilentlyContinue)) {
             if ($f.Name -notmatch '^(?i)anthropic\.claude-code') { continue }
             if (Test-BadVersionText -Text $f.Name) {
-                Add-Finding EXPOSED ('Affected VSIX in Cursor download cache: ' + $f.FullName)
+                Add-Finding EXPOSED ('Affected VSIX in Cursor download cache: ' + $f.FullName) -Action RemovePackage -Target $f.FullName
             } elseif ($BadVsixSha -contains (Get-Sha256Lower -Path $f.FullName)) {
-                Add-Finding EXPOSED ('Cached VSIX matches a malicious package hash: ' + $f.FullName)
+                Add-Finding EXPOSED ('Cached VSIX matches a malicious package hash: ' + $f.FullName) -Action RemovePackage -Target $f.FullName
             }
         }
     }
@@ -257,7 +504,7 @@ function Invoke-ProfileScan {
         foreach ($f in @(Get-ChildItem -LiteralPath $dl -File -Force -Filter '*.vsix' -ErrorAction SilentlyContinue)) {
             if ($f.Length -gt $MaxScanBytes) { continue }
             if ($BadVsixSha -contains (Get-Sha256Lower -Path $f.FullName)) {
-                Add-Finding EXPOSED ('Downloaded VSIX matches a malicious package hash: ' + $f.FullName)
+                Add-Finding EXPOSED ('Downloaded VSIX matches a malicious package hash: ' + $f.FullName) -Action RemovePackage -Target $f.FullName
             }
         }
     }
@@ -282,7 +529,7 @@ function Invoke-ProfileScan {
 
     # 5. Dropped payload and persistence files
     foreach ($f in @((Join-Parts @($h, '.config', 'smt.cmd')), (Join-Parts @($h, '.config', 'smtk')), (Join-Parts @($h, '.config', '.smt')), (Join-Parts @($h, '.config', '.smtk')))) {
-        if (Test-Path -LiteralPath $f) { Add-Finding IMPACTED ('Payload file: ' + $f) }
+        if (Test-Path -LiteralPath $f) { Add-Finding IMPACTED ('Payload file: ' + $f) -Action RemoveFile -Target $f }
     }
     Test-ScriptFolderForPayload -Folder (Join-Parts @($appData, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup'))
     Test-TempForStk -Folder (Join-Parts @($h, 'AppData', 'Local', 'Temp'))
@@ -309,8 +556,8 @@ function Get-ResultSummary {
     $exp = @($Findings | Where-Object { $_.Kind -eq 'EXPOSED' }).Count
     $rev = @($Findings | Where-Object { $_.Kind -eq 'REVIEW' }).Count
     $counts = '(impacted ' + $imp + ', exposed ' + $exp + ', review ' + $rev + ')'
-    if ($imp -gt 0) { return @{ Code = 2; Text = 'RESULT: IMPACTED ' + $counts + ' - isolate the host, remediate, rotate credentials (advisory steps 3-5)' } }
-    if ($exp -gt 0) { return @{ Code = 2; Text = 'RESULT: EXPOSED ' + $counts + ' - affected version was installed; no backdoor artifact found. Run vendor remediation and rotate credentials.' } }
+    if ($imp -gt 0) { return @{ Code = 2; Text = 'RESULT: IMPACTED ' + $counts + ' - isolate the host, re-run with -Remediate, rotate credentials (advisory steps 3-5)' } }
+    if ($exp -gt 0) { return @{ Code = 2; Text = 'RESULT: EXPOSED ' + $counts + ' - affected version was installed; no backdoor artifact found. Rotate credentials; -Remediate clears the cached VSIX.' } }
     if ($rev -gt 0) { return @{ Code = 2; Text = 'RESULT: REVIEW ' + $counts + ' - not proven clean; see REVIEW lines' } }
     return @{ Code = 0; Text = 'RESULT: CLEAN - no indicators found' }
 }
@@ -320,50 +567,19 @@ function Test-Needs64BitRelaunch {
     return ($Is64BitOS -and -not $Is64BitProcess)
 }
 
-if ($env:CLAUDE_IOC_DOTSOURCE -eq '1') { return }
-
-# ---- live run (Windows / Endpoint Central) ----------------------------------
-
-if (Test-Needs64BitRelaunch -Is64BitOS ([Environment]::Is64BitOperatingSystem) -Is64BitProcess ([Environment]::Is64BitProcess)) {
-    $ps64 = $env:WINDIR + '\Sysnative\WindowsPowerShell\v1.0\powershell.exe'
-    if (Test-Path $ps64) {
-        & $ps64 -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath
-        exit $LASTEXITCODE
+function Get-RelaunchArguments {
+    param([string]$ScriptPath, [hashtable]$Bound)
+    $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $ScriptPath)
+    foreach ($k in ($Bound.Keys | Sort-Object)) {
+        $v = $Bound[$k]
+        if ($v -is [System.Management.Automation.SwitchParameter] -and $v.IsPresent) { $a += ('-' + $k) }
     }
+    return $a
 }
 
-$LogDir = 'C:\Logs\CompoSecure'
-$script:LogFile = $LogDir + '\CursorClaudeCodeIOC_' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '.log'
-$LatestFile = $LogDir + '\CursorClaudeCodeIOC_latest.log'
-$code = 1
-
-try {
-    if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
-
-    Write-Log '=============================================='
-    Write-Log ' Cursor Claude Code extension IOC check (v2) - READ ONLY'
-    Write-Log (' Host       : ' + $env:COMPUTERNAME)
-    Write-Log (' Running as : ' + [Environment]::UserName + '  64-bit: ' + [Environment]::Is64BitProcess)
-    Write-Log '=============================================='
-
-    $profiles = @(Get-ScanProfiles)
-    if ($profiles.Count -eq 0) { throw 'No user profiles found to scan' }
-    Write-Log ('Profiles: ' + ($profiles -join ', '))
-
-    foreach ($p in $profiles) {
-        Write-Log ('--- ' + $p)
-        try { Invoke-ProfileScan -ProfilePath $p }
-        catch { Add-Finding REVIEW ('Profile scan failed for ' + $p + ': ' + $_.Exception.Message) }
-    }
-
+function Invoke-MachineScan {
     Write-Log '--- Machine-wide'
-    $adm = $env:ProgramData + '\ssh\administrators_authorized_keys'
-    if (Test-Path -LiteralPath $adm) {
-        $t = Get-FileTextSafe -Path $adm
-        if ($null -eq $t) { Add-Finding REVIEW ('Could not read ' + $adm) }
-        elseif (Test-AttackerKeyText -Text $t) { Add-Finding IMPACTED ('Attacker svc-telemetry key in ' + $adm) }
-        else { Write-Log ('  ' + $adm + ' present, no attacker key') }
-    }
+    Test-KeyFile -Path ($env:ProgramData + '\ssh\administrators_authorized_keys')
     Test-ScriptFolderForPayload -Folder ($env:ProgramData + '\Microsoft\Windows\Start Menu\Programs\StartUp')
     Test-TempForStk -Folder ($env:WINDIR + '\Temp')
 
@@ -378,7 +594,8 @@ try {
         $t = Get-FileTextSafe -Path $tf.FullName
         if (Test-PayloadText -Text $t) {
             $payloadTaskFiles += $tf.FullName
-            Add-Finding IMPACTED ('Scheduled task runs the payload: ' + $tf.FullName.Substring($taskRoot.Length))
+            $tn = $tf.FullName.Substring($taskRoot.Length)
+            Add-Finding IMPACTED ('Scheduled task runs the payload: ' + $tn) -Action RemoveTask -Target $tn
         }
     }
     foreach ($st in $sysmonTasks) {
@@ -386,8 +603,8 @@ try {
         $desc = $st.TaskPath + $st.TaskName + ' (run-as ' + $st.Principal.UserId + ', action ' + $actions + ')'
         $file = $taskRoot + $st.TaskPath + $st.TaskName
         if ($payloadTaskFiles -contains $file) { continue }
-        if (Test-PayloadText -Text $actions) { Add-Finding IMPACTED ('Scheduled task SysMon runs the payload: ' + $desc) }
-        else { Add-Finding REVIEW ('Scheduled task named SysMon with no payload reference - confirm it is legitimate: ' + $desc) }
+        if (Test-PayloadText -Text $actions) { Add-Finding IMPACTED ('Scheduled task SysMon runs the payload: ' + $desc) -Action RemoveTask -Target ($st.TaskPath + $st.TaskName) }
+        else { Add-Finding REVIEW ('Scheduled task named SysMon with no payload reference - confirm it is legitimate (never removed automatically): ' + $desc) }
     }
 
     # Running tunnel / payload processes
@@ -396,11 +613,12 @@ try {
     foreach ($pr in $procs) {
         if ($pr.ProcessId -eq $PID) { continue }
         if (Test-SuspiciousCommandLine -CommandLine $pr.CommandLine) {
-            Add-Finding IMPACTED ('Tunnel/payload process PID ' + $pr.ProcessId + ' (parent ' + $pr.ParentProcessId + '): ' + $pr.CommandLine)
+            Add-Finding IMPACTED ('Tunnel/payload process PID ' + $pr.ProcessId + ' (parent ' + $pr.ParentProcessId + '): ' + $pr.CommandLine) -Action KillProcess -Target ('' + $pr.ProcessId)
         }
     }
 
-    # Live or lingering connections to the attacker endpoint
+    # Live or lingering connections to the attacker endpoint (the owning process is
+    # stopped only if its command line matched above; it may be the editor itself)
     foreach ($c in @(Get-NetTCPConnection -RemoteAddress $BadIP -ErrorAction SilentlyContinue)) {
         Add-Finding IMPACTED ('TCP connection to ' + $BadIP + ':' + $c.RemotePort + ' state ' + $c.State + ' PID ' + $c.OwningProcess)
     }
@@ -413,8 +631,95 @@ try {
     } else {
         Write-Log 'INFO sshd (OpenSSH Server) not installed'
     }
+}
 
-    $r = Get-ResultSummary -Findings $script:Findings
+function Invoke-FullScan {
+    param([string[]]$Profiles)
+    foreach ($p in $Profiles) {
+        Write-Log ('--- ' + $p)
+        try { Invoke-ProfileScan -ProfilePath $p }
+        catch { Add-Finding REVIEW ('Profile scan failed for ' + $p + ': ' + $_.Exception.Message) }
+    }
+    Invoke-MachineScan
+}
+
+function Invoke-SshdDisable {
+    $sshd = Get-Service sshd -ErrorAction SilentlyContinue
+    if (-not $sshd) { Write-Log '[DisableSshd] sshd not installed; nothing to do'; return $true }
+    Stop-Service -Name sshd -Force -ErrorAction SilentlyContinue
+    Set-Service -Name sshd -StartupType Disabled -ErrorAction SilentlyContinue
+    $mode = '' + (Get-CimInstance Win32_Service -Filter 'Name=''sshd''' -ErrorAction SilentlyContinue).StartMode
+    $status = '' + (Get-Service sshd -ErrorAction SilentlyContinue).Status
+    if ($status -eq 'Stopped' -and $mode -eq 'Disabled') { Write-Log '[DisableSshd] sshd stopped and disabled' -Level FIXED; return $true }
+    Write-Log ('[DisableSshd] sshd is ' + $status + ' / ' + $mode + ' - could not disable') -Level ERROR
+    return $false
+}
+
+if ($env:CLAUDE_IOC_DOTSOURCE -eq '1') { return }
+
+# ---- live run (Windows / Endpoint Central) ----------------------------------
+
+if (Test-Needs64BitRelaunch -Is64BitOS ([Environment]::Is64BitOperatingSystem) -Is64BitProcess ([Environment]::Is64BitProcess)) {
+    $ps64 = $env:WINDIR + '\Sysnative\WindowsPowerShell\v1.0\powershell.exe'
+    if (Test-Path $ps64) {
+        $relaunchArgs = Get-RelaunchArguments -ScriptPath $PSCommandPath -Bound $PSBoundParameters
+        & $ps64 @relaunchArgs
+        exit $LASTEXITCODE
+    }
+}
+
+$LogDir = 'C:\Logs\CompoSecure'
+$Stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+$script:LogFile = $LogDir + '\CursorClaudeCodeIOC_' + $Stamp + '.log'
+$script:QuarantineDir = $LogDir + '\CursorClaudeCodeIOC_Quarantine_' + $Stamp
+$LatestFile = $LogDir + '\CursorClaudeCodeIOC_latest.log'
+$code = 1
+
+try {
+    if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
+
+    $mode = 'DETECT ONLY (no changes)'
+    if ($Remediate) { $mode = 'REMEDIATE' + $(if ($ForceCloseEditors) { ' +ForceCloseEditors' } else { '' }) + $(if ($DisableSshd) { ' +DisableSshd' } else { '' }) }
+    Write-Log '=============================================='
+    Write-Log ' Cursor Claude Code extension IOC check (v3)'
+    Write-Log (' Mode       : ' + $mode)
+    Write-Log (' Host       : ' + $env:COMPUTERNAME)
+    Write-Log (' Running as : ' + [Environment]::UserName + '  64-bit: ' + [Environment]::Is64BitProcess)
+    Write-Log '=============================================='
+    if (-not $Remediate -and ($ForceCloseEditors -or $DisableSshd)) {
+        Write-Log '-ForceCloseEditors / -DisableSshd do nothing without -Remediate' -Level WARN
+    }
+
+    $profiles = @(Get-ScanProfiles)
+    if ($profiles.Count -eq 0) { throw 'No user profiles found to scan' }
+    Write-Log ('Profiles: ' + ($profiles -join ', '))
+
+    Invoke-FullScan -Profiles $profiles
+    $before = @($script:Findings)
+    $r = Get-ResultSummary -Findings $before
+
+    if ($Remediate) {
+        Write-Log '=============================================='
+        Write-Log ('Scan: ' + $r.Text)
+        Write-Log '--- REMEDIATE'
+        $res = Invoke-Remediation -Findings $before
+        $done = $res.Done; $failed = $res.Failed
+        if ($DisableSshd) { if (Invoke-SshdDisable) { $done++ } else { $failed++ } }
+
+        Write-Log '--- VERIFY (re-scan after remediation)'
+        $script:Findings.Clear()
+        Invoke-FullScan -Profiles $profiles
+        $after = @($script:Findings)
+
+        $hadBackdoor = @($before | Where-Object { $_.Kind -eq 'IMPACTED' }).Count -gt 0
+        if ($hadBackdoor -and -not $DisableSshd) {
+            $listen = @(Get-NetTCPConnection -LocalPort 22 -State Listen -ErrorAction SilentlyContinue)
+            if ($listen.Count -gt 0) { Write-Log 'Something listens on port 22 and the tunnel exposed it. Disable sshd unless this host needs it (-DisableSshd).' -Level WARN }
+        }
+        if (Test-Path -LiteralPath $script:QuarantineDir) { Write-Log ('Quarantine: ' + $script:QuarantineDir) }
+        $r = Get-RemediationResult -Before $before -After $after -Done $done -Failed $failed
+    }
+
     Write-Log '=============================================='
     Write-Log $r.Text
     Write-Log '=============================================='
