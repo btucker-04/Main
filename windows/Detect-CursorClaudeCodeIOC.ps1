@@ -37,6 +37,8 @@
     * Relaunches in 64-bit PowerShell so System32\Tasks is not redirected.
     * Log is written as it goes, so a killed job still leaves output.
     * A location that could not be read becomes REVIEW instead of a clean result.
+    * Files are read both BOM-decoded and byte-for-byte: the payload appends the key as
+      UTF-8 even to a UTF-16 authorized_keys, which a plain decode garbles.
 
 .NOTES
   Platform / Deploy : Windows, ManageEngine Endpoint Central, runs as SYSTEM. No arguments.
@@ -142,13 +144,26 @@ function Test-StkArtifactName {
     return ($Name -match '^(?i)\.stk_[0-9a-f]{10}')
 }
 
+function ConvertFrom-FileBytes {
+    # The payload appends UTF-8 bytes even when the file is UTF-16 (Windows PowerShell
+    # 5.1 writes authorized_keys that way), so a BOM-aware decode alone garbles the key.
+    # Latin-1 maps bytes 1:1 and keeps the raw UTF-8 run readable; return both views.
+    param([byte[]]$Bytes)
+    if ($null -eq $Bytes -or $Bytes.Length -eq 0) { return '' }
+    $latin1 = [Text.Encoding]::GetEncoding(28591).GetString($Bytes)
+    $ms = New-Object IO.MemoryStream (, $Bytes)
+    $sr = New-Object IO.StreamReader ($ms, [Text.Encoding]::UTF8, $true)
+    try { $decoded = $sr.ReadToEnd() } finally { $sr.Dispose() }
+    return ($decoded + [char]10 + $latin1)
+}
+
 function Get-FileTextSafe {
     # Returns $null when unreadable; caller decides whether that is REVIEW.
     param([string]$Path)
     try {
         $fi = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
         if ($fi.Length -gt $MaxScanBytes) { return $null }
-        return [IO.File]::ReadAllText($fi.FullName)
+        return (ConvertFrom-FileBytes -Bytes ([IO.File]::ReadAllBytes($fi.FullName)))
     } catch {
         return $null
     }
@@ -169,7 +184,7 @@ function Test-ScriptFolderForPayload {
         if ($f.Name -ieq 'sysmon.cmd') { continue }
         if ($f.Extension -notmatch '^(?i)\.(cmd|bat|ps1|vbs|js|lnk)$') { continue }
         $t = Get-FileTextSafe -Path $f.FullName
-        if ($f.Extension -ieq '.lnk' -and $t) { $t = $t -replace [char]0, '' }
+        if ($t) { $t = $t -replace [char]0, '' }
         if (Test-PayloadText -Text $t) { Add-Finding IMPACTED ('Startup item runs the payload: ' + $f.FullName) }
     }
 }

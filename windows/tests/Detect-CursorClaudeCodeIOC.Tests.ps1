@@ -124,6 +124,31 @@ try {
     Assert-Eq $script:Findings.Count 0 'fixture: clean profile has no findings'
     Assert-Eq (Get-ResultSummary -Findings $script:Findings).Code 0 'fixture: clean profile exits 0'
 
+    # authorized_keys encodings. The payload appends raw UTF-8 with no leading newline,
+    # so the key can follow a real key on the same line, inside a UTF-16 file.
+    $u8 = [Text.Encoding]::UTF8
+    $cases = @(
+        @{ Name = 'UTF-16 file with UTF-8 key appended'; Bytes = ([Text.Encoding]::Unicode.GetPreamble() + [Text.Encoding]::Unicode.GetBytes("ssh-ed25519 AAAAown me@pc`r`n") + $u8.GetBytes($keyLine + "`n")) },
+        @{ Name = 'fully UTF-16 file'; Bytes = ([Text.Encoding]::Unicode.GetPreamble() + [Text.Encoding]::Unicode.GetBytes("ssh-ed25519 AAAAown me@pc`r`n" + $keyLine + "`r`n")) },
+        @{ Name = 'key on the same line as a real key'; Bytes = $u8.GetBytes('ssh-ed25519 AAAAown me@pc' + $keyLine + "`n") }
+    )
+    $n = 0
+    foreach ($case in $cases) {
+        $n++
+        $e = Join-Path $tmp ('enc' + $n)
+        $akPath = New-FixtureFile $e @('.ssh', 'authorized_keys') ''
+        [IO.File]::WriteAllBytes($akPath, [byte[]]$case.Bytes)
+        $script:Findings.Clear()
+        Invoke-ProfileScan -ProfilePath $e
+        Assert-Eq (Get-Kinds IMPACTED).Count 1 ('fixture: key found in ' + $case.Name)
+    }
+    $e = Join-Path $tmp 'enc-clean'
+    $akPath = New-FixtureFile $e @('.ssh', 'authorized_keys') ''
+    [IO.File]::WriteAllBytes($akPath, [byte[]]([Text.Encoding]::Unicode.GetPreamble() + [Text.Encoding]::Unicode.GetBytes("ssh-ed25519 AAAAown me@pc`r`n")))
+    $script:Findings.Clear()
+    Invoke-ProfileScan -ProfilePath $e
+    Assert-Eq $script:Findings.Count 0 'fixture: clean UTF-16 authorized_keys has no findings'
+
     # Startup item (not named sysmon.cmd) that launches the payload.
     $d = Join-Parts @($tmp, 'startup-only')
     New-FixtureFile $d @('run.bat') 'start /min cmd /c %USERPROFILE%\.config\smt.cmd' | Out-Null
