@@ -385,6 +385,9 @@ Remediates per-user Claude Code installs (plugin 322792 / CVE-2026-54316). Becau
 | `-NotifyUser` | switch | off | Also send a console message to any logged-on user so the next-logon update isn't a surprise. |
 | `-DryRun` | switch | off | Report every install found and the intended action without changing anything. |
 
+## Detect-CursorClaudeCodeIOC.ps1
+Read-only check for the malicious Anthropic.claude-code 2.1.312 / 2.1.313 extension from the Cursor marketplace (Cursor security notice, Oct 29, 2026). **No arguments.** Scans every user profile, not SYSTEM's `$HOME`. It reports **IMPACTED** (the svc-telemetry key, smt/stk payload files, a SysMon task or Startup script that runs them, a tunnel process or connection to 134.209.82.225, or the malicious `extension.js`), **EXPOSED** (the affected version was installed but no backdoor artifact was found; detected from the extension folder, `extensions.json`, `.obsolete`, Cursor's VSIX cache or Cursor logs, because auto-update deletes the old folder) or **REVIEW** (a SysMon task with no payload reference, or a location it could not read). Exit `0` = clean, `2` = any finding, `1` = could not run. Remediation is the vendor's `remediate-windows.ps1`.
+
 ## Get-AppxBundleContents.ps1
 Read-only: reports which version(s) an `.msixbundle`/`.msix` actually contains, so a staged installer can be verified before or after provisioning. Note the bundle's own Identity version is *not* the app version.
 
