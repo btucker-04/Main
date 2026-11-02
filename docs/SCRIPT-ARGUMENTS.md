@@ -58,7 +58,7 @@ Updates every installed Notepad++ to the **latest release**, resolved at run tim
 | `-TargetVersion` | string | latest release | Install a specific version (e.g. `8.9.8.1`). Not needed for EC; leave blank. |
 
 ## Update-OracleJava8.ps1
-Updates Oracle Java SE 8 JRE, both 64-bit (`C:\Program Files\Java`) and 32-bit (`C:\Program Files (x86)\Java`), to 8u511 b32 (BPR) or later from staged installers (plugin 371349, CVE-2026-91403). Versions are read from `bin\java.exe`, because the vulnerable 8u511 GA build and the fixed b32 BPR share the `jre1.8.0_511` folder. A staged installer below 8u511 b32 is refused with exit `1` before anything is installed.
+Updates Oracle Java SE 8 JRE, both 64-bit (`C:\Program Files\Java`) and 32-bit (`C:\Program Files (x86)\Java`), to exactly 8u511 b32 (BPR) from staged installers (plugin 371349, CVE-2026-91403). A later update (8u521+) counts as fixed. Versions are read from `bin\java.exe`, because every 8u511 build shares the `jre1.8.0_511` folder. **The build is an exact match, not a minimum.** 8u511 b33 stayed flagged on CSLT-136, so a staged installer that is not b32 (GA b7, b33, ...) is refused with exit `1` before anything is installed. Every 8u511 build also shares one MSI product code, so an installed wrong 8u511 build is uninstalled (`msiexec /x`, product code from Add/Remove Programs) right before the b32 installer runs. Java 8u511 is absent for that minute. Upload the `.ps1` with the installers and run it as the package's Installation Command, with no arguments.
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
