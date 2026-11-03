@@ -76,10 +76,10 @@ Each entry gives the rule, then the evidence: the host or PR where it bit us. Se
   - Old Cellar kegs and gemspecs, side-by-side .NET folders, SWID tags, and per-user copies all keep a finding open.
   - It sometimes reads ARP entries too, so orphaned registrations matter (#24).
 - **Fixed versions are per release branch.** net-imap is fixed on 0.4, 0.5 and 0.6 separately. `gem install` alone only adds the newest branch (ARMB-02, #48).
-- **A vendor-named fix build is an exact match, not a minimum.**
-  - Plugin 371349 says "apply 8u511 b32 BPR". v2 accepted b33 as "b32 or later", installed it and reported OK, and Tenable still flagged 8.0.511.33 (CSLT-136).
-  - Match the build Tenable names; only a later *update* counts as newer.
-  - All builds of one Oracle JRE update share the folder and MSI product code, so replacing a wrong build needs `msiexec /x` first.
+- **Check the vendor's newest build before trusting a Tenable solution string.**
+  - Plugin 371349 (last updated 2026-10-23) says "apply 8u511 b32 BPR" and flagged 8.0.511.33 on CSLT-136. Oracle shipped b33 on 2026-10-24; it fixes CVE-2026-114820, which affects b32, and plugin 372933 flags anything below b33.
+  - Forcing the named build would have downgraded hosts and reopened a newer CVE. Keep the target a minimum, set it to the vendor's current security baseline, and treat an older plugin that flags a newer build as stale.
+  - All builds of one Oracle JRE update share the folder and MSI product code, so replacing an older build of the same update needs `msiexec /x` first.
 - **Default gems (`specifications/default`) and macOS system Ruby are never deleted.** Only a newer Ruby fixes them.
 - **A dependency blocker must match on architecture.** An x64 app cannot use x86 .NET 8, so it does not block removing x86 .NET 8 (CSLT-057, #61).
 - **End-of-support comes from a date table.** A major past its date is EOL automatically, and a major inside the warning window gets its successor staged (#53).

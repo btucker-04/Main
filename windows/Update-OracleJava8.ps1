@@ -1,8 +1,8 @@
 <#
 .SYNOPSIS
-    Updates Oracle Java SE 8 JRE (64-bit and 32-bit) to exactly 8u511 b32 BPR,
-    or leaves a later update alone. Nessus plugin 371349 (CVE-2026-91403 Security Alert); also
-    clears the older 338352 / 329223 / 309197 findings.
+    Updates Oracle Java SE 8 JRE (64-bit and 32-bit) to 8u511 b33 or later.
+    Nessus plugin 372933 (CVE-2026-114820) and 371349 (CVE-2026-91403 Security
+    Alert); also clears the older 338352 / 329223 / 309197 findings.
 
 .DESCRIPTION
     ** SCOPE WARNING - READ BEFORE DEPLOYING **
@@ -33,21 +33,23 @@
     and CSLT-159 had only that one. A staged installer whose own version is
     below the target is refused before anything runs.
 
-    v3 (2026-11-02, CSLT-136): the target is the exact build, not a minimum.
-    v2 accepted an 8u511 b33 installer as 'b32 or later'; it installed, the
-    script reported OK, and plugin 371349 still flagged 8.0.511.33. Now only
-    the builds in $FixedBuilds (b32) pass at 8u511; any later update passes.
-    A wrong build of the target update is uninstalled (msiexec /x, product code
-    from Add/Remove Programs, both registry views) before the installer runs,
-    because every 8u511 build shares the jre1.8.0_511 folder and product code
-    and the installer cannot replace it in place.
+    v3 (2026-11-03, CSLT-136): the minimum is 8u511 b33 (Oracle, 2026-10-24;
+    security baseline 1.8.0_511-b33). b33 fixes CVE-2026-114820, which
+    Oracle lists as affecting b32, and plugin 372933 flags anything below
+    8u511-b33. Plugin 371349 (last updated 2026-10-23, before b33 shipped)
+    still names b32 and flags 8.0.511.33 on CSLT-136; that is a stale plugin,
+    not a reason to downgrade. An older build of the target update (GA, b31,
+    b32) is uninstalled (msiexec /x, product code from Add/Remove Programs,
+    both registry views) before the installer runs, because every 8u511 build
+    shares the jre1.8.0_511 folder and product code and the installer cannot
+    replace it in place.
 
 .PARAMETER InstallerPath
-    Full path to the 64-bit jre-8u511-windows-x64.exe (b32 BPR; file version 8.0.5110.32).
+    Full path to the 64-bit jre-8u511-windows-x64.exe (b33 or later; file version 8.0.5110.33).
     Defaults to the newest jre-8u*-windows-x64.exe beside this script, then C:\.
 
 .PARAMETER InstallerPathX86
-    Full path to the 32-bit jre-8u511-windows-i586.exe (b32 BPR; file version 8.0.5110.32).
+    Full path to the 32-bit jre-8u511-windows-i586.exe (b33 or later; file version 8.0.5110.33).
     Defaults to the newest jre-8u*-windows-i586.exe beside this script, then C:\.
     Only needed when a 32-bit JRE is installed.
 
@@ -84,12 +86,9 @@ $LogFile = $LogDir + '\OracleJRE8Update_' + (Get-Date -Format 'yyyyMMdd_HHmmss')
 # genuinely vulnerable. Observed on CSLT-136 (2026-08-26) with 8u491 against
 # a stale 491 target, and again for plugin 371349 (2026-10-30), where 8u503
 # hosts would have passed a 503 target. The build matters: 8u511 GA is
-# vulnerable, 8u511 b32 (BPR) is the fix.
+# vulnerable, b32 fixed CVE-2026-91403, and b33 also fixes CVE-2026-114820.
 $TargetUpdate = 511
-# Builds Tenable accepts at the target update. Exact list, not a minimum: 8u511 b33
-# installed on CSLT-136 (2026-10-30) and plugin 371349 still flagged 8.0.511.33.
-# Any later update (8u521+) counts as fixed.
-$FixedBuilds  = @(32)
+$TargetBuild  = 33
 
 function Write-Log {
     param([string]$Msg, [string]$Level = 'INFO')
@@ -109,22 +108,21 @@ function ConvertTo-JavaVersion {
 }
 
 function Test-JavaAtTarget {
-    # At the target update only the listed builds are fixed; GA, other BPRs and an
-    # unknown build all count as vulnerable.
-    param($Version, [int]$TargetUpdate, [int[]]$FixedBuilds)
+    # An unknown build at the target update counts as vulnerable: it may be GA.
+    param($Version, [int]$TargetUpdate, [int]$TargetBuild)
     if ($null -eq $Version) { return $false }
     if ($Version.Update -gt $TargetUpdate) { return $true }
     if ($Version.Update -lt $TargetUpdate) { return $false }
-    return ($null -ne $Version.Build -and ($FixedBuilds -contains [int]$Version.Build))
+    return ($null -ne $Version.Build -and $Version.Build -ge $TargetBuild)
 }
 
 function Test-NeedsSameUpdateRemoval {
     # Every build of one update shares the jre1.8.0_NNN folder and the MSI product
-    # code, so the installer cannot replace a wrong build of the target update in
+    # code, so the installer cannot replace an older build of the target update in
     # place. That install has to be removed first.
-    param($Version, [int]$TargetUpdate, [int[]]$FixedBuilds)
+    param($Version, [int]$TargetUpdate, [int]$TargetBuild)
     if ($null -eq $Version -or $Version.Update -ne $TargetUpdate) { return $false }
-    return -not (Test-JavaAtTarget -Version $Version -TargetUpdate $TargetUpdate -FixedBuilds $FixedBuilds)
+    return -not (Test-JavaAtTarget -Version $Version -TargetUpdate $TargetUpdate -TargetBuild $TargetBuild)
 }
 
 function Select-JavaArpEntry {
@@ -206,7 +204,7 @@ function Format-JavaVersion {
 if ($env:ORACLEJAVA8_DOTSOURCE -eq '1') { return }
 
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
-$targetLabel = '8u' + $TargetUpdate + ' b' + ($FixedBuilds -join '/b')
+$targetLabel = '8u' + $TargetUpdate + ' b' + $TargetBuild
 
 $arches = @(
     @{ Arch = 'x64'; Root = 'C:\Program Files\Java';       Pattern = 'jre-8u*-windows-x64.exe';  Installer = $InstallerPath;    Remove = @() },
@@ -214,9 +212,9 @@ $arches = @(
 )
 
 Write-Log '=============================================='
-Write-Log ' Oracle JRE 8 Update (v3) -- Plugins 371349 / 338352 / 329223'
+Write-Log ' Oracle JRE 8 Update (v3) -- Plugins 372933 / 371349 / 338352 / 329223'
 Write-Log (' Host   : ' + $env:COMPUTERNAME)
-Write-Log (' Target : ' + $targetLabel + ' (BPR, exact build) or 8u' + ($TargetUpdate + 1) + '+')
+Write-Log (' Target : ' + $targetLabel + ' or later')
 Write-Log (' DryRun : ' + $DryRun)
 Write-Log '=============================================='
 Write-Log 'SCOPE: production shopfloor (Pierce). Ensure Marvin/OT approval and'
@@ -233,12 +231,12 @@ foreach ($a in $arches) {
     if ($inv.Count -eq 0) { Write-Log ('  ' + $a.Arch + ': no jre1.8.0_XXX folder under ' + $a.Root); continue }
     $old = @()
     foreach ($j in $inv) {
-        $ok = Test-JavaAtTarget -Version $j -TargetUpdate $TargetUpdate -FixedBuilds $FixedBuilds
+        $ok = Test-JavaAtTarget -Version $j -TargetUpdate $TargetUpdate -TargetBuild $TargetBuild
         $state = if ($ok) { 'OK' } else { 'VULNERABLE' }
         Write-Log ('  ' + $a.Arch + ': ' + $j.Name + '  ' + (Format-JavaVersion $j) + '  [' + $j.Source + ']  ' + $state)
         if (-not $ok) { $old += $j }
-        if (Test-NeedsSameUpdateRemoval -Version $j -TargetUpdate $TargetUpdate -FixedBuilds $FixedBuilds) {
-            Write-Log ('  ' + $a.Arch + ': ' + $j.Name + ' is the target update but the wrong build; it must be uninstalled before ' + $targetLabel + ' can install.') -Level WARN
+        if (Test-NeedsSameUpdateRemoval -Version $j -TargetUpdate $TargetUpdate -TargetBuild $TargetBuild) {
+            Write-Log ('  ' + $a.Arch + ': ' + $j.Name + ' is an older build of the target update; it must be uninstalled before ' + $targetLabel + ' can install.') -Level WARN
             $a.Remove += $j
         }
     }
@@ -268,7 +266,7 @@ foreach ($a in $needed) {
         }
     }
     if ([string]::IsNullOrWhiteSpace($a.Installer) -or -not (Test-Path $a.Installer)) {
-        Write-Log ('  ' + $a.Arch + ' installer not found. Stage ' + ($a.Pattern -replace '\*', $TargetUpdate) + ' (' + $targetLabel + ' BPR)') -Level ERROR
+        Write-Log ('  ' + $a.Arch + ' installer not found. Stage ' + ($a.Pattern -replace '\*', $TargetUpdate) + ' (' + $targetLabel + ')') -Level ERROR
         Write-Log '  beside this script or in C:\, or pass -InstallerPath / -InstallerPathX86.' -Level ERROR
         Write-Log '  (Oracle JRE 8 is not downloadable without an account, so this script will not fetch it.)' -Level ERROR
         exit 1
@@ -276,11 +274,10 @@ foreach ($a in $needed) {
     $iv = ConvertTo-JavaVersion -Text ([string](Get-Item -LiteralPath $a.Installer).VersionInfo.FileVersion)
     if ($null -eq $iv) {
         Write-Log ('  ' + $a.Arch + ' installer: ' + $a.Installer + '  (version unreadable -- verification after install decides)') -Level WARN
-    } elseif (-not (Test-JavaAtTarget -Version $iv -TargetUpdate $TargetUpdate -FixedBuilds $FixedBuilds)) {
-        Write-Log ('  ' + $a.Arch + ' installer ' + $a.Installer + ' is ' + (Format-JavaVersion $iv) + ', not ' + $targetLabel + '.') -Level ERROR
-        Write-Log '  Installing it would leave the finding open: Tenable accepts only the listed build(s)' -Level ERROR
-        Write-Log ('  at 8u' + $TargetUpdate + ' (8.0.' + $TargetUpdate + '.33 stayed flagged on CSLT-136). Stage the ' + $targetLabel + ' BPR:') -Level ERROR
-        Write-Log ('  the installer file version must read 8.0.' + $TargetUpdate + '0.' + ($FixedBuilds -join ' or ') + '.') -Level ERROR
+    } elseif (-not (Test-JavaAtTarget -Version $iv -TargetUpdate $TargetUpdate -TargetBuild $TargetBuild)) {
+        Write-Log ('  ' + $a.Arch + ' installer ' + $a.Installer + ' is ' + (Format-JavaVersion $iv) + ', below ' + $targetLabel + '.') -Level ERROR
+        Write-Log ('  Installing it would leave plugin 372933 open (CVE-2026-114820 affects b32). Stage ' + $targetLabel + ' or later:') -Level ERROR
+        Write-Log ('  the installer file version must read 8.0.' + $TargetUpdate + '0.' + $TargetBuild + ' or higher.') -Level ERROR
         exit 1
     } else {
         Write-Log ('  ' + $a.Arch + ' installer: ' + $a.Installer + '  (' + (Format-JavaVersion $iv) + ')')
@@ -368,7 +365,7 @@ foreach ($a in $needed) {
     if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) {
         Write-Log ('  ' + $a.Arch + ' install FAILED.') -Level ERROR
         if ($a.Remove.Count -gt 0) {
-            Write-Log ('  The wrong 8u' + $TargetUpdate + ' build was already uninstalled, so this host has no ' + $a.Arch + ' Java 8u' + $TargetUpdate + ' now. Re-run promptly.') -Level ERROR
+            Write-Log ('  The older 8u' + $TargetUpdate + ' build was already uninstalled, so this host has no ' + $a.Arch + ' Java 8u' + $TargetUpdate + ' now. Re-run promptly.') -Level ERROR
         }
         exit 1
     }
@@ -392,7 +389,7 @@ foreach ($a in $needed) {
     $haveTarget = $false
     $stillOld = @()
     foreach ($j in $inv) {
-        if (Test-JavaAtTarget -Version $j -TargetUpdate $TargetUpdate -FixedBuilds $FixedBuilds) {
+        if (Test-JavaAtTarget -Version $j -TargetUpdate $TargetUpdate -TargetBuild $TargetBuild) {
             $haveTarget = $true
             Write-Log ('  ' + $a.Arch + ': ' + $j.Name + '  ' + (Format-JavaVersion $j) + '  (OK)')
         } else {
@@ -417,6 +414,7 @@ if ($bad) {
 }
 
 Write-Log ('  ' + $targetLabel + ' (or a later update) present and no vulnerable 8u folders remain.')
-Write-Log '  Re-run a Nessus scan to confirm plugin 371349 clears.'
+Write-Log '  Re-run a Nessus scan to confirm plugin 372933 clears. Plugin 371349 may still'
+Write-Log ('  flag ' + $targetLabel + ' until Tenable updates it past b32; that finding is stale, do not downgrade.')
 Write-Log '=============================================='
 exit 0
