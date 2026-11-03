@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# update-homebrew.sh  (v2)
+# update-homebrew.sh  (v3)
 # Weekly Homebrew maintenance: update brew, upgrade every outdated formula and
 # cask, then remove superseded kegs.
 # Platform : macOS (bash 3.2 compatible) | Deploy: Mosyle (runs as root)
@@ -35,7 +35,7 @@
 #     that Homebrew prefix (owner of <prefix>/bin/brew), not the console user.
 #   * brew output goes to a per-step file, not $(...) -- a Mosyle timeout kill
 #     otherwise discards everything (jriegel-mac 2026-09-14). Each step has a
-#     wall-clock limit; once one step hits it the remaining brew steps are
+#     time limit; once one step hits it the remaining brew steps are
 #     skipped so the job ends on our terms with a meaningful exit code.
 #   * brew's download bars and new/deleted formula catalogs are dropped from
 #     the summary log (CSMB-036).
@@ -55,12 +55,44 @@
 #   * `brew cleanup` no longer autoremoves unless AUTOREMOVE=1.
 #   * Root-owned gem dirs are handed back to the brew user before gem install.
 #
+# v3, from the fleet runs of 2026-10-14..11-03:
+#   * Mosyle shows only the first ~9 KB of output, so 56 of 99 runs lost their
+#     SUMMARY (cut mid-word in "Removing: ..."). stdout is now a digest kept
+#     under OUTPUT_LIMIT with room reserved for the SUMMARY; brew's own output
+#     goes to the main log file and the per-step logs only.
+#   * Time asleep no longer counts. A 60s retry wait took 2 hours on CSMB-011
+#     (lid closed) and used up RUN_BUDGET; a CLT download was killed at its
+#     limit on CSMB-026 with heartbeats ~17 min apart. Limits and the budget
+#     now count awake time (kern.sleeptime / kern.waketime), and caffeinate
+#     holds off idle sleep while the job runs (KEEP_AWAKE).
+#   * A step that ended during a sleep is no longer killed as "timed out"
+#     (CLT install on CSMB-036 had printed "Done." and was reported failed);
+#     a CLT install that hit its limit is re-checked with pkgutil.
+#   * [0] probes github.com / formulae.brew.sh / ghcr.io first and waits up
+#     to NETWORK_WAIT for the network. Still offline -> exit 1 "OFFLINE"
+#     instead of an hour of DNS failures (many Macs at 07:00 on 10-28).
+#   * "Cant connect to the Apple Software Update server" was reported as
+#     "Command Line Tools are current"; it is now "not checked".
+#   * Steps skipped for the time limit or budget are listed as skipped, not
+#     as "brew upgrade failed" / "gem install failed, exit 124".
+#   * brew link failures name the formula and the file in the way (ARMB-02,
+#     ARMB-09 pkgconf vs pkg-config); a brew update whose only error is such a
+#     link failure is no longer "brew update failed".
+#   * Untrusted taps are listed in the SUMMARY: brew silently ignores what
+#     they installed, so "all current" was not true for those formulae.
+#   * Cleanup that stops on "Fix your permissions on: <keg>" (root-owned
+#     files in python@3.10 on CSMB-020) chowns that keg to the brew user and
+#     runs cleanup once more.
+#   * CASK_SUDO also takes a list of cask names, so sudo can be granted only
+#     while those casks upgrade.
+#
 # Casks are upgraded ONE AT A TIME so one broken cask cannot stop the rest and
 # the log names exactly which ones failed. Casks that ship a .pkg installer
 # call sudo, which has no password to give in an unattended run. Those fail
 # and are listed; CASK_SUDO=1 grants the brew user passwordless sudo for the
-# duration of the run only (sudoers drop-in, removed on exit, and removed at
-# the start of the next run if a kill ever left it behind).
+# duration of the cask step only (sudoers drop-in, removed on exit, and
+# removed at the start of the next run if a kill ever left it behind).
+# CASK_SUDO="temurin@21 docker-desktop" grants it only while those upgrade.
 #
 # CONFIG -- Mosyle passes no environment variables. Edit the block below
 # before paste, or pass the same names from a terminal (DRY_RUN=1 ...).
@@ -69,7 +101,8 @@
 # Exit: 0 = everything current
 #       2 = ran, but something is still outdated (failed / pinned / skipped
 #           cask or formula) or a step failed / timed out -- see "Problems"
-#       1 = brew could not be run at all (no owning user, Rosetta missing)
+#       1 = brew could not be run at all (no owning user, Rosetta missing,
+#           no network)
 # =============================================================================
 
 set -uo pipefail
@@ -82,8 +115,10 @@ CFG_DRY_RUN="0"
 # those apps keep themselves current and rarely show up in Tenable; brew
 # skips them by default. Set "1" to force them too.
 CFG_GREEDY="0"
-# Grant the brew user passwordless sudo while this script runs, so casks with
+# Grant the brew user passwordless sudo while casks upgrade, so casks with
 # .pkg installers can upgrade unattended. See the header before enabling.
+# "0" = never, "1" = for every cask, or cask names ("temurin@21 displaylink")
+# = only while those casks upgrade.
 CFG_CASK_SUDO="0"
 # Uninstall formulae that were only installed as dependencies and are no
 # longer needed by anything (old python@3.x, openssl@1.1 ...).
@@ -94,10 +129,21 @@ CFG_SKIP_CASKS=""
 # Per-brew-step wall-clock limit, seconds. 0 = no limit.
 CFG_BREW_TIMEOUT="3600"
 CFG_CASK_TIMEOUT="900"
-# Wall-clock budget for the whole run, seconds. Keep it below Mosyle's own
-# limit for the command so the job stops itself and still writes a SUMMARY
-# (CSPRMB-21-A's log just ended mid-run). 0 = no budget.
+# Budget for the whole run, seconds of AWAKE time (a Mac asleep with its lid
+# closed does not use it up). When it runs out the remaining steps are
+# skipped and the SUMMARY is still written. 0 = no budget.
 CFG_RUN_BUDGET="6600"
+# Hold off idle sleep while the job runs (caffeinate -i -s; the display may
+# still sleep, and closing the lid still sleeps the Mac). "0" = don't.
+CFG_KEEP_AWAKE="1"
+# No route to github.com / formulae.brew.sh / ghcr.io at the start (Macs in
+# a dark wake at 07:00): wait up to this many awake seconds for the network,
+# then stop with OFFLINE (exit 1) instead of an hour of DNS failures.
+CFG_NETWORK_WAIT="600"
+# Mosyle shows only the first ~9 KB of a script's output. stdout is kept
+# below this many bytes, with room saved for the SUMMARY; the full output
+# is in LOG_DIR/homebrew_update.log. 0 = no limit (terminal runs).
+CFG_OUTPUT_LIMIT="7000"
 # Full Xcode installed but its license never accepted: every brew command
 # fails ("You have not agreed to the Xcode license", ARMB-09, CSPRMB-28).
 # "1" accepts it as root (xcodebuild -license accept); "0" only reports it.
@@ -132,14 +178,55 @@ ACCEPT_XCODE_LICENSE="${ACCEPT_XCODE_LICENSE:-$CFG_ACCEPT_XCODE_LICENSE}"
 UPDATE_CLT="${UPDATE_CLT:-$CFG_UPDATE_CLT}"
 REPAIR_CASKS="${REPAIR_CASKS:-$CFG_REPAIR_CASKS}"
 RUBY_GEMS="${RUBY_GEMS-$CFG_RUBY_GEMS}"
+KEEP_AWAKE="${KEEP_AWAKE:-$CFG_KEEP_AWAKE}"
+NETWORK_WAIT="${NETWORK_WAIT:-$CFG_NETWORK_WAIT}"
+OUTPUT_LIMIT="${OUTPUT_LIMIT:-$CFG_OUTPUT_LIMIT}"
 # Seconds before a step that failed on a network error is retried once.
 RETRY_DELAY="${RETRY_DELAY:-60}"
+# Seconds between network probes while waiting for the network.
+NETWORK_POLL="${NETWORK_POLL:-30}"
+# brew update needs github.com and formulae.brew.sh; bottles come from ghcr.io.
+NET_PROBE_HOSTS="github.com formulae.brew.sh ghcr.io"
 
 LOG_DIR="${LOG_DIR:-/var/log/composecure}"
 LOG_FILE="$LOG_DIR/homebrew_update.log"
 SUDOERS_FILE="${SUDOERS_FILE:-/etc/sudoers.d/zz-composecure-brew}"
 
-log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"; }
+# stdout is what Mosyle shows, and it keeps only the first ~9 KB. "body"
+# lines stop at OUTPUT_LIMIT minus the SUMMARY's share; "summary" lines may
+# use the rest; "final" lines (RESULT, END) always print.
+OUT_PHASE="body"
+OUT_USED=0
+OUT_CUT=0
+to_stdout() {
+    ts_line="$1"
+    [ "${#ts_line}" -gt 300 ] && ts_line="$(printf '%s' "$ts_line" | cut -c1-297)..."
+    if [ "${OUTPUT_LIMIT:-0}" -le 0 ] || [ "$OUT_PHASE" = "final" ]; then
+        printf '%s\n' "$ts_line"
+        return 0
+    fi
+    ts_cap=$OUTPUT_LIMIT
+    [ "$OUT_PHASE" = "body" ] && ts_cap=$(( OUTPUT_LIMIT * 3 / 5 ))
+    ts_n=$(( ${#ts_line} + 1 ))
+    if [ $(( OUT_USED + ts_n )) -le "$ts_cap" ]; then
+        printf '%s\n' "$ts_line"
+        OUT_USED=$(( OUT_USED + ts_n ))
+    elif [ "$OUT_CUT" -eq 0 ]; then
+        OUT_CUT=1
+        ts_note="[...] output trimmed for Mosyle; everything is in $LOG_FILE"
+        printf '%s\n' "$ts_note"
+        OUT_USED=$(( OUT_USED + ${#ts_note} + 1 ))
+    fi
+}
+set_output_phase() { OUT_PHASE="$1"; OUT_CUT=0; }
+
+# log: main log file and (within the limit) stdout. detail: log file only.
+log() {
+    lg_line="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    printf '%s\n' "$lg_line" >> "$LOG_FILE"
+    to_stdout "$lg_line"
+}
+detail() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$LOG_FILE"; }
 
 filter_brew_output() {
     skip=0
@@ -316,6 +403,134 @@ kill_tree() {
     kill -9 $kt_pids 2>/dev/null || true
 }
 
+# --- awake time -------------------------------------------------------------
+# A Mac asleep (lid closed, dark wake) stops brew but not the wall clock: a
+# 60s retry wait took 2 hours on CSMB-011 and ate RUN_BUDGET. Every limit
+# here counts awake seconds: wall time minus SLEPT, the sleep that
+# kern.sleeptime / kern.waketime show between two ticks.
+
+# Seconds field of a timeval sysctl: "{ sec = 1761650000, usec = 12 } Tue ..."
+sysctl_sec() {
+    sysctl -n "$1" 2>/dev/null | sed -n 's/^{[[:space:]]*sec[[:space:]]*=[[:space:]]*\([0-9][0-9]*\),.*/\1/p'
+}
+
+# Seconds asleep between ticks at $1 and $2, given the last sleep $3 and the
+# last wake $4 (epoch, empty = unknown). Only a wake inside the gap counts.
+slept_between() {
+    sb_from="$1"; sb_to="$2"; sb_sleep="${3:-0}"; sb_wake="${4:-0}"
+    if [ "$sb_wake" -gt "$sb_from" ] && [ "$sb_wake" -le "$sb_to" ]; then
+        sb_start=$sb_from
+        if [ "$sb_sleep" -gt "$sb_from" ] && [ "$sb_sleep" -lt "$sb_wake" ]; then
+            sb_start=$sb_sleep
+        fi
+        echo $(( sb_wake - sb_start ))
+    else
+        echo 0
+    fi
+}
+
+SLEPT=0
+LAST_TICK=$(date +%s)
+AWAKE_NOW=$LAST_TICK
+# Call in the main shell (not in $(...)) so SLEPT and AWAKE_NOW stick.
+tick() {
+    tk_now=$(date +%s)
+    if [ $(( tk_now - LAST_TICK )) -ge 30 ]; then
+        tk_s=$(slept_between "$LAST_TICK" "$tk_now" "$(sysctl_sec kern.sleeptime)" "$(sysctl_sec kern.waketime)")
+        SLEPT=$(( SLEPT + tk_s ))
+    fi
+    LAST_TICK=$tk_now
+    AWAKE_NOW=$(( tk_now - SLEPT ))
+}
+
+# --- network ----------------------------------------------------------------
+# Hosts of $1 that do not answer HTTPS at all (any HTTP status is an answer).
+unreachable_hosts() {
+    for uh in $1; do
+        curl -sS -o /dev/null -I --connect-timeout 10 --max-time 20 "https://$uh" >/dev/null 2>&1 \
+            || printf '%s\n' "$uh"
+    done
+}
+
+# softwareupdate prints these and still exits 0; the list it "found" is empty.
+# The apostrophe is U+2019 (3 bytes, and Mosyle runs us with no locale), so
+# "[^ ]*" stands in for it.
+softwareupdate_unreachable() {
+    grep -qiE "Can[^ ]*t connect to the Apple Software Update server|Didn[^ ]*t get a response from the Apple Software Update server|The network connection was lost|A TLS error caused the secure connection to fail|not connected to the internet" "$1" 2>/dev/null
+}
+
+# "Command Line Tools for Xcode 27.2-27.2" / "...for Xcode-16.4" -> 27.2 / 16.4
+clt_label_version() { printf '%s\n' "${1##*-}" | grep -E '^[0-9]+(\.[0-9]+)*$' || true; }
+
+# Installed CLT version $1 (pkgutil "version: 27.2.0.0.1.1761100000") covers
+# label version $2 when its first components are at least $2.
+clt_version_covers() {
+    [ -n "$1" ] && [ -n "$2" ] || return 1
+    cv_n=$(printf '%s\n' "$2" | awk -F. '{print NF}')
+    cv_have=$(printf '%s\n' "$1" | cut -d. -f1-"$cv_n")
+    [ "$(printf '%s\n%s\n' "$2" "$cv_have" | sort -V | head -n 1)" = "$2" ]
+}
+
+# --- brew output parsers ----------------------------------------------------
+# One line per "brew link step did not complete": formula, file, and what is
+# in the way. brew names the formula only in the ==> line before the error.
+#   python@3.13: bin/pip3.13 -- /opt/homebrew/bin/pip3.13 already exists
+#   pkgconf: bin/pkg-config -- /opt/homebrew/bin/pkg-config belongs to pkg-config
+link_failures() {
+    awk '
+        { sub(/^[ \t]+/, "") }
+        /^==> (Pouring|Upgrading|Reinstalling|Installing) / { f = $3; sub(/--.*/, "", f); next }
+        /^Error: The `brew link` step did not complete successfully/ { want = 1; sym = ""; tgt = ""; next }
+        want && /^Could not symlink / { sym = $4; next }
+        want && /^Target / && tgt == "" { tgt = $2 }
+        want && tgt != "" && /already exists/ { print f ": " sym " -- " tgt " already exists"; want = 0; next }
+        want && tgt != "" && /is a symlink belonging to/ {
+            o = $0; sub(/.*belonging to /, "", o); sub(/\. .*/, "", o); sub(/\.$/, "", o)
+            print f ": " sym " -- " tgt " belongs to " o; want = 0; next
+        }
+        want && /^==> / { print f ": not linked (see the step log)"; want = 0 }
+        END { if (want) print f ": not linked (see the step log)" }
+    ' "$1" 2>/dev/null | awk '!seen[$0]++' | to_ascii
+}
+
+# brew update errors that mean the catalog was not fetched.
+update_fetch_failed() {
+    grep -qE '^(Error: )?Fetching .* failed!|^fatal:|^Failed to download https://formulae\.brew\.sh' "$1" 2>/dev/null
+}
+
+# Taps named under "Warning: The following taps are not trusted:".
+untrusted_taps() {
+    awk '
+        /^Warning: The following taps are not trusted:/ { f = 1; next }
+        f && /^Homebrew is currently ignoring/ { f = 0 }
+        f { gsub(/^[ \t]+|[ \t]+$/, ""); if ($0 != "") print }
+    ' "$1" 2>/dev/null
+}
+
+# Installed formulae/casks brew is ignoring: its "brew trust --formula
+# <tap>/<name>" lines, without the <user>/<tap>/<cask> placeholders.
+untrusted_items() {
+    sed -nE 's/^[[:space:]]*brew trust --(formula|cask) ([^<[:space:]]+)[[:space:]]*$/\2/p' "$1" 2>/dev/null
+}
+
+# Paths listed after "Error: Could not cleanup old kegs! Fix your permissions on:".
+cleanup_permission_paths() {
+    awk '
+        /Could not cleanup old kegs! Fix your permissions on:/ { f = 1; next }
+        f { s = $0; gsub(/^[ \t]+|[ \t]+$/, "", s); if (s ~ /^\//) print s; else f = 0 }
+    ' "$1" 2>/dev/null
+}
+
+# CASK_SUDO is "1" (every cask), "0"/empty (none) or a list of cask names.
+cask_sudo_wanted() {
+    case "$2" in
+        1) return 0 ;;
+        0|"") return 1 ;;
+    esac
+    case " $(echo $2) " in *" $1 "*) return 0 ;; esac
+    return 1
+}
+
 if [ "${HOMEBREW_UPDATE_SELFTEST:-0}" = "1" ]; then
     return 0 2>/dev/null || exit 0
 fi
@@ -332,12 +547,27 @@ BUDGET_SPENT=0
 GEMS_REMOVED=0
 SAW_XCODE_LICENSE=0
 SAW_OLD_CLT=0
+OFFLINE=0
 SCRIPT_START=$(date +%s)
+LAST_TICK=$SCRIPT_START
+AWAKE_NOW=$SCRIPT_START
+SKIPPED_STEPS=""
+NOTES=""
+UNTRUSTED_TAPS=""
+UNTRUSTED_ITEMS=""
 # One line per problem; any of them makes the run exit 2 and is listed in
 # the SUMMARY, so a failed update or cleanup can no longer end in "current".
 ISSUES=""
 add_issue() { ISSUES="${ISSUES}${ISSUES:+
 }$1"; }
+# Issues that name $1 (a step log), e.g. a time limit the re-check disproved.
+drop_issues_for() { ISSUES=$(printf '%s\n' "$ISSUES" | grep -vF -- "$1" || true); }
+add_note() { NOTES="${NOTES}${NOTES:+
+}$1"; }
+
+if [ "$KEEP_AWAKE" = "1" ] && command -v caffeinate >/dev/null 2>&1; then
+    caffeinate -i -s -w $$ >/dev/null 2>&1 &
+fi
 
 remove_sudoers() {
     if [ -f "$SUDOERS_FILE" ]; then
@@ -370,23 +600,37 @@ fi
 
 TAIL_LINES=40
 
-# Run one command with a wall-clock limit. $1 = limit seconds, rest = the
-# command; $STEP_TOOL names it in messages. Output streams to $STEP_LOG (appended); the
-# filtered tail is copied into the main log. Returns 124 on a time limit.
-# Elapsed time comes from the clock, not from counting sleeps: background
-# timers stretch while a Mac idles, and a 900s cask limit let sage run 2304s.
+# Mark the current step as not run (time limit or budget) and return 125.
+skip_step() {
+    log "    skipped ($1)"
+    SKIPPED_STEPS="${SKIPPED_STEPS}${SKIPPED_STEPS:+, }$STEP_NAME"
+    return 125
+}
+
+# Run one command with a time limit. $1 = limit seconds, rest = the command;
+# $STEP_TOOL names it in messages. Output streams to $STEP_LOG (appended);
+# the filtered tail is copied into the main log file, and only the error
+# lines reach stdout. Returns 124 on a time limit, 125 when not started.
+# Elapsed time comes from the clock, not from counting sleeps (background
+# timers stretch while a Mac idles: a 900s cask limit let sage run 2304s),
+# minus the time the Mac was asleep (tick).
 run_limited() {
     limit="$1"; shift
-    if [ "$TIMED_OUT" -eq 1 ] || [ "$BUDGET_SPENT" -eq 1 ]; then
-        log "    skipped (an earlier step hit its time limit)"
-        return 124
+    tick
+    if [ "$BUDGET_SPENT" -eq 1 ]; then
+        skip_step "RUN_BUDGET of ${RUN_BUDGET}s used up"
+        return 125
+    fi
+    if [ "$TIMED_OUT" -eq 1 ]; then
+        skip_step "an earlier step hit its time limit"
+        return 125
     fi
     if [ "${RUN_BUDGET:-0}" -gt 0 ]; then
-        left=$(( RUN_BUDGET - ($(date +%s) - SCRIPT_START) ))
+        left=$(( RUN_BUDGET - (AWAKE_NOW - SCRIPT_START) ))
         if [ "$left" -le 0 ]; then
             BUDGET_SPENT=1
-            log "    skipped (RUN_BUDGET of ${RUN_BUDGET}s used up)"
-            return 124
+            skip_step "RUN_BUDGET of ${RUN_BUDGET}s used up"
+            return 125
         fi
         if [ "$limit" -le 0 ] || [ "$limit" -gt "$left" ]; then
             limit=$left
@@ -397,20 +641,23 @@ run_limited() {
     else
         limit_is_budget=0
     fi
-    start=$(date +%s)
+    start=$AWAKE_NOW
+    slept_before=$SLEPT
     next_beat=$((start + 300))
     "$@" >>"$STEP_LOG" 2>&1 &
     pid=$!
     hit_limit=0
-    now=$start
     while kill -0 "$pid" 2>/dev/null; do
-        if [ $((now - start)) -lt 5 ]; then sleep 0.2; else sleep 2; fi
-        now=$(date +%s)
-        if [ "$now" -ge "$next_beat" ]; then
-            log "    ...still running ($((now - start))s): $(tail -n 1 "$STEP_LOG" 2>/dev/null | to_ascii)"
-            next_beat=$((now + 300))
+        if [ $((AWAKE_NOW - start)) -lt 5 ]; then sleep 0.2; else sleep 2; fi
+        tick
+        # It may have finished while the Mac slept (CSMB-036's CLT install
+        # had printed "Done." and was then killed as over its limit).
+        kill -0 "$pid" 2>/dev/null || break
+        if [ "$AWAKE_NOW" -ge "$next_beat" ]; then
+            log "    ...still running ($((AWAKE_NOW - start))s): $(tail -n 1 "$STEP_LOG" 2>/dev/null | to_ascii | cut -c1-100)"
+            next_beat=$((AWAKE_NOW + 300))
         fi
-        if [ "$limit" -gt 0 ] && [ $((now - start)) -ge "$limit" ]; then
+        if [ "$limit" -gt 0 ] && [ $((AWAKE_NOW - start)) -ge "$limit" ]; then
             if [ "$limit_is_budget" -eq 1 ]; then
                 log "    RUN_BUDGET (${RUN_BUDGET}s) used up -- stopping $STEP_TOOL and skipping the remaining steps."
                 BUDGET_SPENT=1
@@ -429,15 +676,21 @@ run_limited() {
         TIMED_OUT=1
         rc=124
     fi
+    tick
     tail -n "$TAIL_LINES" "$STEP_LOG" 2>/dev/null | filter_brew_output | while IFS= read -r l; do
-        log "    $l"
+        detail "    $l"
     done
     if [ "$rc" -ne 0 ]; then
-        step_error_lines "$STEP_LOG" "$TAIL_LINES" | while IFS= read -r l; do
-            log "    (earlier) $l"
-        done
+        # Whole log, not just the tail: brew names the formula that broke a
+        # batch near the top. A heredoc, not a pipe, so log's byte count sticks.
+        while IFS= read -r l; do
+            [ -n "$l" ] && log "    ! $l"
+        done <<EOF
+$(step_error_lines "$STEP_LOG" 0)
+EOF
     fi
-    log "    exit $rc after $(( $(date +%s) - start ))s"
+    rl_slept=$(( SLEPT - slept_before ))
+    log "    exit $rc after $(( AWAKE_NOW - start ))s$( [ "$rl_slept" -gt 0 ] && echo " (+${rl_slept}s asleep, not counted)")"
     return "$rc"
 }
 
@@ -449,6 +702,7 @@ run_step() {
     STEP_LOG="$LOG_DIR/homebrew_${PREFIX_TAG}_${rs_step}.log"
     : > "$STEP_LOG"
     STEP_TOOL=$(basename "$rs_bin")
+    STEP_NAME="$rs_step"
     log "  $STEP_TOOL $*"
     attempt=1
     while :; do
@@ -471,7 +725,8 @@ run_step() {
         rs_rc=$?
         xcode_license_blocked "$STEP_LOG" && SAW_XCODE_LICENSE=1
         clt_outdated "$STEP_LOG" && SAW_OLD_CLT=1
-        if [ "$rs_rc" -eq 0 ] || [ "$rs_rc" -eq 124 ] || [ "$attempt" -ge 2 ] || ! is_transient_failure "$STEP_LOG"; then
+        if [ "$rs_rc" -eq 0 ] || [ "$rs_rc" -ge 124 ] || [ "$attempt" -ge 2 ] || ! is_transient_failure "$STEP_LOG"; then
+            collect_brew_findings
             return "$rs_rc"
         fi
         log "    network error -- retrying once in ${RETRY_DELAY}s"
@@ -481,12 +736,27 @@ run_step() {
     done
 }
 
+# Things brew reports in passing that the SUMMARY must name: untrusted taps
+# (brew silently skips what they installed) and formulae left unlinked.
+collect_brew_findings() {
+    UNTRUSTED_TAPS="$UNTRUSTED_TAPS $(untrusted_taps "$STEP_LOG" | tr '\n' ' ')"
+    UNTRUSTED_ITEMS="$UNTRUSTED_ITEMS $(untrusted_items "$STEP_LOG" | tr '\n' ' ')"
+    while IFS= read -r cf_l; do
+        [ -n "$cf_l" ] || continue
+        log "    NOT LINKED $cf_l"
+        add_issue "$PREFIX: ${cf_l%%:*} is installed but not linked (${cf_l#*: }); check what owns the file, then as $BREW_USER: brew link --overwrite ${cf_l%%:*}"
+    done <<EOF
+$(link_failures "$STEP_LOG")
+EOF
+}
+
 # Run a root command (xcodebuild, softwareupdate) through the same limits.
 run_root_step() {
     step="$1"; limit="$2"; shift 2
     STEP_LOG="$LOG_DIR/homebrew_system_${step}.log"
     : > "$STEP_LOG"
     STEP_TOOL=$(basename "$1")
+    STEP_NAME="$step"
     log "  $*"
     run_limited "$limit" "$@"
 }
@@ -606,7 +876,9 @@ maintain_ruby_gems() {
                     run_step "gem_${rlabel}_${g}" "$CASK_TIMEOUT" "$gembin" install "$g" --no-document
                 fi
                 gi_rc=$?
-                [ "$gi_rc" -ne 0 ] && add_issue "$rlabel: gem install $g ${req:+($req) }failed, exit $gi_rc -- $STEP_LOG"
+                if [ "$gi_rc" -ne 0 ] && [ "$gi_rc" -ne 125 ]; then
+                    add_issue "$rlabel: gem install $g ${req:+($req) }failed, exit $gi_rc -- $STEP_LOG"
+                fi
                 TIMED_OUT=0
             done <<EOF
 $(gem_install_requirements "$mode" "$vers")
@@ -663,9 +935,15 @@ EOF
 # Full Xcode with an unaccepted license blocks every brew call; the CLT-only
 # developer dir has no license to accept.
 check_xcode_license() {
-    xdev=$(xcode-select -p 2>/dev/null) || return 0
+    if ! xdev=$(xcode-select -p 2>/dev/null); then
+        log "  No developer tools selected (xcode-select -p failed)."
+        return 0
+    fi
     case "$xdev" in *.app/Contents/Developer) ;; *) return 0 ;; esac
-    xcodebuild -license check >/dev/null 2>&1 && return 0
+    if xcodebuild -license check >/dev/null 2>&1; then
+        log "  Xcode license accepted ($xdev)."
+        return 0
+    fi
     if [ "$DRY_RUN" = "1" ]; then
         log "  [DRY_RUN] Xcode license not accepted ($xdev) -- would accept it"
     elif [ "$ACCEPT_XCODE_LICENSE" = "1" ]; then
@@ -679,15 +957,29 @@ check_xcode_license() {
     fi
 }
 
+clt_installed_version() {
+    pkgutil --pkg-info=com.apple.pkg.CLTools_Executables 2>/dev/null | sed -n 's/^version:[[:space:]]*//p'
+}
+
 update_command_line_tools() {
-    pkgutil --pkg-info=com.apple.pkg.CLTools_Executables >/dev/null 2>&1 || return 0
+    if ! pkgutil --pkg-info=com.apple.pkg.CLTools_Executables >/dev/null 2>&1; then
+        log "  Command Line Tools package not installed -- not checked (brew uses ${xdev:-the selected developer dir})."
+        return 0
+    fi
     if ! run_root_step clt_list 600 softwareupdate --list; then
+        TIMED_OUT=0
         log "  softwareupdate --list failed -- Command Line Tools not checked."
+        add_note "Command Line Tools not checked (softwareupdate --list failed)"
+        return 0
+    fi
+    if softwareupdate_unreachable "$STEP_LOG"; then
+        log "  Apple Software Update server not reachable -- Command Line Tools not checked."
+        add_note "Command Line Tools not checked (Apple Software Update server not reachable)"
         return 0
     fi
     clt_label=$(clt_update_label < "$STEP_LOG")
     if [ -z "$clt_label" ]; then
-        log "  Command Line Tools are current."
+        log "  Command Line Tools are current ($(clt_installed_version))."
         return 0
     fi
     if [ "$DRY_RUN" = "1" ]; then
@@ -698,16 +990,57 @@ update_command_line_tools() {
             return 0
         fi
         TIMED_OUT=0
-        add_issue "Command Line Tools update '$clt_label' failed to install -- $STEP_LOG"
+        # softwareupdate can finish the install and still be stopped or exit
+        # non-zero; what pkgutil reports is what brew will see.
+        ci_have=$(clt_installed_version)
+        if clt_version_covers "$ci_have" "$(clt_label_version "$clt_label")"; then
+            drop_issues_for "$STEP_LOG"
+            log "  Installed $clt_label (pkgutil reports $ci_have)."
+            return 0
+        fi
+        add_issue "Command Line Tools update '$clt_label' failed to install (pkgutil reports ${ci_have:-nothing}) -- $STEP_LOG"
     else
         add_issue "Command Line Tools update pending: softwareupdate --install '$clt_label' (or set UPDATE_CLT=1)"
     fi
 }
 
+# Wait (awake time) until every probe host answers, at most NETWORK_WAIT.
+# Sets OFFLINE=1 when none answer; a partial outage is only reported.
+check_network() {
+    cn_waited_from=$AWAKE_NOW
+    cn_said=0
+    while :; do
+        cn_down=$(unreachable_hosts "$NET_PROBE_HOSTS" | tr '\n' ' ' | sed 's/ $//')
+        [ -z "$cn_down" ] && break
+        tick
+        [ $(( AWAKE_NOW - cn_waited_from )) -ge "${NETWORK_WAIT:-0}" ] && break
+        if [ "$cn_said" -eq 0 ]; then
+            log "  No answer from: $cn_down -- waiting up to ${NETWORK_WAIT}s for the network."
+            cn_said=1
+        fi
+        sleep "$NETWORK_POLL"
+        tick
+    done
+    tick
+    cn_waited=$(( AWAKE_NOW - cn_waited_from ))
+    if [ -z "$cn_down" ]; then
+        log "  Network OK ($NET_PROBE_HOSTS answer)$( [ "$cn_said" -eq 1 ] && echo " after ${cn_waited}s")."
+    elif [ "$cn_down" = "$(echo $NET_PROBE_HOSTS)" ]; then
+        OFFLINE=1
+        log "  OFFLINE: none of $NET_PROBE_HOSTS answered within ${cn_waited}s. Not running brew."
+    else
+        log "  WARNING: no answer from $cn_down -- brew steps that need it will fail."
+        add_issue "no answer from $cn_down at the start (proxy, filter or DNS?); brew steps that need it fail"
+    fi
+}
+
 log ""
-log "[0] Xcode license and Command Line Tools"
-check_xcode_license
-update_command_line_tools
+log "[0] Network, Xcode license and Command Line Tools"
+check_network
+if [ "$OFFLINE" -eq 0 ]; then
+    check_xcode_license
+    update_command_line_tools
+fi
 TIMED_OUT=0
 
 NO_AUTOREMOVE_ENV="HOMEBREW_NO_AUTOREMOVE=1"
@@ -716,8 +1049,24 @@ NO_AUTOREMOVE_ENV="HOMEBREW_NO_AUTOREMOVE=1"
 GREEDY_FLAG=""
 [ "$GREEDY" = "1" ] && GREEDY_FLAG="--greedy"
 
+grant_sudo() {
+    sudoers_line "$BREW_USER" > "$SUDOERS_FILE.tmp"
+    chmod 440 "$SUDOERS_FILE.tmp"
+    if visudo -cf "$SUDOERS_FILE.tmp" >/dev/null 2>&1; then
+        mv -f "$SUDOERS_FILE.tmp" "$SUDOERS_FILE"
+        log "  Temporary passwordless sudo granted to $BREW_USER${1:+ for $1} (removed on exit)."
+    else
+        rm -f "$SUDOERS_FILE.tmp"
+        log "  WARNING: sudoers drop-in failed validation -- not granting sudo."
+    fi
+}
+
+FAILED_REASONS=""
+[ "$OFFLINE" -eq 1 ] && PREFIXES=""
 for PREFIX in $PREFIXES; do
     PREFIX_TAG=$(echo "$PREFIX" | tr '/' '_' | sed 's/^_//')
+    UNTRUSTED_TAPS=""
+    UNTRUSTED_ITEMS=""
     log ""
     log "################ $PREFIX ################"
 
@@ -750,9 +1099,22 @@ for PREFIX in $PREFIXES; do
 
     log ""
     log "[1] brew update"
-    if ! run_brew update "$BREW_TIMEOUT" update; then
-        log "  WARNING: brew update failed -- upgrading against the existing catalog."
-        add_issue "$PREFIX: brew update failed, so newer versions may be missing from the outdated list -- $STEP_LOG"
+    run_brew update "$BREW_TIMEOUT" update
+    up_rc=$?
+    if [ "$up_rc" -eq 125 ]; then
+        log "  brew update did not run -- upgrading against the existing catalog."
+    elif [ "$up_rc" -eq 124 ]; then
+        log "  WARNING: brew update was stopped -- upgrading against the existing catalog."
+        add_issue "$PREFIX: brew update did not finish (stopped at its time limit), so newer versions may be missing -- $STEP_LOG"
+    elif [ "$up_rc" -ne 0 ]; then
+        # brew update reinstalls formulae built for another macOS; a link
+        # conflict there exits 1 after the catalog WAS fetched (ARMB-09).
+        if ! update_fetch_failed "$STEP_LOG" && [ -n "$(link_failures "$STEP_LOG")" ]; then
+            log "  Catalog updated; the formula brew reinstalled afterwards is not linked (NOT LINKED above)."
+        else
+            log "  WARNING: brew update failed -- upgrading against the existing catalog."
+            add_issue "$PREFIX: brew update failed, so newer versions may be missing from the outdated list -- $STEP_LOG"
+        fi
     fi
 
     log ""
@@ -760,8 +1122,10 @@ for PREFIX in $PREFIXES; do
     OUT_F=$(brew_query outdated --formula --quiet)
     OUT_C=$(brew_query outdated --cask --quiet $GREEDY_FLAG)
     PINNED=$(brew_query list --pinned)
-    brew_query outdated --formula --verbose | while IFS= read -r l; do [ -n "$l" ] && log "  formula  $l"; done
-    brew_query outdated --cask --verbose $GREEDY_FLAG | while IFS= read -r l; do [ -n "$l" ] && log "  cask     $l"; done
+    brew_query outdated --formula --verbose | while IFS= read -r l; do [ -n "$l" ] && detail "  formula  $l"; done
+    brew_query outdated --cask --verbose $GREEDY_FLAG | while IFS= read -r l; do [ -n "$l" ] && detail "  cask     $l"; done
+    [ -n "$OUT_F" ] && log "  formulae ($(echo $OUT_F | wc -w | tr -d ' ')): $(echo $OUT_F)"
+    [ -n "$OUT_C" ] && log "  casks ($(echo $OUT_C | wc -w | tr -d ' ')): $(echo $OUT_C)"
     [ -z "$OUT_F$OUT_C" ] && log "  Everything is current."
 
     PINNED_OUT=$(list_and "$OUT_F" "$PINNED")
@@ -787,10 +1151,14 @@ for PREFIX in $PREFIXES; do
     if [ -n "$DO_F" ]; then
         # One call, so brew orders dependencies itself.
         # shellcheck disable=SC2086
-        if ! run_brew formulae "$BREW_TIMEOUT" upgrade --formula $DO_F; then
-            log "  WARNING: formula upgrade reported errors (the Error lines above; what is left is listed in [6])."
-            first_err=$(grep -m1 -E '^Error:' "$STEP_LOG" 2>/dev/null | to_ascii)
-            add_issue "$PREFIX: brew upgrade --formula failed${first_err:+: $first_err} -- $STEP_LOG"
+        run_brew formulae "$BREW_TIMEOUT" upgrade --formula $DO_F
+        fo_rc=$?
+        if [ "$fo_rc" -ne 0 ] && [ "$fo_rc" -ne 125 ]; then
+            log "  WARNING: formula upgrade reported errors (the ! lines above; what is left is listed in [6])."
+            first_err=$(grep -E '^Error:' "$STEP_LOG" 2>/dev/null | grep -vF 'The `brew link` step did not complete' | head -n 1 | to_ascii)
+            if [ -n "$first_err" ] || [ -z "$(link_failures "$STEP_LOG")" ]; then
+                add_issue "$PREFIX: brew upgrade --formula failed${first_err:+: $first_err} -- $STEP_LOG"
+            fi
         fi
     else
         log "  Nothing to upgrade."
@@ -800,22 +1168,20 @@ for PREFIX in $PREFIXES; do
     log "[4] Casks (one at a time)"
     if [ -n "$DO_C" ] && [ "$TIMED_OUT" -eq 1 ]; then
         log "  Skipped (an earlier step hit its time limit): $(echo $DO_C)"
+        SKIPPED_STEPS="${SKIPPED_STEPS}${SKIPPED_STEPS:+, }casks ($(echo $DO_C))"
     elif [ -n "$DO_C" ]; then
-        if [ "$CASK_SUDO" = "1" ]; then
-            sudoers_line "$BREW_USER" > "$SUDOERS_FILE.tmp"
-            chmod 440 "$SUDOERS_FILE.tmp"
-            if visudo -cf "$SUDOERS_FILE.tmp" >/dev/null 2>&1; then
-                mv -f "$SUDOERS_FILE.tmp" "$SUDOERS_FILE"
-                log "  Temporary passwordless sudo granted to $BREW_USER (removed on exit)."
-            else
-                rm -f "$SUDOERS_FILE.tmp"
-                log "  WARNING: sudoers drop-in failed validation -- not granting sudo."
-            fi
-        fi
+        [ "$CASK_SUDO" = "1" ] && grant_sudo
         for c in $DO_C; do
+            if [ "$CASK_SUDO" != "1" ] && cask_sudo_wanted "$c" "$CASK_SUDO"; then
+                grant_sudo "$c"
+            fi
             # shellcheck disable=SC2086
-            if run_brew "cask_$c" "$CASK_TIMEOUT" upgrade --cask $GREEDY_FLAG "$c"; then
+            run_brew "cask_$c" "$CASK_TIMEOUT" upgrade --cask $GREEDY_FLAG "$c"
+            ca_rc=$?
+            if [ "$ca_rc" -eq 0 ]; then
                 log "  OK       $c"
+            elif [ "$ca_rc" -eq 125 ]; then
+                log "  SKIPPED  $c"
             elif [ "$REPAIR_CASKS" = "1" ] && cask_app_missing "$STEP_LOG" \
                 && run_brew "cask_${c}_uninstall" "$CASK_TIMEOUT" uninstall --cask --force "$c" \
                 && run_brew "cask_${c}_install" "$CASK_TIMEOUT" install --cask "$c"; then
@@ -824,7 +1190,10 @@ for PREFIX in $PREFIXES; do
                 reason=$(cask_failure_reason "$STEP_LOG")
                 log "  FAILED   $c -- $reason"
                 FAILED="$FAILED $c"
+                FAILED_REASONS="${FAILED_REASONS}${FAILED_REASONS:+
+}$c -- $reason"
             fi
+            [ "$CASK_SUDO" != "1" ] && remove_sudoers
             # One slow cask should not cost the rest of the list.
             TIMED_OUT=0
         done
@@ -843,12 +1212,36 @@ for PREFIX in $PREFIXES; do
     log "[5] brew cleanup (superseded kegs, old portable-ruby, download cache)"
     # Old Cellar/<formula>/<version> kegs are what Tenable keeps reporting
     # after an upgrade; this is the step that clears them.
-    if run_brew cleanup "$BREW_TIMEOUT" cleanup --prune=all; then
+    run_brew cleanup "$BREW_TIMEOUT" cleanup --prune=all
+    cl_rc=$?
+    # A superseded keg with files root left behind (python@3.10 __pycache__
+    # on CSMB-020): brew names it; hand it back to the brew user, run again.
+    cl_fixed=0
+    if [ "$cl_rc" -ne 0 ] && [ "$cl_rc" -lt 124 ]; then
+        while IFS= read -r cp_path; do
+            case "$cp_path" in "$PREFIX"/*) ;; *) continue ;; esac
+            case "$cp_path" in *..*) continue ;; esac
+            [ -e "$cp_path" ] || continue
+            if chown -R "$BREW_USER" "$cp_path" 2>/dev/null; then
+                log "  FIXED    $cp_path had files brew could not remove -- chowned to $BREW_USER"
+                cl_fixed=1
+            else
+                log "  WARNING: could not chown $cp_path to $BREW_USER"
+            fi
+        done <<EOF
+$(cleanup_permission_paths "$STEP_LOG")
+EOF
+    fi
+    if [ "$cl_fixed" -eq 1 ]; then
+        run_brew cleanup_retry "$BREW_TIMEOUT" cleanup --prune=all
+        cl_rc=$?
+    fi
+    if [ "$cl_rc" -eq 0 ]; then
         for f in $(brew_query list --formula); do
             n=$(find "$PREFIX/Cellar/$f" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
             [ "${n:-0}" -gt 1 ] && log "  NOTE     $f still has $n kegs in $PREFIX/Cellar (pinned, or in use by a dependent)"
         done
-    else
+    elif [ "$cl_rc" -ne 125 ]; then
         log "  WARNING: cleanup reported errors -- superseded kegs may still be on disk."
         add_issue "$PREFIX: brew cleanup failed, so old kegs Tenable reports may remain -- $STEP_LOG"
     fi
@@ -860,10 +1253,16 @@ for PREFIX in $PREFIXES; do
     LEFT=$(printf '%s\n%s\n' "$(brew_query outdated --formula --quiet)" "$(brew_query outdated --cask --quiet $GREEDY_FLAG)")
     LEFT=$(echo $LEFT)
     if [ -n "$LEFT" ]; then
-        for n in $LEFT; do log "  $n"; done
+        log "  $LEFT"
         REMAINING="$REMAINING $LEFT"
     else
         log "  None."
+    fi
+    UT=$(printf '%s\n' $UNTRUSTED_TAPS | awk 'NF && !seen[$0]++' | tr '\n' ' ' | sed 's/ $//')
+    if [ -n "$UT" ]; then
+        UI=$(printf '%s\n' $UNTRUSTED_ITEMS | awk 'NF && !seen[$0]++' | tr '\n' ' ' | sed 's/ $//')
+        log "  UNTRUSTED taps: $UT -- brew ignores ${UI:-what they installed}"
+        add_issue "$PREFIX: untrusted taps ($UT) -- brew neither upgrades nor lists ${UI:-what they installed}. As $BREW_USER: brew trust --formula <tap>/<name>, or brew untap <tap>"
     fi
 done
 
@@ -872,21 +1271,47 @@ FAILED=$(echo $FAILED)
 
 [ "$SAW_XCODE_LICENSE" -eq 1 ] && add_issue "brew output says the Xcode license is not accepted -- run 'sudo xcodebuild -license accept'"
 [ "$SAW_OLD_CLT" -eq 1 ] && add_issue "brew output says the Command Line Tools are outdated -- softwareupdate --list, then install the 'Command Line Tools for Xcode' label"
-[ "$BUDGET_SPENT" -eq 1 ] && add_issue "RUN_BUDGET (${RUN_BUDGET}s) used up; the steps after that were skipped"
+if [ "$BUDGET_SPENT" -eq 1 ]; then
+    add_issue "RUN_BUDGET (${RUN_BUDGET}s awake) used up; not run: ${SKIPPED_STEPS:-the remaining steps}"
+elif [ -n "$SKIPPED_STEPS" ]; then
+    add_issue "not run after a time limit: $SKIPPED_STEPS"
+fi
 ISSUES=$(printf '%s\n' "$ISSUES" | awk 'NF && !seen[$0]++')
+tick
 
 log ""
+set_output_phase summary
 log "================ SUMMARY ================"
+log "Logs: $LOG_DIR (homebrew_update.log has everything; step logs named below)"
+[ "$SLEPT" -gt 0 ] && log "Mac was asleep ${SLEPT}s of $(( $(date +%s) - SCRIPT_START ))s (not counted against limits)"
 [ "$GEMS_REMOVED" -gt 0 ] && log "Ruby gem specs removed: $GEMS_REMOVED"
-[ -n "$FAILED" ] && log "Failed casks : $FAILED  (reasons above; logs: $LOG_DIR/homebrew_*_cask_<name>.log)"
+if [ -n "$FAILED" ]; then
+    log "Failed casks:"
+    while IFS= read -r l; do [ -n "$l" ] && log "  - $l"; done <<EOF
+$FAILED_REASONS
+EOF
+fi
 if [ -n "$REMAINING" ]; then
     log "Still outdated: $REMAINING"
     NEEDS_HUMAN=1
 fi
 if [ -n "$ISSUES" ]; then
     log "Problems:"
-    printf '%s\n' "$ISSUES" | while IFS= read -r l; do log "  - $l"; done
+    while IFS= read -r l; do log "  - $l"; done <<EOF
+$(printf '%s\n' "$ISSUES" | sed "s#$LOG_DIR/##g")
+EOF
     NEEDS_HUMAN=1
+fi
+if [ -n "$NOTES" ]; then
+    while IFS= read -r l; do [ -n "$l" ] && log "Note: $l"; done <<EOF
+$NOTES
+EOF
+fi
+set_output_phase final
+if [ "$OFFLINE" -eq 1 ]; then
+    log "RESULT: OFFLINE -- no network for ${NETWORK_WAIT}s; nothing was changed. The next scheduled run tries again."
+    log "===== END ====="
+    exit 1
 fi
 if [ "$FATAL" -eq 1 ]; then
     log "RESULT: at least one Homebrew prefix could not be maintained (see ERROR above)."
