@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
-    Updates Oracle Java SE 8 JRE (64-bit and 32-bit) to 8u511 b32 BPR or
-    later. Nessus plugin 371349 (CVE-2026-91403 Security Alert); also
+    Updates Oracle Java SE 8 JRE (64-bit and 32-bit) to exactly 8u511 b32 BPR,
+    or leaves a later update alone. Nessus plugin 371349 (CVE-2026-91403 Security Alert); also
     clears the older 338352 / 329223 / 309197 findings.
 
 .DESCRIPTION
@@ -33,12 +33,21 @@
     and CSLT-159 had only that one. A staged installer whose own version is
     below the target is refused before anything runs.
 
+    v3 (2026-11-02, CSLT-136): the target is the exact build, not a minimum.
+    v2 accepted an 8u511 b33 installer as 'b32 or later'; it installed, the
+    script reported OK, and plugin 371349 still flagged 8.0.511.33. Now only
+    the builds in $FixedBuilds (b32) pass at 8u511; any later update passes.
+    A wrong build of the target update is uninstalled (msiexec /x, product code
+    from Add/Remove Programs, both registry views) before the installer runs,
+    because every 8u511 build shares the jre1.8.0_511 folder and product code
+    and the installer cannot replace it in place.
+
 .PARAMETER InstallerPath
-    Full path to the 64-bit jre-8u511-windows-x64.exe (b32 BPR or later).
+    Full path to the 64-bit jre-8u511-windows-x64.exe (b32 BPR; file version 8.0.5110.32).
     Defaults to the newest jre-8u*-windows-x64.exe beside this script, then C:\.
 
 .PARAMETER InstallerPathX86
-    Full path to the 32-bit jre-8u511-windows-i586.exe (b32 BPR or later).
+    Full path to the 32-bit jre-8u511-windows-i586.exe (b32 BPR; file version 8.0.5110.32).
     Defaults to the newest jre-8u*-windows-i586.exe beside this script, then C:\.
     Only needed when a 32-bit JRE is installed.
 
@@ -77,7 +86,10 @@ $LogFile = $LogDir + '\OracleJRE8Update_' + (Get-Date -Format 'yyyyMMdd_HHmmss')
 # hosts would have passed a 503 target. The build matters: 8u511 GA is
 # vulnerable, 8u511 b32 (BPR) is the fix.
 $TargetUpdate = 511
-$TargetBuild  = 32
+# Builds Tenable accepts at the target update. Exact list, not a minimum: 8u511 b33
+# installed on CSLT-136 (2026-10-30) and plugin 371349 still flagged 8.0.511.33.
+# Any later update (8u521+) counts as fixed.
+$FixedBuilds  = @(32)
 
 function Write-Log {
     param([string]$Msg, [string]$Level = 'INFO')
@@ -97,12 +109,65 @@ function ConvertTo-JavaVersion {
 }
 
 function Test-JavaAtTarget {
-    # An unknown build at the target update counts as vulnerable: it may be GA.
-    param($Version, [int]$TargetUpdate, [int]$TargetBuild)
+    # At the target update only the listed builds are fixed; GA, other BPRs and an
+    # unknown build all count as vulnerable.
+    param($Version, [int]$TargetUpdate, [int[]]$FixedBuilds)
     if ($null -eq $Version) { return $false }
     if ($Version.Update -gt $TargetUpdate) { return $true }
     if ($Version.Update -lt $TargetUpdate) { return $false }
-    return ($null -ne $Version.Build -and $Version.Build -ge $TargetBuild)
+    return ($null -ne $Version.Build -and ($FixedBuilds -contains [int]$Version.Build))
+}
+
+function Test-NeedsSameUpdateRemoval {
+    # Every build of one update shares the jre1.8.0_NNN folder and the MSI product
+    # code, so the installer cannot replace a wrong build of the target update in
+    # place. That install has to be removed first.
+    param($Version, [int]$TargetUpdate, [int[]]$FixedBuilds)
+    if ($null -eq $Version -or $Version.Update -ne $TargetUpdate) { return $false }
+    return -not (Test-JavaAtTarget -Version $Version -TargetUpdate $TargetUpdate -FixedBuilds $FixedBuilds)
+}
+
+function Select-JavaArpEntry {
+    # The Add/Remove Programs entry for one JRE folder: InstallLocation match first,
+    # then display name + architecture when InstallLocation is blank.
+    param($Entries, [string]$JrePath, [int]$Update, [string]$Arch)
+    $want = $JrePath.TrimEnd('\').ToLowerInvariant()
+    foreach ($e in @($Entries)) {
+        if (-not $e.ProductCode) { continue }
+        $loc = ('' + $e.InstallLocation).TrimEnd('\').ToLowerInvariant()
+        if ($loc -and $loc -eq $want) { return $e }
+    }
+    foreach ($e in @($Entries)) {
+        if (-not $e.ProductCode -or ('' + $e.InstallLocation)) { continue }
+        if ($e.DisplayName -notmatch ('^Java 8 Update ' + $Update + '(\s|$)')) { continue }
+        $is64 = $e.DisplayName -match '\(64-bit\)'
+        if (($Arch -eq 'x64') -eq $is64) { return $e }
+    }
+    return $null
+}
+
+function Get-JavaArpEntries {
+    # Both registry views: the EC agent is 32-bit, and the 64-bit JRE registers only
+    # in the 64-bit view.
+    $out = @()
+    $sub = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
+    foreach ($view in @([Microsoft.Win32.RegistryView]::Registry64, [Microsoft.Win32.RegistryView]::Registry32)) {
+        try { $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, $view) } catch { continue }
+        $root = $base.OpenSubKey($sub)
+        if (-not $root) { continue }
+        foreach ($name in $root.GetSubKeyNames()) {
+            $k = $root.OpenSubKey($name)
+            if (-not $k) { continue }
+            $dn = '' + $k.GetValue('DisplayName')
+            if ($dn -match '^Java 8 Update \d+') {
+                $pc = if ($name -match '^\{[0-9A-Fa-f-]{36}\}$') { $name } else { $null }
+                $out += [pscustomobject]@{ DisplayName = $dn; DisplayVersion = '' + $k.GetValue('DisplayVersion'); InstallLocation = '' + $k.GetValue('InstallLocation'); ProductCode = $pc; View = '' + $view }
+            }
+            $k.Close()
+        }
+        $root.Close()
+    }
+    return $out
 }
 
 function Get-JavaExeVersion {
@@ -141,17 +206,17 @@ function Format-JavaVersion {
 if ($env:ORACLEJAVA8_DOTSOURCE -eq '1') { return }
 
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
-$targetLabel = '8u' + $TargetUpdate + ' b' + $TargetBuild
+$targetLabel = '8u' + $TargetUpdate + ' b' + ($FixedBuilds -join '/b')
 
 $arches = @(
-    @{ Arch = 'x64'; Root = 'C:\Program Files\Java';       Pattern = 'jre-8u*-windows-x64.exe';  Installer = $InstallerPath },
-    @{ Arch = 'x86'; Root = 'C:\Program Files (x86)\Java'; Pattern = 'jre-8u*-windows-i586.exe'; Installer = $InstallerPathX86 }
+    @{ Arch = 'x64'; Root = 'C:\Program Files\Java';       Pattern = 'jre-8u*-windows-x64.exe';  Installer = $InstallerPath;    Remove = @() },
+    @{ Arch = 'x86'; Root = 'C:\Program Files (x86)\Java'; Pattern = 'jre-8u*-windows-i586.exe'; Installer = $InstallerPathX86; Remove = @() }
 )
 
 Write-Log '=============================================='
-Write-Log ' Oracle JRE 8 Update (v2) -- Plugins 371349 / 338352 / 329223'
+Write-Log ' Oracle JRE 8 Update (v3) -- Plugins 371349 / 338352 / 329223'
 Write-Log (' Host   : ' + $env:COMPUTERNAME)
-Write-Log (' Target : ' + $targetLabel + ' (BPR) or later')
+Write-Log (' Target : ' + $targetLabel + ' (BPR, exact build) or 8u' + ($TargetUpdate + 1) + '+')
 Write-Log (' DryRun : ' + $DryRun)
 Write-Log '=============================================='
 Write-Log 'SCOPE: production shopfloor (Pierce). Ensure Marvin/OT approval and'
@@ -168,15 +233,19 @@ foreach ($a in $arches) {
     if ($inv.Count -eq 0) { Write-Log ('  ' + $a.Arch + ': no jre1.8.0_XXX folder under ' + $a.Root); continue }
     $old = @()
     foreach ($j in $inv) {
-        $ok = Test-JavaAtTarget -Version $j -TargetUpdate $TargetUpdate -TargetBuild $TargetBuild
+        $ok = Test-JavaAtTarget -Version $j -TargetUpdate $TargetUpdate -FixedBuilds $FixedBuilds
         $state = if ($ok) { 'OK' } else { 'VULNERABLE' }
         Write-Log ('  ' + $a.Arch + ': ' + $j.Name + '  ' + (Format-JavaVersion $j) + '  [' + $j.Source + ']  ' + $state)
         if (-not $ok) { $old += $j }
+        if (Test-NeedsSameUpdateRemoval -Version $j -TargetUpdate $TargetUpdate -FixedBuilds $FixedBuilds) {
+            Write-Log ('  ' + $a.Arch + ': ' + $j.Name + ' is the target update but the wrong build; it must be uninstalled before ' + $targetLabel + ' can install.') -Level WARN
+            $a.Remove += $j
+        }
     }
     if ($old.Count -gt 0) { $needed += $a }
 }
 if ($needed.Count -eq 0) {
-    Write-Log ('  Every installed Java 8 JRE is at ' + $targetLabel + ' or later. Nothing to do.')
+    Write-Log ('  Every installed Java 8 JRE is ' + $targetLabel + ' or a later update. Nothing to do.')
     Write-Log '=============================================='
     exit 0
 }
@@ -207,10 +276,11 @@ foreach ($a in $needed) {
     $iv = ConvertTo-JavaVersion -Text ([string](Get-Item -LiteralPath $a.Installer).VersionInfo.FileVersion)
     if ($null -eq $iv) {
         Write-Log ('  ' + $a.Arch + ' installer: ' + $a.Installer + '  (version unreadable -- verification after install decides)') -Level WARN
-    } elseif (-not (Test-JavaAtTarget -Version $iv -TargetUpdate $TargetUpdate -TargetBuild $TargetBuild)) {
-        Write-Log ('  ' + $a.Arch + ' installer ' + $a.Installer + ' is ' + (Format-JavaVersion $iv) + ', below ' + $targetLabel + '.') -Level ERROR
-        Write-Log '  Installing it would leave the finding open. Stage the 8u511 b32 BPR' -Level ERROR
-        Write-Log '  (My Oracle Support patch, not the public 8u511 GA download).' -Level ERROR
+    } elseif (-not (Test-JavaAtTarget -Version $iv -TargetUpdate $TargetUpdate -FixedBuilds $FixedBuilds)) {
+        Write-Log ('  ' + $a.Arch + ' installer ' + $a.Installer + ' is ' + (Format-JavaVersion $iv) + ', not ' + $targetLabel + '.') -Level ERROR
+        Write-Log '  Installing it would leave the finding open: Tenable accepts only the listed build(s)' -Level ERROR
+        Write-Log ('  at 8u' + $TargetUpdate + ' (8.0.' + $TargetUpdate + '.33 stayed flagged on CSLT-136). Stage the ' + $targetLabel + ' BPR:') -Level ERROR
+        Write-Log ('  the installer file version must read 8.0.' + $TargetUpdate + '0.' + ($FixedBuilds -join ' or ') + '.') -Level ERROR
         exit 1
     } else {
         Write-Log ('  ' + $a.Arch + ' installer: ' + $a.Installer + '  (' + (Format-JavaVersion $iv) + ')')
@@ -259,6 +329,35 @@ Write-Log '[4/5] Installing updated JRE(s)...'
 foreach ($a in $needed) {
     $installLog = $LogDir + '\jre_install_' + $a.Arch + '.log'
     $installArgs = '/s STATIC=0 AUTO_UPDATE=0 WEB_JAVA=0 REMOVEOUTOFDATEJRES=1 NOSTARTMENU=1 SPONSORS=0 /L "' + $installLog + '"'
+    if ($a.Remove.Count -gt 0) {
+        $arp = @(Get-JavaArpEntries)
+        foreach ($j in $a.Remove) {
+            $e = Select-JavaArpEntry -Entries $arp -JrePath $j.Path -Update $j.Update -Arch $a.Arch
+            if (-not $e) {
+                Write-Log ('  ' + $a.Arch + ': no Add/Remove Programs entry with a product code for ' + $j.Path + '.') -Level ERROR
+                Write-Log ('  Uninstall Java 8 Update ' + $j.Update + ' (' + (Format-JavaVersion $j) + ') by hand, then re-run. Nothing was changed.') -Level ERROR
+                exit 1
+            }
+            $uLog = $LogDir + '\jre_uninstall_' + $a.Arch + '_' + $j.Update + '.log'
+            $q = [string][char]34
+            $uArgs = '/x ' + $e.ProductCode + ' /qn /norestart /L*v ' + $q + $uLog + $q
+            if ($DryRun) {
+                Write-Log ('  [DRYRUN] ' + $a.Arch + ': would uninstall ' + $e.DisplayName + ' ' + $e.DisplayVersion + ' (' + $e.ProductCode + ') first')
+                continue
+            }
+            Write-Log ('  ' + $a.Arch + ': uninstalling ' + $e.DisplayName + ' ' + $e.DisplayVersion + ' (' + $e.ProductCode + ') so ' + $targetLabel + ' can install into ' + $j.Name) -Level WARN
+            Write-Log ('  Java ' + $j.Update + ' (' + $a.Arch + ') is absent until the install below finishes.') -Level WARN
+            $msiexec = $env:WINDIR + '\System32\msiexec.exe'
+            $up = Start-Process -FilePath $msiexec -ArgumentList $uArgs -Wait -PassThru -NoNewWindow
+            Write-Log ('  uninstall exit code: ' + $up.ExitCode + '  (see ' + $uLog + ')')
+            Start-Sleep -Seconds 3
+            $leftVersion = ConvertTo-JavaVersion -Text (Get-JavaExeVersion -JreDir $j.Path)
+            if ($leftVersion -and $leftVersion.Build -eq $j.Build) {
+                Write-Log ('  ' + $j.Path + ' is still ' + (Format-JavaVersion $leftVersion) + ' after uninstall. Not installing over it.') -Level ERROR
+                exit 1
+            }
+        }
+    }
     if ($DryRun) {
         Write-Log ('  [DRYRUN] ' + $a.Arch + ': would run ' + $a.Installer + ' ' + $installArgs)
         continue
@@ -268,6 +367,9 @@ foreach ($a in $needed) {
     Write-Log ('  ' + $a.Arch + ' installer exit code: ' + $proc.ExitCode + '  (see ' + $installLog + ')')
     if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) {
         Write-Log ('  ' + $a.Arch + ' install FAILED.') -Level ERROR
+        if ($a.Remove.Count -gt 0) {
+            Write-Log ('  The wrong 8u' + $TargetUpdate + ' build was already uninstalled, so this host has no ' + $a.Arch + ' Java 8u' + $TargetUpdate + ' now. Re-run promptly.') -Level ERROR
+        }
         exit 1
     }
 }
@@ -290,7 +392,7 @@ foreach ($a in $needed) {
     $haveTarget = $false
     $stillOld = @()
     foreach ($j in $inv) {
-        if (Test-JavaAtTarget -Version $j -TargetUpdate $TargetUpdate -TargetBuild $TargetBuild) {
+        if (Test-JavaAtTarget -Version $j -TargetUpdate $TargetUpdate -FixedBuilds $FixedBuilds) {
             $haveTarget = $true
             Write-Log ('  ' + $a.Arch + ': ' + $j.Name + '  ' + (Format-JavaVersion $j) + '  (OK)')
         } else {
@@ -299,7 +401,7 @@ foreach ($a in $needed) {
         }
     }
     if (-not $haveTarget) {
-        Write-Log ('  ' + $a.Arch + ': ' + $targetLabel + '+ not present after install.') -Level ERROR
+        Write-Log ('  ' + $a.Arch + ': ' + $targetLabel + ' (or a later update) not present after install.') -Level ERROR
         $bad = $true
     }
     if ($stillOld.Count -gt 0) {
@@ -314,7 +416,7 @@ if ($bad) {
     exit 1
 }
 
-Write-Log ('  ' + $targetLabel + '+ present and no vulnerable 8u folders remain.')
+Write-Log ('  ' + $targetLabel + ' (or a later update) present and no vulnerable 8u folders remain.')
 Write-Log '  Re-run a Nessus scan to confirm plugin 371349 clears.'
 Write-Log '=============================================='
 exit 0
