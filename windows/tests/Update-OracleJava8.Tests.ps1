@@ -1,9 +1,9 @@
 # Unit tests for Update-OracleJava8.ps1 version helpers.
 # Run: pwsh -NoProfile -File windows/tests/Update-OracleJava8.Tests.ps1
 #
-# Covers plugin 371349 (CVE-2026-91403 Security Alert, 2026-10-30): the fix is
-# the 8u511 b32 BPR, which installs into the same jre1.8.0_511 folder as the
-# vulnerable 8u511 GA build, so the folder name alone cannot tell them apart.
+# Covers plugins 371349 (CVE-2026-91403, fixed in 8u511 b32) and 372933
+# (CVE-2026-114820, fixed in 8u511 b33). Every 8u511 build installs into the
+# same jre1.8.0_511 folder, so the folder name alone cannot tell them apart.
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $scriptPath = Join-Path (Split-Path -Parent $here) 'Update-OracleJava8.ps1'
@@ -34,22 +34,23 @@ Assert-Eq (Fmt (ConvertTo-JavaVersion -Text '')) 'null' 'empty version is unknow
 Assert-Eq (Fmt (ConvertTo-JavaVersion -Text '21.0.13.0')) 'null' 'non-8 major is not a Java 8 version'
 
 # --- Target comparison -------------------------------------------------------
-$t = { param($u, $b) Test-JavaAtTarget -Version ([pscustomobject]@{ Update = $u; Build = $b }) -TargetUpdate 511 -FixedBuilds @(32) }
+$t = { param($u, $b) Test-JavaAtTarget -Version ([pscustomobject]@{ Update = $u; Build = $b }) -TargetUpdate 511 -TargetBuild 33 }
 Assert-True (-not (& $t 503 1)) '8u503 is vulnerable'
 Assert-True (-not (& $t 511 7)) '8u511 GA (b7) is vulnerable'
-Assert-True (& $t 511 32) '8u511 b32 BPR is fixed'
-Assert-True (-not (& $t 511 33)) 'CSLT-136: 8u511 b33 is still flagged by plugin 371349 (exact build, not a minimum)'
+Assert-True (-not (& $t 511 32)) '8u511 b32 is vulnerable to CVE-2026-114820 (plugin 372933)'
+Assert-True (& $t 511 33) 'CSLT-136: 8u511 b33 is the fix; it is not downgraded'
+Assert-True (& $t 511 40) 'a later 8u511 build is fixed'
 Assert-True (& $t 521 1) 'a later update is fixed'
 Assert-True (-not (& $t 511 $null)) '8u511 with unknown build is treated as vulnerable'
-Assert-True (-not (Test-JavaAtTarget -Version $null -TargetUpdate 511 -FixedBuilds @(32))) 'unknown version is vulnerable'
+Assert-True (-not (Test-JavaAtTarget -Version $null -TargetUpdate 511 -TargetBuild 33)) 'unknown version is vulnerable'
 Assert-Eq (Fmt (ConvertTo-JavaVersion -Text '8.0.511.33')) '511b33' 'Tenable output 8.0.511.33 (CSLT-136) is 8u511 b33'
 
 # --- Same-update replacement ---------------------------------------------------
-$n = { param($u, $b) Test-NeedsSameUpdateRemoval -Version ([pscustomobject]@{ Update = $u; Build = $b }) -TargetUpdate 511 -FixedBuilds @(32) }
-Assert-True (& $n 511 33) 'CSLT-136: 8u511 b33 must be uninstalled before b32 can install'
-Assert-True (& $n 511 7) '8u511 GA must be uninstalled before b32 can install'
+$n = { param($u, $b) Test-NeedsSameUpdateRemoval -Version ([pscustomobject]@{ Update = $u; Build = $b }) -TargetUpdate 511 -TargetBuild 33 }
+Assert-True (-not (& $n 511 33)) 'CSLT-136: 8u511 b33 is left alone'
+Assert-True (& $n 511 32) '8u511 b32 must be uninstalled before b33 can install'
+Assert-True (& $n 511 7) '8u511 GA must be uninstalled before b33 can install'
 Assert-True (& $n 511 $null) '8u511 with unknown build must be uninstalled first'
-Assert-True (-not (& $n 511 32)) '8u511 b32 is left alone'
 Assert-True (-not (& $n 503 1)) '8u503 upgrades in place (different folder and product code)'
 Assert-True (-not (& $n 521 1)) 'a later update is left alone'
 
@@ -85,7 +86,7 @@ try {
     Assert-Eq $inv.Count 3 'only jre1.8.0_* folders are inventoried'
     Assert-Eq (($inv | ForEach-Object { $_.Name + '=' + (Fmt $_) }) -join ',') 'jre1.8.0_491=491b,jre1.8.0_503=503b1,jre1.8.0_511=511b7' `
         'versions come from java.exe, folder name only when java.exe is unreadable'
-    Assert-Eq (($inv | Where-Object { -not (Test-JavaAtTarget -Version $_ -TargetUpdate 511 -FixedBuilds @(32)) }).Count) 3 `
+    Assert-Eq (($inv | Where-Object { -not (Test-JavaAtTarget -Version $_ -TargetUpdate 511 -TargetBuild 33) }).Count) 3 `
         'all three, including the 8u511 GA folder, are vulnerable'
     Assert-Eq @(Get-JreInventory -Root (Join-Path $tmp 'missing')).Count 0 'missing root yields nothing'
 } finally {
