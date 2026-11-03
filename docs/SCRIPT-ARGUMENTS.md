@@ -105,6 +105,14 @@ Stages a model-appropriate Dell BIOS update via Dell Command | Update, with firm
 | `-RebootAfter` | switch | off | Restart immediately after staging so the flash applies and BitLocker resumes promptly. |
 | `-DryRun` | switch | off | Scan and report only; does not suspend BitLocker and does not flash. |
 
+## Update-DellWatchdogTimer.ps1
+Updates the Dell Watchdog Timer kernel driver (`C:\Windows\System32\drivers\WDTKernel.sys`) to 2.0.0.1 or later from a staged Dell Update Package (plugin 339708, DSA-2026-248, CVE-2026-61407). Upload the `.ps1` as the package's Installation Command with no arguments, and add the DUP `.exe` as a Dependency File. Any file name matching `*Watchdog*.exe` or `*WDT*.exe` is found. Before installing, the script extracts the DUP (`/s /e=`) and refuses it with exit `1` if the `WDTKernel.sys` inside is below 2.0.0.1. It then runs `/s /l=C:\Logs\CompoSecure\DellWatchdogTimer_dup_<stamp>.log` and re-reads the driver file. It relaunches in 64-bit PowerShell, because the 32-bit EC agent sees `System32\drivers` redirected to `SysWOW64`. Exit codes: `0` = driver at or above 2.0.0.1 (or no driver present); `3010` = installed, restart needed (set EC success codes to `0,3010`); `2` = a human must look (DUP code 5, "not applicable to this system", or the DUP reported success while the file is still old); `1` = failure.
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `-InstallerPath` | string | `''` | Full path to the DUP, for terminal use only. Under EC, leave it empty. |
+| `-DryRun` | switch | off | Inventory and inspect the staged DUP; does not install. |
+
 ## Update-DotNetRuntimes.ps1
 Patches every installed .NET runtime channel to its latest build and prunes superseded versions.
 
