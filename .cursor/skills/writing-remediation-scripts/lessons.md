@@ -53,7 +53,12 @@ Each entry gives the rule, then the evidence: the host or PR where it bit us. Se
 - **Measure time limits with `date +%s`, not by counting sleeps.**
   - Background timers stretch, and a 900s limit let a cask run 2304s.
   - Kill the whole tree: collect descendants with `pgrep -P` *before* killing, or killing only `sudo` leaves brew's children running.
-  - Keep a whole-run budget below Mosyle's limit so the SUMMARY is always written (#67).
+  - Keep a whole-run budget so the job ends on its own terms and writes a SUMMARY (#67).
+  - **Count awake time only.** A lid-closed Mac stretched a 60s retry wait to 2 hours and used up the budget (CSMB-011). Subtract the sleep that `sysctl kern.sleeptime` / `kern.waketime` show between polls, and hold `caffeinate -i -s -w $$` while the job runs.
+  - **After each poll, check that the process is still alive before the limit check.** A CLT install that printed "Done." while the Mac slept was killed and reported failed (CSMB-036). Re-check the installed state (`pkgutil --pkg-info`) after any limit kill.
+- **Mosyle shows only the first ~9 KB of stdout.** 56 of 99 weekly runs were cut mid-word, so the SUMMARY was lost; Mosyle's response time still matched the job's real end, so the job ran to completion. Print a digest to stdout with a byte budget and room saved for the SUMMARY, and keep the full output in the log file.
+- **Probe the network before a network job.** Macs woken at 07:00 (dark wake) had no DNS. `softwareupdate --list` then printed "Can't connect to the Apple Software Update server" and exited 0, and the script reported that as "current". Treat that as "not checked", and wait or stop as OFFLINE instead of running brew against dead DNS.
+- **A skipped step is not a failed step.** Return a distinct code (125) when a step was never started because of the time limit or budget, and list it as "not run".
 - **brew refuses root.** Run it as the owner of `<prefix>/bin/brew` (`stat -f %Su`), not the console user. Run Intel `/usr/local` under `arch -x86_64`.
 - **`brew cleanup` autoremoves by default.** Set `HOMEBREW_NO_AUTOREMOVE=1` unless autoremove was asked for; cleanup removed openssl@3 on CSMB-026.
 - **Root-run tools leave root-owned files in user-owned trees,** e.g. `Gem::FilePermissionError` on rexml (ARMB-02, ARMB-09). Never run gem or brew as root, and chown the prefix's gem dirs back before installing.
@@ -94,6 +99,8 @@ Each entry gives the rule, then the evidence: the host or PR where it bit us. Se
 
 - **Shim the macOS and Windows tools in a temp dir on `PATH`:** `sudo`, `stat`, `dscl`, `sw_vers`, `visudo`, `xcode-select`, `pkgutil`, `softwareupdate` and `brew`. Point the script at the fixture with `BREW_PREFIXES`, `LOG_DIR` and similar overrides.
 - **`chmod +x` every shim, including ones a single test adds later.** A non-executable shim silently falls through to the real command.
+- **Simulate a Mac sleeping:** a `date` shim adds `state/clock_offset` to `+%s`, and a `sysctl` shim reports `kern.sleeptime` / `kern.waketime` from state files. A brew shim that writes all three during a step is a two-hour lid-closed nap. Shim `curl` too, or the network probe hits the real network.
+- **`make_fixture` rebuilds every shim.** A test that needs a custom shim must create it after `make_fixture`, every time.
 - **On Linux, `pgrep` matches only the first 15 characters of `comm`.** Full RemoteUpdateManager matching needs a Mac.
 - **Hard-coded `C:\Logs` paths fail on Linux.** Dot-source the helpers, or rewrite the log path in a temp copy for smoke runs.
 - **Assert on the fixture's call log** (`$S/calls`) for ordering, e.g. upgrade before cleanup, or the CLT install before brew update.

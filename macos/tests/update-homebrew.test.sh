@@ -6,6 +6,9 @@
 #   1. a .pkg cask (zoom) fails without sudo, a pinned formula stays outdated,
 #      upgrade runs BEFORE cleanup and the superseded keg is removed -> exit 2
 #   2. CASK_SUDO=1 lets zoom upgrade, and the sudoers grant is gone -> exit 0
+# then one scenario per fleet finding (v2: 2026-10-07..14, v3: ..11-03).
+# Shims for curl (network probe), sysctl (sleep/wake) and date (clock jump)
+# let a test take the Mac offline or put it to sleep for two hours.
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
 script=$(cd "$here/.." && pwd)/update-homebrew.sh
@@ -30,6 +33,8 @@ check_nogrep() {
 }
 
 # ---------------------------------------------------------------- unit ----
+# LAST_TICK, OUT_USED and OUTPUT_LIMIT are read by the sourced script.
+# shellcheck disable=SC2034
 (
   export HOMEBREW_UPDATE_SELFTEST=1
   # shellcheck source=/dev/null
@@ -122,6 +127,92 @@ openssl@3" | tr '\n' ' ')" 'postgresql@14 '
   kill_tree "$tp"; wait "$tp" 2>/dev/null
   alive=0; for k in $kids; do kill -0 "$k" 2>/dev/null && alive=1; done
   u 'kill_tree stops the whole tree' "$alive" '0'
+
+  # --- v3: fleet runs 2026-10-14..11-03 (lines verbatim from Mosyle) ---
+  sysctl() { echo '{ sec = 1761650000, usec = 123456 } Tue Oct 28 09:02:00 2026'; }
+  u 'sysctl timeval seconds' "$(sysctl_sec kern.waketime)" '1761650000'
+  unset -f sysctl
+  u 'sleep inside the gap counts from sleeptime' "$(slept_between 1000 9000 1100 8000)" '6900'
+  u 'sleep that began before the gap counts from the tick' "$(slept_between 1000 9000 500 8000)" '7000'
+  u 'wake before the gap is not ours' "$(slept_between 1000 9000 100 900)" '0'
+  u 'unknown sleep/wake counts nothing' "$(slept_between 1000 9000 '' '')" '0'
+  sysctl_sec() { case "$1" in kern.sleeptime) echo $(( $(date +%s) - 7190 )) ;; kern.waketime) echo $(( $(date +%s) - 10 )) ;; esac; }
+  SLEPT=0; LAST_TICK=$(( $(date +%s) - 7200 )); tick
+  u 'tick books a 2h lid-closed sleep' "$([ "$SLEPT" -ge 7175 ] && [ "$SLEPT" -le 7185 ] && echo y || echo "n ($SLEPT)")" 'y'
+  aw=$(( $(date +%s) - AWAKE_NOW ))
+  u 'awake clock excludes the sleep' "$([ "$aw" -ge "$SLEPT" ] && [ "$aw" -le $(( SLEPT + 1 )) ] && echo y || echo n)" 'y'
+  SLEPT=0; LAST_TICK=$(( $(date +%s) - 10 )); tick
+  u 'short gap is never sleep' "$SLEPT" '0'
+  unset -f sysctl_sec
+
+  t=$(mktemp)
+  for m in "Cant connect to the Apple Software Update server, because you are not connected to the internet." \
+           "Can$(printf '\342\200\231')t connect to the Apple Software Update server, because you are not connected to the internet." \
+           "Didn$(printf '\342\200\231')t get a response from the Apple Software Update server." \
+           "The network connection was lost." "A TLS error caused the secure connection to fail."; do
+    printf '%s\n' "$m" 'Software Update Tool' '' 'Finding available software' > "$t"
+    u "softwareupdate unreachable: ${m%% the *}" "$(LC_ALL=C softwareupdate_unreachable "$t" && echo y || echo n)" 'y'
+  done
+  printf '%s\n' 'Software Update Tool' 'Finding available software' 'No new software available.' > "$t"
+  u 'no new software is not unreachable' "$(softwareupdate_unreachable "$t" && echo y || echo n)" 'n'
+
+  u 'CLT label version (27.x style)' "$(clt_label_version 'Command Line Tools for Xcode 27.2-27.2')" '27.2'
+  u 'CLT label version (16.x style)' "$(clt_label_version 'Command Line Tools for Xcode-16.4')" '16.4'
+  u 'pkgutil 27.2.0.0.1 covers 27.2' "$(clt_version_covers 27.2.0.0.1.1761100000 27.2 && echo y || echo n)" 'y'
+  u 'pkgutil 27.0 does not cover 27.2' "$(clt_version_covers 27.0.0.0.1.1758000000 27.2 && echo y || echo n)" 'n'
+  u 'pkgutil 27.10 covers 27.2' "$(clt_version_covers 27.10.0.0.1 27.2 && echo y || echo n)" 'y'
+  u 'no pkgutil version covers nothing' "$(clt_version_covers '' 27.2 && echo y || echo n)" 'n'
+
+  # ARMB-09 2026-10-20, brew update reinstalling pkgconf.
+  printf '%s\n' '==> Fetching downloads for: pkgconf' '==> Reinstalling pkgconf' '==> make install' \
+    'Error: The `brew link` step did not complete successfully' 'The formula built, but is not symlinked into /opt/homebrew' \
+    'Could not symlink bin/pkg-config' 'Target /opt/homebrew/bin/pkg-config' 'is a symlink belonging to pkg-config. You can unlink it:' \
+    '  brew unlink pkg-config' '==> Summary' '==> Reinstalled pkgconf due to macOS version mismatch' > "$t"
+  u 'link failure names formula and owner' "$(link_failures "$t")" 'pkgconf: bin/pkg-config -- /opt/homebrew/bin/pkg-config belongs to pkg-config'
+  u 'link-only update error is not a fetch failure' "$(update_fetch_failed "$t" && echo y || echo n)" 'n'
+  printf '%s\n' '==> Upgrading python@3.13' '  3.13.17 -> 3.13.18' '==> Pouring python@3.13--3.13.18.arm64_golden_gate.bottle.tar.gz' \
+    'Error: The `brew link` step did not complete successfully' 'The formula built, but is not symlinked into /opt/homebrew' \
+    'Could not symlink bin/pip3.13' 'Target /opt/homebrew/bin/pip3.13' "already exists. You may want to remove it:" \
+    "  rm '/opt/homebrew/bin/pip3.13'" '==> Upgrading zip' > "$t"
+  u 'link failure: file already exists' "$(link_failures "$t")" 'python@3.13: bin/pip3.13 -- /opt/homebrew/bin/pip3.13 already exists'
+  # CSMB-011 2026-10-28.
+  printf '%s\n' '==> Updating Homebrew...' "fatal: unable to access 'https://github.com/Homebrew/brew/': Could not resolve host: github.com" \
+    'Error: Fetching /opt/homebrew failed!' 'Failed to download https://formulae.brew.sh/api/internal/packages.arm64_golden_gate.jws.json!' > "$t"
+  u 'DNS update failure is a fetch failure' "$(update_fetch_failed "$t" && echo y || echo n)" 'y'
+  u 'no link failure in a DNS failure' "$(link_failures "$t")" ''
+
+  # CSMB-026 2026-11-02.
+  printf '%s\n' 'Warning: The following taps are not trusted:' '  asmvik/formulae' '  koekeishiya/formulae' '  powershell/tap' \
+    'Homebrew is currently ignoring formulae, casks and commands' 'from these taps because tap trust is required.' \
+    'Trust installed formulae from these taps with:' '  brew trust --formula asmvik/formulae/yabai' \
+    '  brew trust --formula koekeishiya/formulae/skhd' '  brew trust --formula powershell/tap/powershell' \
+    'Trust other specific casks and commands with:' '  brew trust --cask <user>/<tap>/<cask>' '  brew trust --command <user>/<tap>/<command>' \
+    '  brew trust asmvik/formulae koekeishiya/formulae powershell/tap' > "$t"
+  u 'untrusted taps listed' "$(untrusted_taps "$t" | tr '\n' ' ')" 'asmvik/formulae koekeishiya/formulae powershell/tap '
+  u 'untrusted installed formulae, no placeholders' "$(untrusted_items "$t" | tr '\n' ' ')" 'asmvik/formulae/yabai koekeishiya/formulae/skhd powershell/tap/powershell '
+
+  # CSMB-020 2026-11-02.
+  printf '%s\n' 'Warning: Permission denied @ apply2files - /opt/homebrew/Cellar/python@3.10/3.10.20/Frameworks/x.pyc' \
+    'Error: Could not cleanup old kegs! Fix your permissions on:' '  /opt/homebrew/Cellar/python@3.10/3.10.20' \
+    'Removing: /opt/homebrew/Cellar/python@3.10/3.10.20... (1,238 files, 21.1MB)' > "$t"
+  u 'cleanup permission path' "$(cleanup_permission_paths "$t")" '/opt/homebrew/Cellar/python@3.10/3.10.20'
+  rm -f "$t"
+
+  u 'CASK_SUDO=1 covers any cask' "$(cask_sudo_wanted zoom 1 && echo y || echo n)" 'y'
+  u 'CASK_SUDO=0 covers none' "$(cask_sudo_wanted zoom 0 && echo y || echo n)" 'n'
+  u 'CASK_SUDO list covers a listed cask' "$(cask_sudo_wanted temurin@21 'temurin@21 docker-desktop' && echo y || echo n)" 'y'
+  u 'CASK_SUDO list is whole-word' "$(cask_sudo_wanted temurin 'temurin@21 docker-desktop' && echo y || echo n)" 'n'
+
+  OUTPUT_LIMIT=1000; OUT_USED=0; set_output_phase body
+  o=$( for i in $(seq 1 60); do to_stdout "body line $i padded to about forty bytes"; done
+       set_output_phase summary; for i in $(seq 1 60); do to_stdout "summary $i"; done
+       set_output_phase final; to_stdout 'RESULT: x' )
+  u 'body stops at 3/5 of the limit' "$([ "$(printf '%s\n' "$o" | grep -c '^body line')" -le 15 ] && echo y || echo n)" 'y'
+  u 'one trim marker per phase' "$(printf '%s\n' "$o" | grep -c 'output trimmed for Mosyle')" '2'
+  u 'summary prints after the body is cut' "$(printf '%s\n' "$o" | grep -c '^summary 1$')" '1'
+  u 'final line always prints' "$(printf '%s\n' "$o" | tail -n 1)" 'RESULT: x'
+  u 'stdout stays under the limit' "$([ "$(printf '%s\n' "$o" | wc -c)" -le 1100 ] && echo y || echo n)" 'y'
+  OUTPUT_LIMIT=0
   exit $ufail
 ) || fail=1
 
@@ -158,6 +249,33 @@ EOF
   # No Xcode and no CLT unless a test installs these shims differently.
   printf '#!/bin/bash\nexit 2\n' > "$fix/run/shims/xcode-select"
   printf '#!/bin/bash\nexit 1\n' > "$fix/run/shims/pkgutil"
+  # Network probe: hosts listed in state/net_down do not answer.
+  cat > "$fix/run/shims/curl" <<EOF
+#!/bin/bash
+for a in "\$@"; do u="\$a"; done
+h="\${u#https://}"
+echo "curl \$h" >> "$S/net_calls"
+# state/net_up_after = N: the network comes back after N probes.
+[ -f "$S/net_up_after" ] && [ "\$(wc -l < "$S/net_calls")" -gt "\$(cat "$S/net_up_after")" ] && exit 0
+grep -qx "\$h" "$S/net_down" 2>/dev/null && { echo "curl: (6) Could not resolve host: \$h" >&2; exit 6; }
+exit 0
+EOF
+  # No sleep/wake unless a test writes state/waketime (epoch seconds).
+  cat > "$fix/run/shims/sysctl" <<EOF
+#!/bin/bash
+case "\$2" in
+  kern.waketime) [ -f "$S/waketime" ] && echo "{ sec = \$(cat "$S/waketime"), usec = 0 } Tue Oct 28 09:02:00 2026" ;;
+  kern.sleeptime) [ -f "$S/sleeptime" ] && echo "{ sec = \$(cat "$S/sleeptime"), usec = 0 } Tue Oct 28 07:08:00 2026" ;;
+esac
+exit 0
+EOF
+  # The clock: real time plus state/clock_offset seconds (a simulated sleep).
+  cat > "$fix/run/shims/date" <<EOF
+#!/bin/bash
+off=\$(cat "$S/clock_offset" 2>/dev/null || echo 0)
+if [ "\$1" = "+%s" ]; then echo \$(( \$(/bin/date +%s) + off )); exit 0; fi
+exec /bin/date "\$@"
+EOF
 
   cat > "$P/bin/brew" <<EOF
 #!/bin/bash
@@ -169,8 +287,27 @@ xcode_error() {
   echo "  sudo xcodebuild -license accept"
   exit 1
 }
+nap() {  # the Mac sleeps \$1 seconds: the clock jumps, kern.*time record it
+  now=\$(/bin/date +%s); echo "\$1" > "\$S/clock_offset"
+  echo \$((now + 1)) > "\$S/sleeptime"; echo \$((now + \$1)) > "\$S/waketime"
+}
 case "\$1 \$2" in
   "update "*)
+    if [ -f "\$S/update_dns_sleep_once" ]; then
+      rm -f "\$S/update_dns_sleep_once"
+      echo "fatal: unable to access 'https://github.com/Homebrew/brew/': Could not resolve host: github.com"
+      echo "Error: Fetching /opt/homebrew failed!"; nap 7200; exit 1
+    fi
+    if [ -f "\$S/update_link_error" ]; then
+      printf '%s\n' '==> Updating Homebrew...' 'Updated 2 taps (homebrew/core and homebrew/cask).' '==> Reinstalling pkgconf' \\
+        'Error: The \`brew link\` step did not complete successfully' 'The formula built, but is not symlinked into /opt/homebrew' \\
+        'Could not symlink bin/pkg-config' 'Target /opt/homebrew/bin/pkg-config' 'is a symlink belonging to pkg-config. You can unlink it:' \\
+        '  brew unlink pkg-config' '==> Reinstalled pkgconf due to macOS version mismatch'
+      exit 1
+    fi
+    if [ -f "\$S/slow_update" ]; then
+      bash -c 'sleep 300 & wait'; exit 0
+    fi
     if [ -f "\$S/update_dns_once" ]; then
       rm -f "\$S/update_dns_once"
       echo "fatal: unable to access 'https://github.com/Homebrew/brew/': Could not resolve host: github.com"
@@ -195,12 +332,27 @@ case "\$1 \$2" in
       echo "Error: libfoo: the post-install step did not complete successfully"
       for i in \$(seq 1 45); do echo "==> Pouring bottle \$i"; done
     fi
+    if [ -f "\$S/untrusted" ]; then
+      printf '%s\n' 'Warning: The following taps are not trusted:' '  asmvik/formulae' '  powershell/tap' \\
+        'Homebrew is currently ignoring formulae, casks and commands' 'Trust installed formulae from these taps with:' \\
+        '  brew trust --formula asmvik/formulae/yabai' '  brew trust --formula powershell/tap/powershell' \\
+        '  brew trust --cask <user>/<tap>/<cask>'
+    fi
     for n in "\$@"; do grep -vx "\$n" "\$S/formulae_outdated" > "\$S/t"; mv "\$S/t" "\$S/formulae_outdated"; done
     printf '\360\237\215\272  %s/Cellar/git/2.51.0: 1,700 files\n' "\$P"
+    if [ -f "\$S/link_error" ]; then
+      printf '%s\n' '==> Upgrading python@3.13' '==> Pouring python@3.13--3.13.18.arm64_golden_gate.bottle.tar.gz' \\
+        'Error: The \`brew link\` step did not complete successfully' 'The formula built, but is not symlinked into /opt/homebrew' \\
+        'Could not symlink bin/pip3.13' 'Target /opt/homebrew/bin/pip3.13' 'already exists. You may want to remove it:' \\
+        "  rm '/opt/homebrew/bin/pip3.13'"
+      for i in \$(seq 1 45); do echo "==> Caveats \$i"; done
+      exit 1
+    fi
     [ -f "\$S/formula_error" ] && exit 1
     exit 0 ;;
   "upgrade --cask")
     n="\${!#}"
+    echo "\$n sudoers=\$([ -f "\$SUDOERS" ] && echo y || echo n)" >> "\$S/sudo_seen"
     if [ "\$n" = "zoom" ] && [ ! -f "\$SUDOERS" ]; then
       echo "sudo: a terminal is required to read the password"; exit 1
     fi
@@ -220,6 +372,14 @@ case "\$1 \$2" in
     exit 0 ;;
   "cleanup "*)
     [ -f "\$S/xcode_unaccepted" ] && xcode_error
+    if [ -f "\$S/many_removing" ]; then
+      for i in \$(seq 1 400); do echo "Removing: /Users/testuser/Library/Caches/Homebrew/pkg\$i--1.0... (18MB)"; done
+    fi
+    if [ -f "\$S/cleanup_perm" ]; then
+      printf '%s\n' "Warning: Permission denied @ apply2files - \$P/Cellar/python@3.10/3.10.20/x.pyc" \\
+        'Error: Could not cleanup old kegs! Fix your permissions on:' "  \$P/Cellar/python@3.10/3.10.20"
+      exit 1
+    fi
     rm -rf "\$P/Cellar/git/2.45.0"; exit 0 ;;
 esac
 exit 0
@@ -229,7 +389,7 @@ EOF
 
 run_script() {
   PATH="$fix/run/shims:$PATH" BREW_PREFIXES="$fix/run/opt/homebrew" LOG_DIR="$fix/run/logs" \
-    SUDOERS_FILE="$fix/run/sudoers" "$@" bash "$script" >/dev/null 2>&1
+    SUDOERS_FILE="$fix/run/sudoers" "$@" bash "$script" >"$fix/run/stdout" 2>&1
 }
 
 make_fixture
@@ -299,7 +459,7 @@ run_script env RUN_BUDGET=6 CASK_TIMEOUT=900; rc=$?
 L="$fix/run/logs/homebrew_update.log"
 check_grep 'budget stop logged' 'RUN_BUDGET \(6s\) used up -- stopping brew' "$L"
 check_nogrep 'no cask after the budget' '^upgrade --cask firefox$' "$S/calls"
-check_grep 'budget in the summary' '  - RUN_BUDGET \(6s\) used up' "$L"
+check_grep 'budget in the summary' '  - RUN_BUDGET \(6s awake\) used up; not run: cask_firefox' "$L"
 check_grep 'summary still written' '===== END =====' "$L"
 check 'budget run exits 2' "$rc" '2'
 
@@ -380,7 +540,8 @@ printf 'git\n' > "$S/formulae_outdated"; : > "$S/casks_outdated"; : > "$S/pinned
 touch "$S/formula_error"
 run_script env; rc=$?
 L="$fix/run/logs/homebrew_update.log"
-check_grep 'early error copied to main log' '\(earlier\) Error: libfoo: the post-install step' "$L"
+check_grep 'early error copied to main log' '    ! Error: libfoo: the post-install step' "$L"
+check_grep 'early error reaches stdout' '    ! Error: libfoo: the post-install step' "$fix/run/stdout"
 check_grep 'formula failure in the summary' '  - .*brew upgrade --formula failed: Error: libfoo' "$L"
 check 'formula error exits 2' "$rc" '2'
 
@@ -530,6 +691,187 @@ mkdir -p "$P/lib/ruby/gems/3.3.0/specifications"
 : > "$P/lib/ruby/gems/3.3.0/specifications/net-imap-0.4.9.1.gemspec"
 run_script env RUBY_GEMS= CASK_SUDO=0
 check 'RUBY_GEMS empty skips the gem step' "$(present "$P/lib/ruby/gems/3.3.0/specifications/net-imap-0.4.9.1.gemspec")" 'present'
+
+# --- v3: fleet runs 2026-10-14..11-03 ---
+# Mosyle keeps ~9 KB: 19 outdated formulae, 400 "Removing:" lines and a
+# failed cask must still leave the SUMMARY and RESULT on stdout (ARMB-02,
+# CSMB-010: cut mid-word in cleanup).
+make_fixture
+for i in $(seq 1 40); do echo "formula-number-$i"; done > "$S/formulae_outdated"
+cp "$S/formulae_outdated" "$S/formulae"; printf 'zoom\n' > "$S/casks_outdated"; : > "$S/pinned"
+touch "$S/many_removing" "$S/untrusted"
+run_script env; rc=$?
+O="$fix/run/stdout"; L="$fix/run/logs/homebrew_update.log"
+check 'stdout fits under OUTPUT_LIMIT' "$([ "$(wc -c < "$O")" -le 7300 ] && echo yes || echo "no ($(wc -c < "$O") bytes)")" 'yes'
+check_grep 'SUMMARY reaches Mosyle' '================ SUMMARY ================' "$O"
+check_grep 'failed cask reason in the SUMMARY' '^\[.*\]   - zoom -- needs sudo' "$O"
+check_grep 'RESULT reaches Mosyle' 'RESULT: brew ran, but the items above still need attention' "$O"
+check_grep 'END reaches Mosyle' '===== END =====' "$O"
+check_nogrep 'cleanup listing kept off stdout' 'Removing: ' "$O"
+check_grep 'cleanup tail in the main log file' 'Removing: /Users/testuser/Library/Caches/Homebrew/pkg400--' "$L"
+check_grep 'whole cleanup listing in the step log' 'Removing: /Users/testuser/Library/Caches/Homebrew/pkg1--' "$(ls "$fix/run/logs/"homebrew_*_cleanup.log)"
+check_grep 'outdated list is one line' '  formulae \(40\): formula-number-1 formula-number-2 ' "$O"
+check 'big run exits 2 (zoom)' "$rc" '2'
+
+# CSMB-011 2026-10-28: brew update hit a DNS error, the Mac slept 2h through
+# the 60s retry wait, RUN_BUDGET was gone and nothing was upgraded.
+make_fixture
+: > "$S/casks_outdated"; : > "$S/pinned"
+touch "$S/update_dns_sleep_once"
+run_script env RETRY_DELAY=0; rc=$?
+L="$fix/run/logs/homebrew_update.log"
+check 'retry ran after the sleep' "$(grep -c '^update' "$S/calls")" '2'
+check_grep 'formulae upgraded after the sleep' '^upgrade --formula git postgresql@14$' "$S/calls"
+check_nogrep 'budget not spent by sleep' 'RUN_BUDGET .* used up' "$L"
+check_grep 'sleep reported in the summary' 'Mac was asleep 7[0-9]{3}s of ' "$L"
+check 'slept-through run exits 0' "$rc" '0'
+check_nogrep 'no failure issues after the sleep' '  - .*(failed|time limit)' "$L"
+
+clt_shims() {
+  cat > "$fix/run/shims/pkgutil" <<EOF
+#!/bin/bash
+[ -f "$S/clt_new" ] && echo 'version: 27.2.0.0.1.1761100000' || echo 'version: 27.0.0.0.1.1758000000'
+exit 0
+EOF
+  cat > "$fix/run/shims/softwareupdate" <<EOF
+#!/bin/bash
+echo "softwareupdate \$*" >> "$S/calls"
+if [ "\$1" = "--list" ]; then
+  printf '%s\n' 'Software Update found the following new or updated software:' '* Label: Command Line Tools for Xcode 27.2-27.2'
+  exit 0
+fi
+printf '%s\n' 'Installing Command Line Tools for Xcode 27.2' 'Done with Command Line Tools for Xcode 27.2' 'Done.'
+touch "$S/clt_new"
+[ -f "$S/clt_hang" ] && { bash -c 'sleep 300 & wait'; exit 0; }
+echo 5000 > "$S/clock_offset"
+exit 0
+EOF
+  chmod +x "$fix/run/shims/pkgutil" "$fix/run/shims/softwareupdate"
+}
+# CSMB-036 2026-10-29: softwareupdate printed "Done." and exited while the
+# Mac slept; the limit check then "stopped" it and the SUMMARY said failed.
+make_fixture
+: > "$S/casks_outdated"; : > "$S/formulae_outdated"; : > "$S/pinned"
+clt_shims
+run_script env; rc=$?
+L="$fix/run/logs/homebrew_update.log"
+check_grep 'CLT install reported installed' 'Installed Command Line Tools for Xcode 27.2-27.2' "$L"
+check_nogrep 'CLT install not reported failed' 'failed to install|TIME LIMIT' "$L"
+check 'CLT finished-during-sleep run exits 0' "$rc" '0'
+# A CLT install that really hits its limit after installing: pkgutil decides.
+make_fixture
+: > "$S/casks_outdated"; : > "$S/formulae_outdated"; : > "$S/pinned"
+clt_shims; touch "$S/clt_hang"
+run_script env BREW_TIMEOUT=3; rc=$?
+L="$fix/run/logs/homebrew_update.log"
+check_grep 'CLT time limit hit' 'TIME LIMIT \(3s\) reached -- stopping softwareupdate' "$L"
+check_grep 'pkgutil confirms the install' 'Installed Command Line Tools for Xcode 27.2-27.2 \(pkgutil reports 27.2.0.0.1' "$L"
+check_nogrep 'confirmed CLT is not a problem' '  - softwareupdate hit|failed to install' "$L"
+check 'pkgutil-confirmed CLT exits 0' "$rc" '0'
+
+# Software Update server unreachable is "not checked", never "current"
+# (CSMB-010 / CSMB-011 / CSMB-017 ... on 2026-10-28).
+make_fixture
+: > "$S/casks_outdated"; : > "$S/formulae_outdated"; : > "$S/pinned"
+printf '#!/bin/bash\necho "version: 27.0.0.0.1"\nexit 0\n' > "$fix/run/shims/pkgutil"
+cat > "$fix/run/shims/softwareupdate" <<'EOF'
+#!/bin/bash
+printf '%s\n' "Can$(printf '\342\200\231')t connect to the Apple Software Update server, because you are not connected to the internet." 'Software Update Tool' '' 'Finding available software'
+exit 0
+EOF
+chmod +x "$fix/run/shims/pkgutil" "$fix/run/shims/softwareupdate"
+run_script env; rc=$?
+L="$fix/run/logs/homebrew_update.log"
+check_nogrep 'unreachable server is not "current"' 'Command Line Tools are current' "$L"
+check_grep 'unreachable server is "not checked"' 'Apple Software Update server not reachable -- Command Line Tools not checked' "$L"
+check_grep 'not checked noted in the SUMMARY' '^\[.*\] Note: Command Line Tools not checked' "$L"
+
+# Offline at 07:00 (dark wake): stop with OFFLINE, run no brew at all.
+make_fixture
+printf 'github.com\nformulae.brew.sh\nghcr.io\n' > "$S/net_down"
+run_script env NETWORK_WAIT=0; rc=$?
+L="$fix/run/logs/homebrew_update.log"
+check 'offline run exits 1' "$rc" '1'
+check_grep 'offline RESULT' 'RESULT: OFFLINE -- no network' "$L"
+check 'offline run calls no brew' "$(grep -c . "$S/calls")" '0'
+# Network back after the first probe round: brew runs.
+make_fixture
+: > "$S/casks_outdated"; : > "$S/formulae_outdated"; : > "$S/pinned"
+printf 'github.com\nformulae.brew.sh\nghcr.io\n' > "$S/net_down"
+echo 3 > "$S/net_up_after"
+run_script env NETWORK_WAIT=60 NETWORK_POLL=1; rc=$?
+L="$fix/run/logs/homebrew_update.log"
+check_grep 'waited for the network' 'No answer from: github.com formulae.brew.sh ghcr.io -- waiting up to 60s' "$L"
+check_grep 'network came back' 'Network OK .* after [0-9]+s' "$L"
+check_grep 'brew ran once online' '^update' "$S/calls"
+check 'network-recovered run exits 0' "$rc" '0'
+# Only ghcr.io blocked: reported, brew still runs.
+make_fixture
+: > "$S/casks_outdated"; : > "$S/formulae_outdated"; : > "$S/pinned"
+printf 'ghcr.io\n' > "$S/net_down"
+run_script env NETWORK_WAIT=0; rc=$?
+L="$fix/run/logs/homebrew_update.log"
+check_grep 'partial outage reported' '  - no answer from ghcr.io at the start' "$L"
+check_grep 'brew still ran' '^update' "$S/calls"
+check 'partial outage exits 2' "$rc" '2'
+
+# Steps skipped for the budget are "not run", not "failed" (CSMB-011,
+# CSPRMB-21-A: "brew upgrade --formula failed", "gem install ... exit 124").
+make_fixture
+: > "$S/casks_outdated"; : > "$S/pinned"
+touch "$S/slow_update"
+run_script env RUN_BUDGET=4; rc=$?
+L="$fix/run/logs/homebrew_update.log"
+check_grep 'skips listed by step' '  - RUN_BUDGET \(4s awake\) used up; not run: formulae, cleanup' "$L"
+check_nogrep 'skipped formulae not called failed' 'brew upgrade --formula failed' "$L"
+check_nogrep 'skipped cleanup not called failed' 'brew cleanup failed' "$L"
+check 'budget-skipped run exits 2' "$rc" '2'
+
+# brew link failures name the formula (ARMB-02 python@3.13, ARMB-09 pkgconf);
+# a link-only brew update error is not "brew update failed".
+make_fixture
+printf 'git\n' > "$S/formulae_outdated"; : > "$S/casks_outdated"; : > "$S/pinned"
+touch "$S/link_error" "$S/update_link_error"
+run_script env; rc=$?
+L="$fix/run/logs/homebrew_update.log"
+check_grep 'python@3.13 link failure in SUMMARY' '  - .*: python@3.13 is installed but not linked \(bin/pip3.13 -- .*/bin/pip3.13 already exists\)' "$L"
+check_grep 'pkgconf link failure in SUMMARY' '  - .*: pkgconf is installed but not linked \(bin/pkg-config -- .*belongs to pkg-config\)' "$L"
+check_nogrep 'link-only update not "update failed"' 'brew update failed' "$L"
+check_nogrep 'link-only upgrade not a generic failure' 'brew upgrade --formula failed' "$L"
+check 'link failure exits 2' "$rc" '2'
+
+# Untrusted taps: brew ignores what they installed, so not "all current".
+make_fixture
+printf 'git\n' > "$S/formulae_outdated"; : > "$S/casks_outdated"; : > "$S/pinned"
+touch "$S/untrusted"
+run_script env; rc=$?
+L="$fix/run/logs/homebrew_update.log"
+check_grep 'untrusted taps in SUMMARY' '  - .*: untrusted taps \(asmvik/formulae powershell/tap\) -- brew neither upgrades nor lists asmvik/formulae/yabai powershell/tap/powershell' "$L"
+check 'untrusted taps exit 2' "$rc" '2'
+
+# Cleanup stopped by a root-owned keg: chown it, run cleanup again (CSMB-020).
+make_fixture
+: > "$S/casks_outdated"; : > "$S/formulae_outdated"; : > "$S/pinned"
+mkdir -p "$P/Cellar/python@3.10/3.10.20"; touch "$S/cleanup_perm"
+printf '#!/bin/bash\necho "chown $*" >> "%s/calls"\nrm -f "%s/cleanup_perm"\n' "$S" "$S" > "$fix/run/shims/chown"
+chmod +x "$fix/run/shims/chown"
+run_script env; rc=$?
+L="$fix/run/logs/homebrew_update.log"
+check_grep 'root-owned keg chowned' "^chown -R testuser $P/Cellar/python@3.10/3.10.20\$" "$S/calls"
+check 'cleanup ran twice' "$(grep -c '^cleanup' "$S/calls")" '2'
+check_nogrep 'fixed cleanup is not a problem' 'brew cleanup failed' "$L"
+check 'fixed cleanup exits 0' "$rc" '0'
+
+# CASK_SUDO as a list grants sudo only while those casks upgrade.
+make_fixture
+printf 'firefox\nzoom\n' > "$S/casks_outdated"; : > "$S/formulae_outdated"; : > "$S/pinned"
+run_script env CASK_SUDO=zoom; rc=$?
+L="$fix/run/logs/homebrew_update.log"
+check 'listed cask had sudo' "$(grep -c '^zoom sudoers=y$' "$S/sudo_seen")" '1'
+check 'other cask had no sudo' "$(grep -c '^firefox sudoers=n$' "$S/sudo_seen")" '1'
+check_grep 'grant names the cask' 'Temporary passwordless sudo granted to testuser for zoom' "$L"
+check 'no grant left behind' "$([ -f "$fix/run/sudoers" ] && echo present || echo gone)" 'gone'
+check 'CASK_SUDO list run exits 0' "$rc" '0'
 
 if [ "$fail" -ne 0 ]; then
   echo "tests failed"
