@@ -89,6 +89,44 @@ try {
     Remove-Item $freeingFile -Force -ErrorAction SilentlyContinue
 }
 
+# --- CSPRPC-76 (2026-11-04): installed fine, link never connected ------------
+$csprpc76Link = '[error] [agent] Link fail: Connection to sensor.cloud.tenable.com:443 failed.'
+$csprpc76Status = @'
+Running: Yes
+Linked to: None
+Link status: Not linked to a manager
+Proxy: None
+Last connect: Never
+Last connection attempt: Never
+'@
+Assert-True ((Get-LinkFailureKind $csprpc76Link) -eq 'NoConnection') 'CSPRPC-76 link error is a connection failure'
+Assert-True (-not (Test-AgentLinked $csprpc76Status)) 'CSPRPC-76 status is NOT linked'
+Assert-True ((Get-LinkFailureKind 'Link fail: empty response from controller') -eq 'EmptyResponse') 'empty response is its own signature'
+Assert-True ((Get-LinkFailureKind '[error] [agent] Link fail: [409] Agent with different token already exists') -eq 'DuplicateIdentity') '409 is duplicate identity, not network'
+Assert-True ((Get-LinkFailureKind '[info] [agent] Successfully linked to sensor.cloud.tenable.com:443') -eq 'None') 'successful link output is not a failure'
+Assert-True ((Get-LinkFailureKind '') -eq 'None') 'empty link output is not a failure'
+Assert-True (Test-AgentLinked "Running: Yes`nLinked to: sensor.cloud.tenable.com:443`nLink status: Connected") 'linked status is linked'
+Assert-True (-not (Test-AgentLinked '')) 'no status output is not linked'
+
+$v = Get-LinkVerdict -FailureKind 'NoConnection' -Probe 'TcpTimeout' -TargetHost 'sensor.cloud.tenable.com'
+Assert-True ($v -match 'silently dropped' -and $v -match 'relinking cannot fix') 'TCP timeout verdict names egress, not the agent'
+$v = Get-LinkVerdict -FailureKind 'NoConnection' -Probe 'Intercepted' -TargetHost 'sensor.cloud.tenable.com'
+Assert-True ($v -match 'bypass') 'intercepted TLS verdict asks for an inspection bypass'
+$v = Get-LinkVerdict -FailureKind 'DuplicateIdentity' -Probe '' -TargetHost 'sensor.cloud.tenable.com'
+Assert-True ($v -match '409' -and $v -match 'ResetTenableTag') '409 verdict points at the duplicate record'
+$v = Get-LinkVerdict -FailureKind 'NoConnection' -Probe 'Ok' -TargetHost 'sensor.cloud.tenable.com'
+Assert-True ($v -match 'probes clean NOW') 'clean probe verdict says the path works now'
+$v = Get-LinkVerdict -FailureKind 'NoConnection' -Probe 'DNS' -TargetHost 'sensor.cloud.tenable.com'
+Assert-True ($v -match 'DNS') 'DNS verdict names DNS'
+
+# Probe against a local port nothing listens on: must report a TCP failure, not throw.
+$listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
+$listener.Start(); $freePort = $listener.LocalEndpoint.Port; $listener.Stop()
+$probe = Test-ManagerReachability -TargetHost '127.0.0.1' -Port $freePort -TimeoutMs 3000
+Assert-True ($probe -eq 'TcpRefused' -or $probe -eq 'TcpTimeout') ('closed port probes as a TCP failure (got ' + $probe + ')')
+$probe = Test-ManagerReachability -TargetHost 'no-such-host.invalid' -TimeoutMs 3000
+Assert-True ($probe -eq 'DNS') ('unresolvable host probes as DNS (got ' + $probe + ')')
+
 if ($failed -gt 0) {
     Write-Host "`n$failed test(s) failed"
     exit 1
