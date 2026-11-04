@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Clean teardown + reinstall of a broken Nessus Agent install (v4.3).
+    Clean teardown + reinstall of a broken Nessus Agent install (v4.4).
     Handles every broken state catalogued so far: dual product codes,
     orphaned Installer-DB registrations (1612), orphaned processes
     holding DB locks, and stale ARP entries.
@@ -27,6 +27,17 @@
     five installed 11.2.2 and linked successfully, EC reported Succeeded, and
     Tenable still showed 11.1.0 days later. Exit 0 must mean "installed, linked,
     and able to report".
+
+    v4.4 (from the 2026-11-04 CSPRPC-76 run): the install succeeded, the
+    link failed with 'Connection to sensor.cloud.tenable.com:443 failed.',
+    and the script still printed 'Clean reinstall complete' and exited 0.
+      * A link that does not take now exits 2 with a RESULT/CAUSE summary.
+        Exit 0 means installed, running, AND linked (or -NoLink was asked for).
+      * On link failure the path is probed (DNS, TCP 443, TLS issuer -- the
+        same probe as Repair-NessusAgent.ps1 v5) and the cause is named:
+        DNS, egress dropped/refused, TLS interception, 409 duplicate identity.
+      * Not-linked / no-group (exit 2) now wins over 3010, so a reboot hint
+        can no longer turn an unusable agent into an EC success.
 
     v4.3 (from the 2026-09-24 CSLT-192 run): the v4.1 pre-flight refused to
     start on a host where nothing was actually installing.
@@ -387,6 +398,108 @@ function Convert-CompressedGuid {
 }
 
 # Unit tests dot-source this file for the helpers above; stop before the run.
+function Get-LinkFailureKind {
+    # Same signatures Repair-NessusAgent.ps1 distinguishes; each has a different owner.
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return 'None' }
+    if ($Text -match '\[409\]' -or $Text -match 'with different token already exists') { return 'DuplicateIdentity' }
+    if ($Text -match 'empty response') { return 'EmptyResponse' }
+    if ($Text -match 'Connection to .*failed' -or $Text -match 'Failed to connect' -or $Text -match 'Could not connect') { return 'NoConnection' }
+    if ($Text -match 'Link fail') { return 'Other' }
+    return 'None'
+}
+
+function Test-AgentLinked {
+    param([string]$StatusText)
+    if ([string]::IsNullOrWhiteSpace($StatusText)) { return $false }
+    if ($StatusText -match 'Not linked') { return $false }
+    if ($StatusText -match 'Linked to:\s*None') { return $false }
+    return ($StatusText -match 'Linked to:\s*\S')
+}
+
+function Test-ManagerReachability {
+    # Raw .NET rather than Test-NetConnection: the NetTCPIP module is not
+    # guaranteed under EC's SYSTEM context, and it cannot show the certificate
+    # issuer -- the only check here that PROVES TLS interception.
+    # $TargetHost, not $Host: $Host is a reserved automatic variable.
+    param([string]$TargetHost, [int]$Port = 443, [int]$TimeoutMs = 10000)
+
+    Write-Log ('  Probing ' + $TargetHost + ':' + $Port + ' from this host...')
+    try {
+        $addrs = @([System.Net.Dns]::GetHostAddresses($TargetHost) | ForEach-Object { $_.IPAddressToString })
+        Write-Log ('  DNS      : resolves to ' + ($addrs -join ', '))
+    } catch {
+        Write-Log ('  DNS      : FAILED to resolve -- ' + $_.Exception.Message) -Level ERROR
+        return 'DNS'
+    }
+
+    $tcp = New-Object System.Net.Sockets.TcpClient
+    try {
+        $iar = $tcp.BeginConnect($TargetHost, $Port, $null, $null)
+        if (-not $iar.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) {
+            Write-Log ('  TCP ' + $Port + '  : TIMED OUT after ' + [int]($TimeoutMs / 1000) + 's (silently dropped).') -Level ERROR
+            $tcp.Close()
+            return 'TcpTimeout'
+        }
+        $tcp.EndConnect($iar)
+        Write-Log ('  TCP ' + $Port + '  : connected')
+    } catch {
+        Write-Log ('  TCP ' + $Port + '  : FAILED -- ' + $_.Exception.Message) -Level ERROR
+        $tcp.Close()
+        return 'TcpRefused'
+    }
+
+    # Accept ANY certificate on purpose: the point is to see what is presented,
+    # including an intercepting one that normal validation rejects.
+    $result = 'Ok'
+    try {
+        $noValidation = [System.Net.Security.RemoteCertificateValidationCallback] { $true }
+        $ssl = New-Object System.Net.Security.SslStream($tcp.GetStream(), $false, $noValidation)
+        $ssl.AuthenticateAsClient($TargetHost)
+        $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]$ssl.RemoteCertificate
+        Write-Log ('  TLS cert : subject ' + $cert.Subject)
+        Write-Log ('  TLS cert : issuer  ' + $cert.Issuer)
+        if ($cert.Issuer -match 'Zscaler|Proxy|Forcepoint|Netskope|Palo Alto|Blue Coat|Fortinet') {
+            Write-Log '  TLS cert : issued by an INSPECTION PROXY, not the vendor CA.' -Level ERROR
+            $result = 'Intercepted'
+        } else {
+            Write-Log '  TLS cert : issuer does not look like an inspection proxy.'
+        }
+        $ssl.Dispose()
+    } catch {
+        Write-Log ('  TLS      : handshake FAILED -- ' + $_.Exception.Message) -Level WARN
+        $result = 'TlsFailed'
+    }
+    $tcp.Close()
+    return $result
+}
+
+function Get-LinkVerdict {
+    # One line naming the cause and who owns the fix. $Probe is the
+    # Test-ManagerReachability result ('' when no probe ran).
+    param([string]$FailureKind, [string]$Probe, [string]$TargetHost)
+    if ($FailureKind -eq 'DuplicateIdentity') {
+        return 'HTTP 409 duplicate identity: this host UUID is already registered under another token. Remove the old agent record in Tenable (Sensors > Agents) or run Repair-NessusAgent.ps1 -ResetTenableTag.'
+    }
+    switch ($Probe) {
+        'DNS'         { return ('DNS cannot resolve ' + $TargetHost + ' from this host. Fix name resolution, then re-run.') }
+        'TcpTimeout'  { return ('Egress to ' + $TargetHost + ':443 is silently dropped (firewall or a required proxy). Network owner must allow it; relinking cannot fix this.') }
+        'TcpRefused'  { return ('Egress to ' + $TargetHost + ':443 is refused. Network owner must allow it; relinking cannot fix this.') }
+        'Intercepted' { return ('TLS to ' + $TargetHost + ' is intercepted by an inspection proxy. Add an SSL-inspection bypass, then re-run.') }
+        'TlsFailed'   { return ('Port 443 opens but TLS to ' + $TargetHost + ' does not complete (inspection proxy or TLS mismatch). Add an SSL-inspection bypass, then re-run.') }
+        'Ok' {
+            if ($FailureKind -eq 'EmptyResponse') {
+                return ('Path to ' + $TargetHost + ' probes clean now but the agent got an empty response -- typical of SSL inspection applied only to the agent process. Add a bypass and re-run.')
+            }
+            return ('Path to ' + $TargetHost + ' probes clean NOW, so the failure was transient or agent-specific. Re-run, or link manually: nessuscli agent link --key=<key> --host=' + $TargetHost + ' --port=443')
+        }
+        default {
+            if ($FailureKind -eq 'EmptyResponse') { return ('Empty response from ' + $TargetHost + ' -- check SSL inspection (add bypass) and re-run.') }
+            return ('Agent not linked to ' + $TargetHost + '. See the link output above.')
+        }
+    }
+}
+
 if ($env:NESSUS_CLEANREINSTALL_DOTSOURCE -eq '1') { return }
 
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
@@ -397,9 +510,11 @@ $ProgramDir   = 'C:\Program Files\Tenable\Nessus Agent'
 $DataDir      = 'C:\ProgramData\Tenable\Nessus Agent'
 $RebootNeeded = $false
 $NoGroup      = $false
+$LinkAttempted = $false
+$LinkFailure   = 'None'
 
 Write-Log '=============================================='
-Write-Log ' Nessus Agent Clean Reinstall (v4.3)'
+Write-Log ' Nessus Agent Clean Reinstall (v4.4)'
 Write-Log (' Host   : ' + $env:COMPUTERNAME)
 Write-Log (' DryRun : ' + $DryRun)
 Write-Log (' Relink : ' + ((-not $NoLink) -and ($LinkKey -ne '')))
@@ -675,31 +790,55 @@ if ((Test-Path $cli) -and $LinkKey -and -not $NoLink) {
     if ($groups) { $linkArgs += ('--groups=' + $groups) }
     $linkOut = & $cli $linkArgs 2>&1
     foreach ($line in $linkOut) { Write-Log ('    ' + $line) }
-    if ($linkOut -match 'empty response') {
-        Write-Log '  Link failed with empty response -- check Zscaler SSL inspection of ' -Level WARN
-        Write-Log ('  ' + $LinkHost + ' (add bypass) and retry.') -Level WARN
-    }
+    $LinkAttempted = $true
+    $LinkFailure = Get-LinkFailureKind (($linkOut | Out-String))
 } elseif ($NoLink) {
     Write-Log '  -NoLink set: skipping link step.'
 }
+$Linked = $false
 if (Test-Path $cli) {
     $status = & $cli agent status 2>&1
     foreach ($line in $status) { Write-Log ('  ' + $line) }
-    if (($status -join ' ') -match 'Not linked') {
-        Write-Log '  AGENT NOT LINKED -- run nessuscli agent link with your key.' -Level WARN
+    $Linked = Test-AgentLinked (($status | Out-String))
+}
+
+# CSPRPC-76 (2026-11-04): install fine, link failed with 'Connection to
+# sensor.cloud.tenable.com:443 failed', and v4.3 still printed 'Clean reinstall
+# complete' and exited 0 -- EC recorded success for an agent that cannot report.
+$LinkVerdict = ''
+if ($LinkAttempted -and -not $Linked) {
+    Write-Log ''
+    Write-Log ('  Link failure type: ' + $LinkFailure)
+    $probe = ''
+    if ($LinkFailure -ne 'DuplicateIdentity') {
+        $probe = Test-ManagerReachability -TargetHost $LinkHost
     }
+    $LinkVerdict = Get-LinkVerdict -FailureKind $LinkFailure -Probe $probe -TargetHost $LinkHost
+    Write-Log ('  ' + $LinkVerdict) -Level ERROR
 }
 
 Write-Log ''
 Write-Log '=============================================='
-Write-Log ' Clean reinstall complete.'
-Write-Log (' Log : ' + $LogFile)
-if ($NoGroup) {
-    Write-Log ' ATTENTION: agent linked with NO GROUP -- it will NOT scan or report' -Level WARN
-    Write-Log ' until a group is assigned. Assign it in Tenable (Sensors > Agents)' -Level WARN
-    Write-Log ' or re-run with -LinkGroups. Exiting 2 so this is not read as done.' -Level WARN
+if ($LinkVerdict) {
+    Write-Log ' RESULT: Nessus Agent reinstalled and running, but NOT LINKED.' -Level ERROR
+    Write-Log (' CAUSE : ' + $LinkVerdict) -Level ERROR
+    Write-Log ' The agent cannot scan or report until it links. Exiting 2.' -Level ERROR
+} elseif ($NoGroup) {
+    Write-Log ' RESULT: reinstalled and linked, but with NO GROUP.' -Level WARN
+    Write-Log ' It will NOT scan or report until a group is assigned in Tenable' -Level WARN
+    Write-Log ' (Sensors > Agents) or this is re-run with -LinkGroups. Exiting 2.' -Level WARN
+} elseif ($NoLink) {
+    Write-Log ' RESULT: reinstalled and running; not linked (-NoLink).'
+} elseif (-not $Linked) {
+    $LinkVerdict = 'No link attempted (empty -LinkKey) and the agent is not linked.'
+    Write-Log ' RESULT: Nessus Agent reinstalled and running, but NOT LINKED.' -Level ERROR
+    Write-Log (' CAUSE : ' + $LinkVerdict) -Level ERROR
+    Write-Log ' Pass -LinkKey or link manually. Exiting 2.' -Level ERROR
+} else {
+    Write-Log ' RESULT: Clean reinstall complete -- agent installed, running, and linked.'
 }
+Write-Log (' Log : ' + $LogFile)
 Write-Log '=============================================='
+if ($LinkVerdict -or $NoGroup) { exit 2 }
 if ($RebootNeeded) { exit 3010 }
-if ($NoGroup) { exit 2 }
 exit 0
