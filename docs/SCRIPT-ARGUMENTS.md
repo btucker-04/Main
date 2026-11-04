@@ -295,6 +295,8 @@ Full teardown + reinstall of a broken Nessus Agent, with optional relink.
 
 The pre-flight tests whether the installer mutex is *held*, not merely whether it exists — an idle `msiexec` service process keeps the object alive, which previously made the check report "install in progress" permanently (CSLT-192).
 
+Exit 0 means installed, running, **and linked** (or `-NoLink`). If the link does not take, the script probes DNS / TCP 443 / TLS issuer to `-LinkHost`, names the cause in a `RESULT`/`CAUSE` summary, and exits 2 — even when a reboot (3010) is also pending (CSPRPC-76).
+
 ## Repair-NessusAgent.ps1
 Checks agent state and fixes only what is broken (installs if missing, ensures service running, links/relinks).
 
