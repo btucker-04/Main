@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# remediate-ruby-gem.sh  (v3.5)
+# remediate-ruby-gem.sh  (v4)
 # Generic remediation for a vulnerable Ruby gem on macOS.
 # Platform : macOS (bash 3.2 compatible) | Deploy: Mosyle (runs as root)
 #
@@ -44,6 +44,8 @@
 #     required to clear Tenable (it keys on the .gemspec path).
 #   * Plugin 240854 (webrick 1.7.0 < 1.8.2) on the same host is macOS
 #     SYSTEM Ruby: /Library/Ruby/Gems/2.6.0/specifications/webrick-1.7.0.gemspec.
+#     [v4: SYSTEM_RUBY=1 now installs the patched release there and removes
+#     the old copy; the rest of this note describes v3.1.]
 #     This script will REPORT it and leave it (SIP-adjacent). Do not deploy a
 #     webrick job expecting the finding to clear -- recast/accept, or migrate
 #     off the built-in Ruby. Alternate CONFIG for a diagnostic-only run:
@@ -88,6 +90,27 @@
 #   `gem cleanup` so cleanup cannot remove it again. Step 3 then finds the
 #   same-branch sibling and removes the old spec.
 #
+# v4 (ARMB-02, 2026-11-05, plugin 210049): the finding was
+#   /Library/Ruby/Gems/2.6.0/specifications/rexml-3.2.5.gemspec, but the stock
+#   paste logged GEM=net-imap and never looked at rexml -- every finding needed
+#   the CONFIG edited first. And even a rexml run would only have REPORTED a
+#   macOS system Ruby copy: nothing ever installed a patched sibling there.
+#   * One run now covers every gem in GEMS (default: rexml, net-imap, webrick).
+#   * No hand-maintained version floors by default. "latest" resolves the
+#     newest release from rubygems.org; "branch" resolves the newest release
+#     of every major.minor line (net-imap backports fixes per branch).
+#     Explicit THRESHOLDS still work and keep the old strict semantics.
+#   * SYSTEM_RUBY=1 (default): an outdated NON-default spec in
+#     /Library/Ruby/Gems/<abi> gets the patched release installed with
+#     /usr/bin/gem as root -- the same place `sudo gem install` writes; that
+#     directory is not SIP-protected. Step 3 then removes the old copy through
+#     the usual patched-sibling guard. Default gems are still never deleted.
+#   * In latest/branch mode a copy this script cannot change (a default gem,
+#     the CURRENT portable-ruby, the CURRENT formula keg) is listed as
+#     OUTDATED but does not fail the run: "not the newest release" is not by
+#     itself a vulnerability. Use explicit THRESHOLDS to make such copies
+#     exit 2 for a known advisory.
+#
 # PER-BRANCH THRESHOLDS: gems are commonly fixed independently per minor line.
 # A flat "greater than X" test is wrong and has caused a real bug here -- a
 # net-imap 0.6.3 spec satisfied a flat >= 0.5.14 check while being vulnerable in
@@ -96,20 +119,26 @@
 #
 # ENVIRONMENT:
 #   (Configure via the CONFIG block below, or positional args, or environment.)
-#   GEM=rexml                       (required) gem name
-#   THRESHOLDS="3.4.2"              (required) either a single minimum, or
+#   GEMS="rexml net-imap=branch webrick"
+#                                   gems to remediate, one run each. An entry
+#                                   is NAME or NAME=SPEC; SPEC is "latest"
+#                                   (default), "branch", or explicit THRESHOLDS.
+#   GEM=rexml                       single gem; overrides GEMS
+#   THRESHOLDS="3.4.2"              for GEM: "latest", "branch", a single
 #   THRESHOLDS="0.4:0.4.24;0.5:0.5.15;0.6:0.6.4.1"
-#                                   per-branch "prefix:minimum" pairs.
-#                                   A spec whose version matches no branch
-#                                   prefix is REPORTED and never deleted.
+#                                   minimum, or per-branch "prefix:minimum"
+#                                   pairs. A spec whose version matches no
+#                                   branch prefix is REPORTED, never deleted.
 #   PLUGIN=265895                   (optional) for the log header only
+#   SYSTEM_RUBY=0                   (optional) never install into macOS Ruby
 #   NO_INSTALL=1                    (optional) clean up only; never install
 #   DRY_RUN=1                       (optional) report only, delete nothing
 #
 # Examples:
-#   GEM=rexml    THRESHOLDS="3.4.2"                                    PLUGIN=265895
-#   GEM=net-imap THRESHOLDS="0.4:0.4.24;0.5:0.5.15;0.6:0.6.4.1"        PLUGIN=321503
-#   GEM=webrick  THRESHOLDS="1.8.2"                                    PLUGIN=240854  (system Ruby: report only)
+#   (no arguments)                  rexml + webrick at latest, net-imap per branch
+#   ./remediate-ruby-gem.sh rexml                       -> latest
+#   ./remediate-ruby-gem.sh rexml "3.4.2" 265895        -> fixed floor (strict)
+#   ./remediate-ruby-gem.sh net-imap "0.4:0.4.24;0.5:0.5.15;0.6:0.6.4.1" 321503
 #
 # HOMEBREW PORTABLE RUBY: Homebrew ships its own Ruby under
 # <prefix>/Library/Homebrew/vendor/portable-ruby/<version>/ to run brew itself,
@@ -128,7 +157,8 @@
 # Homebrew formula libexec trees (fastlane etc.), per-user rbenv under
 # /Users/*/.rbenv, and the Homebrew rbenv root.
 #
-# Exit: 0 = no vulnerable spec remains
+# Exit (per gem, and OVERALL = worst of them: 1 > 2 > 0):
+#       0 = no vulnerable spec remains (latest/branch: none this script can update)
 #       2 = something needs a human (unpatched SYSTEM spec with no sibling,
 #           CURRENT formula keg / portable-ruby, unknown branch, or no
 #           usable brew user to install with)
@@ -140,49 +170,75 @@ HOME="${HOME:-/var/root}"
 export HOME
 
 # =============================================================================
-# CONFIG -- EDIT THESE TWO LINES BEFORE PASTING INTO MOSYLE.
+# CONFIG -- a stock Mosyle paste needs no edits.
 # Mosyle runs the script directly and passes no environment variables, so
 # in-script config is the deployable path (same constraint as EC stripping
 # parameters). Precedence: command-line args > environment > these defaults.
 #
-# v3.3 (ARMB-09, 2026-09-28): a stock Mosyle paste logged
-#   GEM=rexml THRESHOLDS=3.4.2 PLUGIN=265895
-# and never looked at net-imap. Plugin 321503 (CVE-2026-47240/47241/47242)
-# is net-imap < 0.5.15 or 0.6.x < 0.6.4.1. ARMB-09 and CSMB-017 both have
-# net-imap-0.6.4.gemspec. The old 313278 floor of 0.6.4 treats that spec as
-# already fixed, so the finding would not clear. Default CONFIG is now this
-# advisory. Switch the three CFG_* lines back to rexml / 3.4.2 / 265895
-# when that is the finding being deployed.
-#
-#   rexml    : CFG_GEM="rexml"    CFG_THRESHOLDS="3.4.2"                 PLUGIN 265895
-#   net-imap : CFG_GEM="net-imap" CFG_THRESHOLDS="0.4:0.4.24;0.5:0.5.15;0.6:0.6.4.1"
-#   webrick  : CFG_GEM="webrick"  CFG_THRESHOLDS="1.8.2"                  PLUGIN 240854
-#              (CSMB-017 webrick is SYSTEM Ruby -- this job will exit 2)
+# GEMS entries are NAME or NAME=SPEC. SPEC "latest" (the default) treats any
+# copy older than the newest rubygems.org release as the one to replace;
+# "branch" does that per major.minor line. A fixed floor for one advisory
+# (strict: unfixable copies below it exit 2) is still possible, e.g.
+#   CFG_GEMS="rexml=3.4.2"   or   CFG_GEMS="net-imap=0.4:0.4.24;0.5:0.5.15;0.6:0.6.4.1"
 # =============================================================================
-CFG_GEM="net-imap"
-CFG_THRESHOLDS="0.4:0.4.24;0.5:0.5.15;0.6:0.6.4.1"
-CFG_PLUGIN="321503"
+CFG_GEMS="rexml net-imap=branch webrick"
+CFG_SYSTEM_RUBY="1"
 CFG_NO_INSTALL="0"
 CFG_DRY_RUN="0"
 
 # Positional args win, then environment, then the CONFIG block above.
-GEM="${1:-${GEM:-$CFG_GEM}}"
-THRESHOLDS="${2:-${THRESHOLDS:-$CFG_THRESHOLDS}}"
-PLUGIN="${3:-${PLUGIN:-$CFG_PLUGIN}}"
+if [ -n "${1:-}" ]; then
+    GEMS="$1=${2:-latest}"
+    PLUGIN="${3:-${PLUGIN:-}}"
+elif [ -n "${GEM:-}" ]; then
+    GEMS="$GEM=${THRESHOLDS:-latest}"
+    PLUGIN="${PLUGIN:-}"
+else
+    GEMS="${GEMS:-$CFG_GEMS}"
+    PLUGIN="${PLUGIN:-}"
+fi
+GEM=""
+THRESHOLDS=""
+SYSTEM_RUBY="${SYSTEM_RUBY:-$CFG_SYSTEM_RUBY}"
 NO_INSTALL="${NO_INSTALL:-$CFG_NO_INSTALL}"
 DRY_RUN="${DRY_RUN:-$CFG_DRY_RUN}"
 
-LOG_DIR="/var/log/composecure"
+# macOS system Ruby locations; overridable only so the tests can stage a fake one.
+SYS_RUBY_ROOT="${SYS_RUBY_ROOT:-/Library/Ruby}"
+SYS_GEM_BIN="${SYS_GEM_BIN:-/usr/bin/gem}"
+SYS_RUBY_BIN="${SYS_RUBY_BIN:-/usr/bin/ruby}"
+
+LOG_DIR="${LOG_DIR:-/var/log/composecure}"
 LOG_FILE="$LOG_DIR/ruby_gem_remediation.log"
-mkdir -p "$LOG_DIR"
+mkdir -p "$LOG_DIR" 2>/dev/null
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"; }
 
-if [ -z "$GEM" ] || [ -z "$THRESHOLDS" ]; then
-    log "ERROR: no gem/thresholds configured. Set the CONFIG block at the top of"
-    log "       this script (Mosyle passes no environment variables), or pass them"
-    log "       positionally:  ./remediate-ruby-gem.sh rexml \"3.4.2\" 265895"
-    exit 1
-fi
+# rubygems.org /api/v1/versions/<gem>.json on stdin -> release numbers, one
+# per line. Prereleases are skipped; sed/tr only (no jq or python on a stock Mac).
+release_versions() {
+    grep -o '"number":"[^"]*"[^{}]*"prerelease":false' \
+        | sed -n 's/^"number":"\([^"]*\)".*/\1/p' | grep -E '^[0-9]' | sort -u
+}
+newest_release() { sort -V | tail -n1; }
+# Release list on stdin -> "0.4:0.4.24;0.5:0.5.15;..." (newest of each major.minor).
+branch_floors() {
+    sort -V | awk -F. 'NF >= 2 {
+        b = $1 "." $2
+        if (!(b in last)) order[++n] = b
+        last[b] = $0
+    } END { for (i = 1; i <= n; i++) printf "%s%s:%s", (i > 1 ? ";" : ""), order[i], last[order[i]] }'
+}
+# SPEC (latest | branch | explicit) + release list file -> THRESHOLDS.
+thresholds_for_spec() {
+    case "$1" in
+        latest) newest_release < "$2" ;;
+        branch) branch_floors < "$2" ;;
+        *)      echo "$1" ;;
+    esac
+}
+fetch_release_list() {
+    curl -fsS --max-time 30 "https://rubygems.org/api/v1/versions/$1.json" 2>/dev/null | release_versions
+}
 
 version_ge() { [ "$(printf '%s\n' "$2" "$1" | sort -V | head -n1)" = "$2" ]; }
 
@@ -219,7 +275,7 @@ scope_of() {
         esac
     fi
     case "$s" in
-        /Library/Ruby/*) echo "SYSTEM"; return ;;
+        "$SYS_RUBY_ROOT"/*) echo "SYSTEM"; return ;;
         */.rbenv/versions/*) echo "RBENV:$(echo "$s" | sed -nE 's|.*/\.rbenv/versions/([^/]+)/.*|\1|p')"; return ;;
     esac
     if [ -n "$BREW_PREFIX" ]; then
@@ -268,8 +324,14 @@ formula_current_keg() {
     fi
 }
 # Per-branch thresholds present? Then a patched spec must also match the branch.
+# SOFT_UNFIXABLE: floors came from "latest"/"branch", not an advisory, so a
+# copy this script cannot change is OUTDATED rather than a failure.
 THRESH_PER_BRANCH=0
-case "$THRESHOLDS" in *:*) THRESH_PER_BRANCH=1 ;; esac
+SOFT_UNFIXABLE=0
+apply_thresholds() {
+    THRESHOLDS="$1"; SOFT_UNFIXABLE="${2:-0}"; THRESH_PER_BRANCH=0
+    case "$THRESHOLDS" in *:*) THRESH_PER_BRANCH=1 ;; esac
+}
 
 spec_version() { echo "$1" | sed -E "s/^${GEM}-([0-9][0-9A-Za-z.]*)\.gemspec$/\1/"; }
 
@@ -310,6 +372,46 @@ patched_sibling_of() {
     echo "$ps_found"
 }
 
+system_ruby_abi() {
+    [ -x "$SYS_RUBY_BIN" ] || { echo ""; return; }
+    "$SYS_RUBY_BIN" -e 'print RbConfig::CONFIG["ruby_version"]' 2>/dev/null
+}
+
+# Spec list + system Ruby ABI -> '|'-separated `gem install -v` requirements
+# for the outdated NON-default specs in /Library/Ruby/Gems/<abi> ("any" = plain
+# install). Only that ABI: /usr/bin/ruby cannot load any other gem dir there.
+system_install_requirements() {
+    si_list="$1"; si_abi="$2"; si_reqs=""
+    [ -n "$si_abi" ] || { echo ""; return; }
+    while IFS= read -r si_spec; do
+        case "$si_spec" in "$SYS_RUBY_ROOT/Gems/$si_abi/specifications/"*) ;; *) continue ;; esac
+        is_default_gem "$si_spec" && continue
+        si_ver=$(spec_version "$(basename "$si_spec")")
+        [ "$si_ver" = "$(basename "$si_spec")" ] && continue
+        si_need=$(required_for "$si_ver")
+        [ -n "$si_need" ] || continue
+        version_ge "$si_ver" "$si_need" && continue
+        si_req=$(branch_requirement "$si_ver")
+        [ -n "$si_req" ] || si_req="any"
+        case "|$si_reqs|" in *"|$si_req|"*) ;; *) si_reqs="${si_reqs:+$si_reqs|}$si_req" ;; esac
+    done < "$si_list"
+    echo "$si_reqs"
+}
+
+# Copies no step here can replace: default gems, the CURRENT portable-ruby,
+# the CURRENT keg of a formula that vendors the gem.
+unfixable_reason() {
+    if is_default_gem "$1"; then echo "Ruby default gem"; return; fi
+    uf_sc=$(scope_of "$1")
+    case "$uf_sc" in
+        PORTABLE:*)
+            [ "${uf_sc#PORTABLE:}" = "$PORTABLE_CURRENT" ] && echo "current Homebrew portable-ruby" ;;
+        FORMULA:*)
+            uf_cur=$(formula_current_keg "${uf_sc#FORMULA:}")
+            [ -n "$uf_cur" ] && [ "$(formula_keg_of "$1")" = "$uf_cur" ] && echo "current ${uf_sc#FORMULA:} formula keg" ;;
+    esac
+}
+
 collect_specs() {
     : > "$1"
     for root in $SEARCH_ROOTS; do
@@ -324,11 +426,14 @@ if [ "${RUBY_GEM_SELFTEST:-0}" = "1" ]; then
     return 0 2>/dev/null || exit 0
 fi
 
-WORK="/tmp/rubygem_$$"; mkdir -p "$WORK"
+# One gem per call, always in a subshell: the body ends with `exit`, which
+# then only ends that gem's run.
+remediate_one() {
+WORK="/tmp/rubygem_$$_$GEM"; mkdir -p "$WORK"
 trap 'rm -rf "$WORK"' EXIT
 
 log "===== remediate-ruby-gem.sh START ====="
-log "Host: $(hostname -s)   GEM=$GEM   THRESHOLDS=$THRESHOLDS   PLUGIN=${PLUGIN:-n/a}"
+log "Host: $(hostname -s)   GEM=$GEM   SPEC=$GEM_SPEC   THRESHOLDS=$THRESHOLDS   PLUGIN=${PLUGIN:-n/a}"
 
 # -----------------------------------------------------------------------
 # 0. Homebrew prefix + a non-root user able to run brew/gem
@@ -375,7 +480,7 @@ run_brew() {
 # -----------------------------------------------------------------------
 log ""
 log "[1] Locating $GEM gemspecs..."
-SEARCH_ROOTS="/Library/Ruby/Gems"
+SEARCH_ROOTS="$SYS_RUBY_ROOT/Gems"
 PORTABLE_ROOT=""
 PORTABLE_CURRENT=""
 if [ -n "$BREW_PREFIX" ]; then
@@ -424,7 +529,7 @@ while IFS= read -r spec; do
     else
         log "  VULN     $ver  $spec  (< $need)"
         VULN=1
-        case "$spec" in /Library/Ruby/*) SYSTEM_VULN=1 ;; esac
+        case "$spec" in "$SYS_RUBY_ROOT"/*) SYSTEM_VULN=1 ;; esac
     fi
 done < "$WORK/specs"
 
@@ -524,6 +629,48 @@ else
         OUT=$(run_brew upgrade "$f" 2>&1); log "  $OUT"
         OUT=$(run_brew cleanup "$f" 2>&1); log "  cleanup $f: $OUT"
     done
+fi
+
+# -----------------------------------------------------------------------
+# 2c. macOS system Ruby: install the patched release where `sudo gem install`
+#     writes (/Library/Ruby/Gems/<abi>), so step 3 has a sibling to keep
+# -----------------------------------------------------------------------
+if [ "$SYSTEM_VULN" -eq 1 ]; then
+    log ""
+    log "[2c] macOS system Ruby has an outdated non-default $GEM..."
+    SYS_REQS=$(system_install_requirements "$WORK/specs" "$(system_ruby_abi)")
+    if [ "$SYSTEM_RUBY" != "1" ]; then
+        log "  SYSTEM_RUBY=0 -- not installing into /Library/Ruby; reported only."
+    elif [ "$NO_INSTALL" = "1" ]; then
+        log "  NO_INSTALL=1 -- not installing into /Library/Ruby."
+    elif [ ! -x "$SYS_GEM_BIN" ]; then
+        log "  $SYS_GEM_BIN not present -- cannot install into the system Ruby."
+    elif [ -z "$SYS_REQS" ]; then
+        log "  No outdated non-default spec in /Library/Ruby/Gems/$(system_ruby_abi) (the gem dir"
+        log "  /usr/bin/ruby loads). Nothing an install there could replace."
+    else
+        OLDIFS=$IFS; IFS='|'
+        for req in $SYS_REQS; do
+            IFS=$OLDIFS
+            if [ "$req" = "any" ]; then
+                shown="$SYS_GEM_BIN install $GEM --no-document"
+            else
+                shown="$SYS_GEM_BIN install $GEM --no-document -v '$req'"
+            fi
+            if [ "$DRY_RUN" = "1" ]; then
+                log "  [DRY_RUN] Would run: $shown"
+                continue
+            fi
+            log "  $shown"
+            if [ "$req" = "any" ]; then
+                OUT=$(HOME=/var/root "$SYS_GEM_BIN" install "$GEM" --no-document 2>&1)
+            else
+                OUT=$(HOME=/var/root "$SYS_GEM_BIN" install "$GEM" --no-document -v "$req" 2>&1)
+            fi
+            log "  $OUT"
+        done
+        IFS=$OLDIFS
+    fi
 fi
 
 # -----------------------------------------------------------------------
@@ -675,10 +822,18 @@ for root in $SEARCH_ROOTS; do
         base=$(basename "$spec"); ver=$(spec_version "$base")
         need=$(required_for "$ver")
         if [ -n "$need" ] && ! version_ge "$ver" "$need"; then
+            if [ "$SOFT_UNFIXABLE" = "1" ]; then
+                why=$(unfixable_reason "$spec")
+                if [ -n "$why" ]; then
+                    log "  OUTDATED          $ver  $spec  (newest $need; $why -- not updatable here)"
+                    echo x >> "$WORK/outdated"
+                    continue
+                fi
+            fi
             log "  STILL VULNERABLE  $ver  $spec"
             echo x >> "$WORK/remain"
             case "$spec" in */specifications/default/*) echo x >> "$WORK/remain_sys" ;; esac
-            case "$spec" in /Library/Ruby/*) echo x >> "$WORK/remain_sys" ;; esac
+            case "$spec" in "$SYS_RUBY_ROOT"/*) echo x >> "$WORK/remain_sys" ;; esac
             if [ -n "$PORTABLE_CURRENT" ]; then
                 case "$spec" in
                     *"/portable-ruby/$PORTABLE_CURRENT/"*) echo x >> "$WORK/remain_brewcur" ;;
@@ -724,7 +879,54 @@ if [ "$REMAIN" -eq 1 ]; then
     log "===== END (not remediated) ====="
     exit 1
 fi
-log "RESULT: no vulnerable $GEM spec remains."
-log "Re-run a Nessus scan to confirm plugin ${PLUGIN:-<n>} clears."
+if [ -f "$WORK/outdated" ]; then
+    log "RESULT: every $GEM copy this script can update is current. OUTDATED copies"
+    log "        above ship with Ruby, Homebrew, or a formula and only change when"
+    log "        that does; they are not a failure of this run."
+else
+    log "RESULT: no vulnerable $GEM spec remains."
+fi
+log "Re-run a Nessus scan to confirm the ${PLUGIN:+plugin $PLUGIN }finding clears."
 log "===== remediate-ruby-gem.sh END ====="
 exit 0
+}
+
+# GEM, GEM_SPEC -> THRESHOLDS, then the run. Always called in a subshell.
+resolve_and_remediate() {
+    case "$GEM_SPEC" in
+        latest|branch)
+            rel="/tmp/rubygem_releases_$$_$GEM"
+            fetch_release_list "$GEM" > "$rel"
+            resolved=$(thresholds_for_spec "$GEM_SPEC" "$rel")
+            rm -f "$rel"
+            if [ -z "$resolved" ]; then
+                log "===== remediate-ruby-gem.sh START ====="
+                log "ERROR: could not read $GEM releases from rubygems.org (offline, proxy,"
+                log "       or TLS inspection). Re-run when online, or give a fixed floor:"
+                log "       GEMS=\"$GEM=<min version>\""
+                log "===== END (not remediated) ====="
+                exit 1
+            fi
+            apply_thresholds "$resolved" 1 ;;
+        *)  apply_thresholds "$GEM_SPEC" 0 ;;
+    esac
+    remediate_one
+}
+
+OVERALL=0
+SUMMARY=""
+for entry in $GEMS; do
+    GEM="${entry%%=*}"
+    GEM_SPEC="latest"
+    case "$entry" in *=*) GEM_SPEC="${entry#*=}" ;; esac
+    [ -n "$GEM_SPEC" ] || GEM_SPEC="latest"
+    ( resolve_and_remediate )
+    rc=$?
+    SUMMARY="$SUMMARY $GEM=$rc"
+    if [ "$rc" -eq 1 ]; then OVERALL=1
+    elif [ "$rc" -ne 0 ] && [ "$OVERALL" -ne 1 ]; then OVERALL=2
+    fi
+    log ""
+done
+log "OVERALL: exit $OVERALL  (per gem:$SUMMARY; 0 = clean, 2 = needs a decision, 1 = not remediated)"
+exit "$OVERALL"

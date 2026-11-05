@@ -4,6 +4,8 @@
 # ARMB-09 (2026-09-28) ran the stock script and logged GEM=rexml. Plugin
 # 321503 is net-imap 0.6.4, fixed at 0.6.4.1. The older 0.6.4 floor would
 # treat that spec as already patched.
+# Globals assigned here are read by the sourced script's functions.
+# shellcheck disable=SC2034
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 script=$(cd "$here/.." && pwd)/remediate-ruby-gem.sh
@@ -30,11 +32,14 @@ check_rc() {
 }
 
 export RUBY_GEM_SELFTEST=1
+LOG_DIR=$(mktemp -d); export LOG_DIR
 # shellcheck source=/dev/null
 . "$script"
 
-check 'default gem' "$GEM" 'net-imap'
-check 'default plugin' "$PLUGIN" '321503'
+# ARMB-02 (2026-11-05): plugin 210049 was rexml, the stock paste ran net-imap only.
+check 'default run covers rexml, net-imap per branch, webrick' "$GEMS" 'rexml net-imap=branch webrick'
+GEM=net-imap
+apply_thresholds '0.4:0.4.24;0.5:0.5.15;0.6:0.6.4.1'
 check '0.6.4 floor is 0.6.4.1' "$(required_for 0.6.4)" '0.6.4.1'
 check '0.6.4.1 floor is 0.6.4.1' "$(required_for 0.6.4.1)" '0.6.4.1'
 check '0.5.14 floor is 0.5.15' "$(required_for 0.5.14)" '0.5.15'
@@ -103,6 +108,43 @@ other_abi="$fix/armb02.other"
 printf '%s\n' "$cellar_spec" "$b2/lib/ruby/gems/4.0.0/specifications/net-imap-0.4.24.gemspec" > "$other_abi"
 : > "$b2/lib/ruby/gems/4.0.0/specifications/net-imap-0.4.24.gemspec"
 check 'a different ABI never counts' "$(patched_sibling_of "$cellar_spec" "$other_abi")" ''
+
+# --- Release lookup (latest / branch) ----------------------------------------
+# Trimmed from a real rubygems.org /api/v1/versions/net-imap.json response:
+# a nested metadata object, a prerelease, and out-of-order numbers.
+cat > "$fix/netimap.json" <<'EOF'
+[{"authors":"Shugo Maeda","metadata":{"homepage_uri":"https://github.com/ruby/net-imap"},"number":"0.6.8","summary":"Ruby client api","platform":"ruby","rubygems_version":">= 0","ruby_version":">= 3.2.0","prerelease":false,"licenses":["Ruby"]},{"authors":"x","metadata":{},"number":"0.7.0.beta1","summary":"s","platform":"ruby","ruby_version":">= 3.2.0","prerelease":true},{"authors":"x","metadata":{},"number":"0.4.25","summary":"s","platform":"ruby","ruby_version":">= 2.7.3","prerelease":false},{"authors":"x","metadata":{},"number":"0.4.9.1","summary":"s","platform":"ruby","prerelease":false},{"authors":"x","metadata":{},"number":"0.6.10","summary":"s","platform":"ruby","prerelease":false},{"authors":"x","metadata":{},"number":"0.5.15","summary":"s","platform":"ruby","prerelease":false}]
+EOF
+release_versions < "$fix/netimap.json" > "$fix/netimap.rel"
+check 'prereleases are skipped' "$(grep -c beta "$fix/netimap.rel" || true)" '0'
+check 'all releases parsed' "$(wc -l < "$fix/netimap.rel" | tr -d ' ')" '5'
+check 'latest sorts by version, not text' "$(thresholds_for_spec latest "$fix/netimap.rel")" '0.6.10'
+check 'branch floors are the newest per major.minor' \
+  "$(thresholds_for_spec branch "$fix/netimap.rel")" '0.4:0.4.25;0.5:0.5.15;0.6:0.6.10'
+check 'explicit thresholds pass through' "$(thresholds_for_spec '3.4.2' "$fix/netimap.rel")" '3.4.2'
+check 'empty release list resolves to nothing' "$(thresholds_for_spec latest /dev/null)" ''
+
+# --- ARMB-02 plugin 210049: macOS system Ruby rexml ------------------------
+GEM=rexml
+apply_thresholds '3.4.4' 1
+SYS_RUBY_ROOT=/Library/Ruby
+printf '%s\n' /Library/Ruby/Gems/2.6.0/specifications/rexml-3.2.5.gemspec > "$fix/sys.list"
+check 'outdated non-default system rexml gets a plain install' \
+  "$(system_install_requirements "$fix/sys.list" 2.6.0)" 'any'
+check 'a gem dir /usr/bin/ruby does not load is left alone' \
+  "$(system_install_requirements "$fix/sys.list" 2.7.0)" ''
+printf '%s\n' /Library/Ruby/Gems/2.6.0/specifications/default/rexml-3.1.9.gemspec > "$fix/sysdef.list"
+check 'a system default gem is never an install target' \
+  "$(system_install_requirements "$fix/sysdef.list" 2.6.0)" ''
+check 'default gem is not updatable here' \
+  "$(unfixable_reason /Library/Ruby/Gems/2.6.0/specifications/default/rexml-3.1.9.gemspec)" 'Ruby default gem'
+check 'non-default system gem IS updatable' \
+  "$(unfixable_reason /Library/Ruby/Gems/2.6.0/specifications/rexml-3.2.5.gemspec)" ''
+GEM=net-imap
+apply_thresholds '0.4:0.4.25;0.5:0.5.15;0.6:0.6.8' 1
+printf '%s\n' /Library/Ruby/Gems/2.6.0/specifications/net-imap-0.4.9.1.gemspec > "$fix/sysbr.list"
+check 'branch mode installs on the vulnerable branch' \
+  "$(system_install_requirements "$fix/sysbr.list" 2.6.0)" '>= 0.4.25, < 0.5'
 
 if [ "$fail" -ne 0 ]; then
   echo "tests failed"

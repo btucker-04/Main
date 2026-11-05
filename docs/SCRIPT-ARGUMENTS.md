@@ -500,19 +500,21 @@ Generic Adobe updater via Remote Update Manager. Reads **environment variables**
 On a Mac with only Acrobat/Reader installed, RUM's `No new updates are available` with Return Code (2) is treated as nothing offered (`END (nothing offered)`, exit 2), not a failure. Its `Failed to initialize the HDPIM module` log lines are expected there. When a Creative Cloud app is installed, the same HDPIM failure is reported as the blocker. For Bridge (plugin 331360): `TARGETS="Bridge 2026=16.0.6;Bridge 2025=15.1.7"`.
 
 ## remediate-ruby-gem.sh
-Generic vulnerable-gem remediator. Accepts, in precedence order, **positional args > environment variables > in-script `CONFIG` block**.
+Generic vulnerable-gem remediator. A stock Mosyle paste needs **no edits**: it runs rexml, net-imap and webrick in one go. Precedence: **positional args > environment variables > in-script `CONFIG` block**.
 
 | Positional | Environment | CONFIG default | Description |
 |-----------|-------------|----------------|-------------|
-| `$1` | `GEM` | `CFG_GEM="net-imap"` | Gem name (required). |
-| `$2` | `THRESHOLDS` | `CFG_THRESHOLDS="0.4:0.4.24;0.5:0.5.15;0.6:0.6.4.1"` | Either a single minimum (`3.4.2`) or per-branch `prefix:minimum` pairs (required). Plugin 321503 floors: 0.5.15 and 0.6.4.1. The older 313278 floor of `0.6.4` treats the installed 0.6.4 spec as already fixed. |
-| `$3` | `PLUGIN` | `CFG_PLUGIN="321503"` | Plugin ID, for the log header only. |
+| — | `GEMS` | `CFG_GEMS="rexml net-imap=branch webrick"` | Gems to remediate, one run each. Entry = `NAME` or `NAME=SPEC`. SPEC `latest` (default) = newest release from rubygems.org; `branch` = newest release of each major.minor line; anything else = explicit THRESHOLDS. Overall exit is the worst per-gem result (1 > 2 > 0). |
+| `$1` | `GEM` | — | Single gem; overrides `GEMS`. |
+| `$2` | `THRESHOLDS` | `latest` | `latest`, `branch`, a single minimum (`3.4.2`), or per-branch `prefix:minimum` pairs (`0.4:0.4.24;0.5:0.5.15;0.6:0.6.4.1`). An explicit floor is strict: copies below it that the script cannot change (default gems, current portable-ruby, current formula keg) exit 2. With `latest`/`branch` they are listed `OUTDATED` and do not fail the run. |
+| `$3` | `PLUGIN` | — | Plugin ID, for the log only. |
+| — | `SYSTEM_RUBY` | `CFG_SYSTEM_RUBY="1"` | When macOS system Ruby has an outdated **non-default** spec in `/Library/Ruby/Gems/<abi>`, install the patched release there with `/usr/bin/gem` (as root, where `sudo gem install` writes), so the old copy can be removed. `0` = report only (exit 2). Default gems are never deleted. |
 | — | `NO_INSTALL` | `CFG_NO_INSTALL="0"` | Set `1` to clean up only; never install a patched gem. |
 | — | `DRY_RUN` | `CFG_DRY_RUN="0"` | Set `1` to report only, delete nothing. |
 
-Example (terminal): `./remediate-ruby-gem.sh net-imap "0.4:0.4.24;0.5:0.5.15;0.6:0.6.4.1" 321503`
+Examples (terminal): `./remediate-ruby-gem.sh` (all defaults) · `./remediate-ruby-gem.sh rexml` (latest) · `./remediate-ruby-gem.sh net-imap "0.4:0.4.24;0.5:0.5.15;0.6:0.6.4.1" 321503` (fixed floors)
 
-A stock Mosyle paste uses the CONFIG block. To remediate rexml instead, set `CFG_GEM="rexml"`, `CFG_THRESHOLDS="3.4.2"`, `CFG_PLUGIN="265895"` before deploying.
+`latest`/`branch` need rubygems.org; if it cannot be read the gem exits 1 and nothing changes. `branch` cannot tell an end-of-life line from a maintained one (net-imap 0.3.10 is the newest 0.3.x but is not a fix for 321503); use explicit floors when an advisory lists only some branches.
 
 Cleanup is gated on a patched sibling in the **same Ruby tree and ABI** (`gem install` writes only to the current Ruby). A Homebrew gem dir whose ABI no longer has any `Cellar/ruby*` keg (e.g. `lib/ruby/gems/3.3.0` left behind after ruby moved to 4.0) is logged `ORPHAN` and its vulnerable spec removed: nothing can load it and no patched sibling can ever appear there (ARMB-09). A gem dir whose interpreter still exists is left alone (`KEEP`).
 
