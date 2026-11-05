@@ -372,6 +372,16 @@ Tightens loose Everyone / Users / Domain Users / Authenticated Users ACLs on **d
 | `-Service` | string | `''` | Semicolon-separated service-name filter (registry / Win32 name, wildcards allowed). Empty = all non-protected services. |
 | `-IncludeMicrosoft` | switch | off | Also consider services under Windows / Defender / WindowsApps (normally skipped). |
 
+## Set-SpeculativeExecutionMitigation.ps1
+Intel BHI speculative-execution mitigation (CVE-2022-0001, Nessus plugin 302873). Sets `FeatureSettingsOverrideMask` / `FeatureSettingsOverride` under `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management` to one of the scan's three accepted settings. Empty EC arguments = BHI only (`0x00800000`, mask `0x3`). An existing accepted value is left alone. An existing value that only lacks the BHI bit is merged (`0x48` -> `0x00800048`). Any other existing value is held (exit 2), because it may deliberately disable a mitigation. Takes effect at boot: exits 3010 after a change, and keeps returning 3010 until the host has rebooted. EC success codes: `0,3010`.
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `-Combined` | switch | off | Write `0x00800048` (Tenable Recommended Settings 3: BHI + combined mitigations, Hyper-Threading on). |
+| `-CombinedDisableHT` | switch | off | Write `0x00802048` (Recommended Settings 2: also disables Hyper-Threading; costs CPU throughput). |
+| `-Force` | switch | off | Overwrite an existing value that is not an accepted setting. |
+| `-DryRun` | switch | off | Log the plan, write nothing. |
+
 ## Get-DotNetDependencyReferences.ps1
 Read-only: lists MSI dependency providers holding references on old .NET versions.
 
