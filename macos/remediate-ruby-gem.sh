@@ -516,7 +516,7 @@ if [ ! -s "$WORK/specs" ]; then
     exit 0
 fi
 
-VULN=0; UNKNOWN=0; SYSTEM_VULN=0
+VULN=0; UNKNOWN=0; SYSTEM_VULN=0; HOMEBREW_VULN=0
 while IFS= read -r spec; do
     base=$(basename "$spec"); ver=$(spec_version "$base")
     if [ "$ver" = "$base" ]; then log "  ?        $spec  (unparseable version)"; continue; fi
@@ -530,6 +530,7 @@ while IFS= read -r spec; do
         log "  VULN     $ver  $spec  (< $need)"
         VULN=1
         case "$spec" in "$SYS_RUBY_ROOT"/*) SYSTEM_VULN=1 ;; esac
+        [ "$(scope_of "$spec")" = "HOMEBREW" ] && HOMEBREW_VULN=1
     fi
 done < "$WORK/specs"
 
@@ -546,7 +547,12 @@ fi
 # -----------------------------------------------------------------------
 log ""
 log "[2] Ensuring a patched $GEM is installed..."
-if [ "$NO_INSTALL" = "1" ]; then
+# ARMB-02 (2026-11-05): webrick's only outdated copy was the system Ruby's
+# default gem, yet webrick-1.9.2 was installed into Homebrew Ruby, which had
+# none -- a new gem on the host that helps no copy and is one more to track.
+if [ "$HOMEBREW_VULN" -eq 0 ]; then
+    log "  No outdated copy in the Homebrew Ruby tree -- not installing there."
+elif [ "$NO_INSTALL" = "1" ]; then
     log "  NO_INSTALL=1 -- skipping install; cleanup will only remove specs that"
     log "  already have a patched sibling in the same branch."
 elif [ -z "$BREW_USER" ] || [ -z "$BREW_PREFIX" ]; then
