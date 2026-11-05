@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# update-homebrew.sh  (v3)
+# update-homebrew.sh  (v3.1)
 # Weekly Homebrew maintenance: update brew, upgrade every outdated formula and
 # cask, then remove superseded kegs.
 # Platform : macOS (bash 3.2 compatible) | Deploy: Mosyle (runs as root)
@@ -85,6 +85,15 @@
 #     runs cleanup once more.
 #   * CASK_SUDO also takes a list of cask names, so sudo can be granted only
 #     while those casks upgrade.
+#
+# v3.1, from the fleet runs of 2026-11-04..05:
+#   * [5b] ran ruby, ruby@4.0 and ruby@4 -- one keg under three opt/ names --
+#     and installed every gem three times. Each keg is now done once.
+#   * The network wait gave up after fewer than NETWORK_WAIT awake seconds
+#     when Power Nap slept the Mac several times between two probes
+#     (CSMB-036, CSMB-026). It now also needs NETWORK_WAIT / NETWORK_POLL
+#     probe rounds, and logs when the set of hosts that do not answer
+#     changes (ghcr.io alone -> all three on CSMB-036).
 #
 # Casks are upgraded ONE AT A TIME so one broken cask cannot stop the rest and
 # the log names exactly which ones failed. Casks that ship a .pkg installer
@@ -531,6 +540,22 @@ cask_sudo_wanted() {
     return 1
 }
 
+# Label already recorded for keg $1 in $2 (lines "keg|label"), or nothing.
+keg_seen_as() {
+    [ -n "$1" ] || return 0
+    printf '%s' "$2" | awk -F'|' -v k="$1" '$1 == k { print $2; exit }'
+}
+
+# Log line for the probe hosts still down ($1) when that set changes from $2.
+network_change_line() {
+    [ "$1" = "$2" ] && return 0
+    if [ "$1" = "$(echo $3)" ]; then
+        echo "Now no host answers ($1)."
+    else
+        echo "Now no answer from: $1"
+    fi
+}
+
 if [ "${HOMEBREW_UPDATE_SELFTEST:-0}" = "1" ]; then
     return 0 2>/dev/null || exit 0
 fi
@@ -834,10 +859,21 @@ maintain_ruby_gems() {
     log ""
     log "[5b] Ruby gems bundled with Homebrew Ruby: $RUBY_GEMS"
     found_ruby=0
+    seen_kegs=""
     for gembin in "$PREFIX"/opt/ruby/bin/gem "$PREFIX"/opt/ruby@*/bin/gem; do
         [ -x "$gembin" ] || continue
         found_ruby=1
         rlabel=$(basename "$(dirname "$(dirname "$gembin")")")
+        # opt/ruby@4 and opt/ruby@4.0 are aliases of opt/ruby: one keg, one
+        # gem path, so the gems would be installed three times over.
+        rkeg=$(cd "$(dirname "$gembin")/.." 2>/dev/null && pwd -P)
+        rsame=$(keg_seen_as "$rkeg" "$seen_kegs")
+        if [ -n "$rsame" ]; then
+            log "  $rlabel  same keg as $rsame ($rkeg) -- already done."
+            continue
+        fi
+        seen_kegs="${seen_kegs}${rkeg}|${rlabel}
+"
         gpath=$(tool_query "$gembin" environment gempath)
         rbin="$(dirname "$gembin")/ruby"
         abi=""
@@ -1004,21 +1040,34 @@ update_command_line_tools() {
     fi
 }
 
-# Wait (awake time) until every probe host answers, at most NETWORK_WAIT.
-# Sets OFFLINE=1 when none answer; a partial outage is only reported.
+# Wait until every probe host answers, at most NETWORK_WAIT. Sets OFFLINE=1
+# when none answer; a partial outage is only reported. The awake clock alone
+# is not enough here: Power Nap sleeps and wakes several times between two
+# ticks and only the last sleep is booked (CSMB-036 / CSMB-026 gave up after
+# "1121s" / "1044s" of a 600s wait), so also require NETWORK_WAIT worth of
+# probe rounds.
 check_network() {
     cn_waited_from=$AWAKE_NOW
     cn_said=0
+    cn_rounds=0
+    cn_prev=""
+    cn_need=0
+    [ "${NETWORK_POLL:-0}" -gt 0 ] && cn_need=$(( ${NETWORK_WAIT:-0} / NETWORK_POLL ))
     while :; do
         cn_down=$(unreachable_hosts "$NET_PROBE_HOSTS" | tr '\n' ' ' | sed 's/ $//')
         [ -z "$cn_down" ] && break
         tick
-        [ $(( AWAKE_NOW - cn_waited_from )) -ge "${NETWORK_WAIT:-0}" ] && break
+        [ $(( AWAKE_NOW - cn_waited_from )) -ge "${NETWORK_WAIT:-0}" ] && [ "$cn_rounds" -ge "$cn_need" ] && break
         if [ "$cn_said" -eq 0 ]; then
             log "  No answer from: $cn_down -- waiting up to ${NETWORK_WAIT}s for the network."
             cn_said=1
+        else
+            cn_line=$(network_change_line "$cn_down" "$cn_prev" "$NET_PROBE_HOSTS")
+            [ -n "$cn_line" ] && log "  $cn_line"
         fi
+        cn_prev=$cn_down
         sleep "$NETWORK_POLL"
+        cn_rounds=$(( cn_rounds + 1 ))
         tick
     done
     tick
@@ -1027,7 +1076,7 @@ check_network() {
         log "  Network OK ($NET_PROBE_HOSTS answer)$( [ "$cn_said" -eq 1 ] && echo " after ${cn_waited}s")."
     elif [ "$cn_down" = "$(echo $NET_PROBE_HOSTS)" ]; then
         OFFLINE=1
-        log "  OFFLINE: none of $NET_PROBE_HOSTS answered within ${cn_waited}s. Not running brew."
+        log "  OFFLINE: none of $NET_PROBE_HOSTS answered at the last of $(( cn_rounds + 1 )) probe rounds, ${NETWORK_POLL}s apart (${cn_waited}s awake). Not running brew."
     else
         log "  WARNING: no answer from $cn_down -- brew steps that need it will fail."
         add_issue "no answer from $cn_down at the start (proxy, filter or DNS?); brew steps that need it fail"

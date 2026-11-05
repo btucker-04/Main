@@ -203,6 +203,19 @@ openssl@3" | tr '\n' ' ')" 'postgresql@14 '
   u 'CASK_SUDO list covers a listed cask' "$(cask_sudo_wanted temurin@21 'temurin@21 docker-desktop' && echo y || echo n)" 'y'
   u 'CASK_SUDO list is whole-word' "$(cask_sudo_wanted temurin 'temurin@21 docker-desktop' && echo y || echo n)" 'n'
 
+  # --- v3.1: fleet runs 2026-11-04..05 ---
+  # ARMB-02 / CSMB-017: "ruby@4.0 ... gem path: .../Cellar/ruby/4.0.9/..." x3.
+  kegs="/opt/homebrew/Cellar/ruby/4.0.9|ruby
+"
+  u 'alias of a done keg names the first label' "$(keg_seen_as /opt/homebrew/Cellar/ruby/4.0.9 "$kegs")" 'ruby'
+  u 'another keg is new' "$(keg_seen_as /opt/homebrew/Cellar/ruby@3.3/3.3.10 "$kegs")" ''
+  u 'unresolved keg is never a duplicate' "$(keg_seen_as '' "$kegs")" ''
+  # CSMB-036: "No answer from: ghcr.io" ... "OFFLINE: none of github.com formulae.brew.sh ghcr.io".
+  hosts='github.com formulae.brew.sh ghcr.io'
+  u 'outage spreading to every host is logged' "$(network_change_line "$hosts" ghcr.io "$hosts")" "Now no host answers ($hosts)."
+  u 'outage narrowing is logged' "$(network_change_line github.com "$hosts" "$hosts")" 'Now no answer from: github.com'
+  u 'unchanged outage logs nothing' "$(network_change_line ghcr.io ghcr.io "$hosts")" ''
+
   OUTPUT_LIMIT=1000; OUT_USED=0; set_output_phase body
   o=$( for i in $(seq 1 60); do to_stdout "body line $i padded to about forty bytes"; done
        set_output_phase summary; for i in $(seq 1 60); do to_stdout "summary $i"; done
@@ -255,6 +268,9 @@ EOF
 for a in "\$@"; do u="\$a"; done
 h="\${u#https://}"
 echo "curl \$h" >> "$S/net_calls"
+# state/net_nap = N: Power Nap -- each probe the clock jumps N seconds and
+# kern.sleeptime / kern.waketime do not record it.
+[ -f "$S/net_nap" ] && echo \$(( \$(cat "$S/clock_offset" 2>/dev/null || echo 0) + \$(cat "$S/net_nap") )) > "$S/clock_offset"
 # state/net_up_after = N: the network comes back after N probes.
 [ -f "$S/net_up_after" ] && [ "\$(wc -l < "$S/net_calls")" -gt "\$(cat "$S/net_up_after")" ] && exit 0
 grep -qx "\$h" "$S/net_down" 2>/dev/null && { echo "curl: (6) Could not resolve host: \$h" >&2; exit 6; }
@@ -685,6 +701,38 @@ check_grep 'ruby 4.0 rexml installed' '^gem-ruby install rexml --no-document$' "
 check 'old rexml removed' "$(present "$G4/specifications/rexml-3.4.1.gemspec")" 'gone'
 check 'mismatch run exits 2' "$rc" '2'
 
+# opt/ruby, opt/ruby@4 and opt/ruby@4.0 all link to Cellar/ruby/4.0.9
+# (ARMB-02 / CSMB-017 2026-11-04: each gem installed three times).
+make_fixture
+: > "$S/casks_outdated"; : > "$S/formulae_outdated"; : > "$S/pinned"
+G4="$P/lib/ruby/gems/4.0.0"
+RK="$P/Cellar/ruby/4.0.9"
+mkdir -p "$RK/bin" "$RK/lib/ruby/4.0.0" "$G4/specifications"
+: > "$G4/specifications/rexml-3.4.1.gemspec"
+printf '#!/bin/bash\nprintf 4.0.0\n' > "$RK/bin/ruby"
+cat > "$RK/bin/gem" <<EOF
+#!/bin/bash
+echo "gem \$*" >> "$S/calls"
+case "\$1" in
+  environment) echo "$G4"; exit 0 ;;
+  list) v=""; for f in "$G4"/specifications/rexml-*.gemspec; do [ -f "\$f" ] || continue
+          b=\$(basename "\$f" .gemspec); v="\${v:+\$v, }\${b#rexml-}"; done
+        [ -n "\$v" ] && echo "rexml (\$v)"; exit 0 ;;
+  install) : > "$G4/specifications/rexml-3.4.4.gemspec"; exit 0 ;;
+esac
+exit 0
+EOF
+chmod +x "$RK/bin/ruby" "$RK/bin/gem"
+mkdir -p "$P/opt"
+for n in ruby ruby@4 ruby@4.0; do ln -s ../Cellar/ruby/4.0.9 "$P/opt/$n"; done
+run_script env RUBY_GEMS=rexml:latest; rc=$?
+L="$fix/run/logs/homebrew_update.log"
+check 'aliased keg: gem install runs once' "$(grep -c '^gem install rexml' "$S/calls")" '1'
+check_grep 'ruby@4 skipped as the same keg' 'ruby@4  same keg as ruby \(.*/Cellar/ruby/4.0.9\) -- already done\.' "$L"
+check_grep 'ruby@4.0 skipped as the same keg' 'ruby@4.0  same keg as ruby ' "$L"
+check 'old rexml removed through the one keg' "$(present "$G4/specifications/rexml-3.4.1.gemspec")" 'gone'
+check 'aliased keg run exits 0' "$rc" '0'
+
 make_fixture
 : > "$S/casks_outdated"; : > "$S/formulae_outdated"
 mkdir -p "$P/lib/ruby/gems/3.3.0/specifications"
@@ -814,6 +862,39 @@ L="$fix/run/logs/homebrew_update.log"
 check_grep 'partial outage reported' '  - no answer from ghcr.io at the start' "$L"
 check_grep 'brew still ran' '^update' "$S/calls"
 check 'partial outage exits 2' "$rc" '2'
+# Power Nap between probes (CSMB-026: "OFFLINE ... within 1044s" of a 600s
+# wait): unbooked clock jumps do not end the wait before its probe rounds.
+make_fixture
+: > "$S/casks_outdated"; : > "$S/formulae_outdated"; : > "$S/pinned"
+printf 'github.com\nformulae.brew.sh\nghcr.io\n' > "$S/net_down"
+echo 400 > "$S/net_nap"
+echo 6 > "$S/net_up_after"
+run_script env NETWORK_WAIT=3 NETWORK_POLL=1; rc=$?
+L="$fix/run/logs/homebrew_update.log"
+check_nogrep 'Power Nap is not OFFLINE' 'OFFLINE' "$L"
+check_grep 'network came back after the naps' 'Network OK .* after [0-9]+s' "$L"
+check 'Power Nap run exits 0' "$rc" '0'
+# Still down after every round: OFFLINE names the rounds, and a change in
+# which hosts fail is logged (CSMB-036: ghcr.io, then all three).
+make_fixture
+printf 'ghcr.io\n' > "$S/net_down"
+cat > "$fix/run/shims/curl" <<EOF
+#!/bin/bash
+for a in "\$@"; do u="\$a"; done
+h="\${u#https://}"
+echo "curl \$h" >> "$S/net_calls"
+[ "\$(wc -l < "$S/net_calls")" -gt 3 ] && exit 6
+[ "\$h" = ghcr.io ] && exit 6
+exit 0
+EOF
+chmod +x "$fix/run/shims/curl"
+run_script env NETWORK_WAIT=2 NETWORK_POLL=1; rc=$?
+L="$fix/run/logs/homebrew_update.log"
+check_grep 'first outage named' 'No answer from: ghcr.io -- waiting up to 2s' "$L"
+check_grep 'spread to every host logged' 'Now no host answers \(github.com formulae.brew.sh ghcr.io\)\.' "$L"
+check_grep 'OFFLINE counts probe rounds' 'OFFLINE: none of github.com formulae.brew.sh ghcr.io answered at the last of 3 probe rounds, 1s apart' "$L"
+check 'spread outage exits 1' "$rc" '1'
+check 'spread outage calls no brew' "$(grep -c . "$S/calls")" '0'
 
 # Steps skipped for the budget are "not run", not "failed" (CSMB-011,
 # CSPRMB-21-A: "brew upgrade --formula failed", "gem install ... exit 124").
