@@ -116,6 +116,17 @@ check 'multi: overall exit 1' "$rc" 1
 check 'multi: rexml still fixed' "$([ -f "$sys/specifications/rexml-3.2.5.gemspec" ] && echo present || echo gone)" gone
 check 'multi: per-gem summary' "$(has "$t/out" 'per gem: rexml=0 webrick=1;')" yes
 
+# 7. ARMB-02 webrick (2026-11-05): the only outdated copy is a system default
+#    gem. Nothing may be installed anywhere -- no install can replace it.
+stage webrickdefault
+: > "$sys/specifications/default/webrick-1.9.1.gemspec"
+printf '[{"authors":"x","metadata":{},"number":"1.9.2","summary":"s","platform":"ruby","prerelease":false}]' > "$t/json/webrick.json"
+rc=$(GEMS=webrick run)
+check 'webrick default only: exit 0' "$rc" 0
+check 'webrick default only: Homebrew install skipped' "$(has "$t/out" 'No outdated copy in the Homebrew Ruby tree')" yes
+check 'webrick default only: no gem install at all' "$([ -f "$t/gem.calls" ] && echo called || echo none)" none
+check 'webrick default only: listed OUTDATED' "$(has "$t/out" 'OUTDATED          1.9.1')" yes
+
 if [ "$fail" -ne 0 ]; then
   echo "tests failed"
   exit 1
