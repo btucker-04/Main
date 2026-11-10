@@ -493,7 +493,7 @@ Checks agent state and fixes only what is broken. Reads **environment variables*
 | `RESET_TENABLE_TAG` | `0` | Set `1` to recover from an HTTP 409 duplicate-identity link rejection by deleting `/private/etc/tenable_tag` (agent regenerates one) and retrying the link. Off by default: the host then links as a **new** agent and the stale record stays in Tenable holding a license seat until a human deletes it (Sensors > Agents). Without this, a 409 exits 2 with the diagnosis. |
 
 ## update-adobe-rum.sh
-Generic Adobe updater via Remote Update Manager. Reads **environment variables**, with in-script `CFG_*` defaults for Mosyle (which cannot pass env at deploy). A terminal-set variable wins over `CFG_*`.
+Generic Adobe updater via Remote Update Manager. Reads **environment variables**, with in-script `CFG_*` defaults for Mosyle (which cannot pass env at deploy). A terminal-set variable wins over `CFG_*`. Only one copy runs at a time: a second copy started while the first is still running logs the first copy's pid and command line and exits `2` without calling RUM. The lock is `/var/run/composecure-adobe-rum.lock`, and a lock left by a killed run is taken over. When the script defers to a live RemoteUpdateManager, it logs which process started it.
 
 | Environment variable | Default | Description |
 |----------------------|---------|-------------|
