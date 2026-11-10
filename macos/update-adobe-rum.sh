@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# update-adobe-rum.sh  (v7)
+# update-adobe-rum.sh  (v7.1)
 # Generic Adobe updater via Remote Update Manager (RUM).
 # Platform : macOS (bash 3.2 compatible) | Deploy: Mosyle (runs as root)
 #
@@ -19,6 +19,19 @@
 # 2026-08-07, running as root). Unfiltered is the reliable path. Set SAP_CODES to
 # target specific products; if that call fails the script falls back to
 # unfiltered unless NO_FALLBACK=1.
+#
+# v7.1 (from the 2026-11-10 CSMB-062 run):
+#   * Two copies of this script started in the same second. Both found no
+#     RUM running, then this copy's list and install hit the other copy's
+#     RUM lock and it deferred after a 120s wait. Only one copy now runs at
+#     a time (RUN_LOCK, a directory holding the owner's pid); a second copy
+#     logs the first copy's pid and command line and exits 2 at once.
+#   * A deferral now logs who started the live RUM ('Started by: pid command
+#     <- parent ...'). On CSMB-062 the RUM it waited on was born in the same
+#     second as this run's own RUM calls, and the log could not say whether
+#     it was a second copy of this script, another Mosyle job or a person.
+#   * The 'Not interrupting' line gives the real reason. It used to print
+#     'or KILL_STALE_RUM=1', as if killing were turned off.
 #
 # v7 (from the 2026-10-13 CSMB-002 run):
 #   * On an Acrobat-only Mac, RUM 3.1 prints 'No new updates are available
@@ -180,9 +193,13 @@ WORK="/tmp/adobe_rum_$$"
 mkdir -p "$LOG_DIR" "$WORK"
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"; }
 
+RUN_LOCK="${RUN_LOCK:-/var/run/composecure-adobe-rum.lock}"
+HOLD_RUN_LOCK=0
+
 CAFFEINATE_PID=""
 cleanup() {
     [ -n "$CAFFEINATE_PID" ] && kill "$CAFFEINATE_PID" 2>/dev/null
+    [ "$HOLD_RUN_LOCK" = "1" ] && rm -rf "$RUN_LOCK"
     rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -396,6 +413,36 @@ rum_pid_elapsed_seconds() {
     etime_to_seconds "$et"
 }
 
+# "pid command <- ppid command <- ..." for $1 up to (not including) launchd,
+# so a deferral says WHO started the RUM it is waiting on.
+rum_launcher_chain() {
+    lc_pid="$1"; lc_out=""; lc_n=0
+    while [ -n "$lc_pid" ] && [ "$lc_pid" -gt 1 ] 2>/dev/null && [ "$lc_n" -lt 5 ]; do
+        lc_line=$(ps -o ppid=,command= -p "$lc_pid" 2>/dev/null | head -1)
+        [ -n "$lc_line" ] || break
+        lc_ppid=$(echo "$lc_line" | awk '{print $1}')
+        lc_cmd=$(echo "$lc_line" | sed -E 's/^ *[0-9]+ +//' | cut -c1-120)
+        lc_out="${lc_out}${lc_out:+ <- }${lc_pid} ${lc_cmd}"
+        lc_pid="$lc_ppid"; lc_n=$((lc_n + 1))
+    done
+    echo "$lc_out"
+}
+
+# Why a live RUM is left alone, for the deferral message.
+rum_spare_reason() {
+    if [ "$1" != "1" ]; then
+        echo "KILL_STALE_RUM=$1"
+    else
+        echo "elapsed ${2}s < STALE_RUM_SECONDS=$3, so it is a young job, not a hung one"
+    fi
+}
+
+log_rum_launchers() {
+    for lr_pid in $(rum_live_pids); do
+        log "  Started by: $(rum_launcher_chain "$lr_pid")"
+    done
+}
+
 # Oldest (largest elapsed) live RUM, or 0 if none.
 rum_oldest_elapsed_seconds() {
     oldest=0
@@ -453,6 +500,7 @@ resolve_rum_contention() {
     fi
     age=$(rum_oldest_elapsed_seconds)
     log "  RemoteUpdateManager already running (pid(s): $(echo "$pids" | tr '\n' ' ') oldest elapsed ${age}s)."
+    log_rum_launchers
     if [ "$WAIT_FOR_RUM_SECONDS" -gt 0 ]; then
         log "  Waiting up to ${WAIT_FOR_RUM_SECONDS}s for it to finish..."
         wait_for_rum_exit "$WAIT_FOR_RUM_SECONDS" || true
@@ -480,8 +528,7 @@ resolve_rum_contention() {
         log "  RUM survived SIGKILL. Deferring."
         return 1
     fi
-    log "  Concurrent/young RUM (elapsed ${age}s < STALE_RUM_SECONDS=${STALE_RUM_SECONDS}"
-    log "  or KILL_STALE_RUM=${KILL_STALE_RUM}). Not interrupting. Re-run later."
+    log "  Not interrupting it ($(rum_spare_reason "$KILL_STALE_RUM" "$age" "$STALE_RUM_SECONDS")). Re-run later."
     return 1
 }
 
@@ -634,6 +681,32 @@ rum_install_once() {
     fi
 }
 
+# One copy of this script at a time. Two copies started in the same second
+# (CSMB-062 2026-11-10) both pass the RUM process check, then one copy's RUM
+# calls hit the other's lock. mkdir is atomic; a lock whose pid is gone (killed
+# run, reboot) is taken over. Sets HELD_BY when another live copy holds it.
+take_run_lock() {
+    HELD_BY=""
+    if mkdir "$RUN_LOCK" 2>/dev/null; then
+        echo "$$" > "$RUN_LOCK/pid"; HOLD_RUN_LOCK=1; return 0
+    fi
+    HELD_BY=$(cat "$RUN_LOCK/pid" 2>/dev/null)
+    if [ -z "$HELD_BY" ]; then
+        sleep 2
+        HELD_BY=$(cat "$RUN_LOCK/pid" 2>/dev/null)
+    fi
+    if [ -n "$HELD_BY" ] && [ "$HELD_BY" != "$$" ] && kill -0 "$HELD_BY" 2>/dev/null; then
+        return 1
+    fi
+    HELD_BY=""
+    rm -rf "$RUN_LOCK"
+    if mkdir "$RUN_LOCK" 2>/dev/null; then
+        echo "$$" > "$RUN_LOCK/pid"; HOLD_RUN_LOCK=1; return 0
+    fi
+    HELD_BY=$(cat "$RUN_LOCK/pid" 2>/dev/null)
+    return 1
+}
+
 if [ "${RUM_SELFTEST:-0}" = "lib" ]; then
     trap - EXIT
     rm -rf "$WORK"
@@ -702,6 +775,13 @@ log "===== update-adobe-rum.sh START ====="
 log "Host: $(hostname -s)"
 log "TARGETS=${TARGETS:-<none>}  SAP_CODES=${SAP_CODES:-<none, unfiltered>}  DRY_RUN=$DRY_RUN"
 log "FORCE_CLOSE=$FORCE_CLOSE  KILL_STALE_RUM=$KILL_STALE_RUM  WAIT_FOR_RUM_SECONDS=$WAIT_FOR_RUM_SECONDS  STALE_RUM_SECONDS=$STALE_RUM_SECONDS"
+if ! take_run_lock; then
+    log "  Another copy of update-adobe-rum.sh is already running: $(rum_launcher_chain "$HELD_BY")"
+    log "  (the script was started twice -- a duplicate Mosyle assignment or a"
+    log "  manual run). That copy does the update; check its log. Not running RUM."
+    log "===== END (deferred: another copy of this script is running) ====="
+    exit 2
+fi
 
 # -----------------------------------------------------------------------
 # 1. Inventory before

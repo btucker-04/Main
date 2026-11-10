@@ -78,6 +78,39 @@ rum_install_once >/dev/null 2>&1
 check 'SAP_CODES path: no-updates on Acrobat-only sets RUM_OK' "$RUM_OK" 1
 SAP_CODES=
 
+# --- CSMB-062 2026-11-10: two copies started in the same second ---
+RUN_LOCK="$fix/run.lock"
+HOLD_RUN_LOCK=0
+take_run_lock
+check 'free lock is taken' "$HOLD_RUN_LOCK" 1
+check 'lock records our pid' "$(cat "$RUN_LOCK/pid")" "$$"
+sleep 30 & other=$!
+echo "$other" > "$RUN_LOCK/pid"; HOLD_RUN_LOCK=0
+check 'live other copy keeps the lock' "$(rc_of take_run_lock)" 1
+take_run_lock
+check 'holder pid reported' "$HELD_BY" "$other"
+kill "$other"; wait "$other" 2>/dev/null
+take_run_lock
+check 'dead holder: lock taken over' "$HOLD_RUN_LOCK" 1
+check 'dead holder: our pid recorded' "$(cat "$RUN_LOCK/pid")" "$$"
+rm -rf "$RUN_LOCK"
+
+# 'Concurrent/young RUM (elapsed 117s < STALE_RUM_SECONDS=600 / or KILL_STALE_RUM=1)'
+check 'young RUM reason with killing on' "$(rum_spare_reason 1 117 600)" 'elapsed 117s < STALE_RUM_SECONDS=600, so it is a young job, not a hung one'
+check 'killing off is the reason' "$(rum_spare_reason 0 900 600)" 'KILL_STALE_RUM=0'
+
+ps() {
+  case "$4" in
+    25708) echo '25690 /usr/local/bin/RemoteUpdateManager --action=install' ;;
+    25690) echo '25001 /bin/bash /private/tmp/mosyle/update-adobe-rum.sh' ;;
+    25001) echo '    1 /usr/local/bin/MosyleAgent' ;;
+  esac
+}
+check 'launcher chain up to launchd' "$(rum_launcher_chain 25708)" \
+  '25708 /usr/local/bin/RemoteUpdateManager --action=install <- 25690 /bin/bash /private/tmp/mosyle/update-adobe-rum.sh <- 25001 /usr/local/bin/MosyleAgent'
+check 'gone pid gives an empty chain' "$(rum_launcher_chain 99999)" ''
+unset -f ps
+
 if [ "$fail" -ne 0 ]; then
   echo "test(s) failed"
   exit 1
