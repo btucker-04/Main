@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# update-adobe-rum.sh  (v7.1)
+# update-adobe-rum.sh  (v7.2)
 # Generic Adobe updater via Remote Update Manager (RUM).
 # Platform : macOS (bash 3.2 compatible) | Deploy: Mosyle (runs as root)
 #
@@ -19,6 +19,17 @@
 # 2026-08-07, running as root). Unfiltered is the reliable path. Set SAP_CODES to
 # target specific products; if that call fails the script falls back to
 # unfiltered unless NO_FALLBACK=1.
+#
+# v7.2 (from the second 2026-11-10 CSMB-062 run):
+#   * Mosyle cut the output off inside the RUM log dump, so [7] and the
+#     RESULT never showed. The dump printed up to 15 lines per log going back
+#     weeks. It now prints only lines from this run, folds the per-segment
+#     'isSegmentSizeValid' retries into one count, and drops RUM's constant
+#     columns. The Signature MISMATCH note also counts this run only, and now
+#     counts short segments too.
+#   * [7] states what RUM offered in [5]. On CSMB-062 it offered only the
+#     Premiere Pro Beta, so Bridge 16.0.4 (Tenable 331360) could not move;
+#     the cut-off log hid that.
 #
 # v7.1 (from the 2026-11-10 CSMB-062 run):
 #   * Two copies of this script started in the same second. Both found no
@@ -192,6 +203,8 @@ LOG_FILE="$LOG_DIR/adobe_rum_update.log"
 WORK="/tmp/adobe_rum_$$"
 mkdir -p "$LOG_DIR" "$WORK"
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"; }
+# RUM log timestamps ('11/10/26 19:57:50:262') as yymmddHHMMSS, for "this run".
+RUN_START_KEY=$(date '+%y%m%d%H%M%S')
 
 RUN_LOCK="${RUN_LOCK:-/var/run/composecure-adobe-rum.lock}"
 HOLD_RUN_LOCK=0
@@ -268,6 +281,38 @@ lookup_version() {  # $1 = inventory file, $2 = app path
 # useful for diagnosing a RUM failure.
 RUM_LOG_SIGNAL='FATAL|ERROR|Fatal Error|Failed to [Dd]ownload|failed to [Dd]ownload|Return Code|exiting with'
 
+# Lines of RUM log $1 stamped at or after $2 (yymmddHHMMSS). RUM's logs go
+# back weeks; printing their old errors used up Mosyle's output, which cut
+# off [7] and the RESULT (CSMB-062 2026-11-10).
+rum_lines_since() {
+    awk -v from="$2" '$1 ~ /^[0-9][0-9]\/[0-9][0-9]\/[0-9][0-9]$/ {
+        split($1, d, "/"); split($2, t, ":")
+        if (d[3] d[1] d[2] t[1] t[2] t[3] >= from) print
+    }' "$1" 2>/dev/null
+}
+
+# stdin: RUM log lines. Drops the constant '| AAMEE | Utilities |
+# RemoteUpdateManager |' columns, folds the per-segment 'isSegmentSizeValid'
+# retries into one count, keeps the last 12 lines and caps their width.
+condense_rum_lines() {
+    awk '
+        /isSegmentSizeValid/ { seg++; next }
+        { sub(/ \| AAMEE \| Utilities \| RemoteUpdateManager \|/, " |"); keep[++n] = substr($0, 1, 220) }
+        END {
+            for (i = (n > 12 ? n - 11 : 1); i <= n; i++) print keep[i]
+            if (seg) print seg " x isSegmentSizeValid: a downloaded segment was shorter than Adobe says"
+        }'
+}
+
+# $1 = RUM stdout. The "(SAPCODE/version/platform)" entries listed under
+# 'Following Updates are applicable on the system'.
+rum_offered_updates() {
+    printf '%s\n' "$1" | awk '
+        /Following Updates are applicable/ { f = 1; next }
+        /\*\*\*\*\*/ { f = 0 }
+        f && /\(/ { gsub(/^[ \t]*\(|\)[ \t]*$/, ""); print }'
+}
+
 dump_rum_log() {
     log "  --- relevant lines from Adobe RemoteUpdateManager log(s) ---"
     log "  (filtered to FATAL/ERROR/failure/return-code lines; full log is at the"
@@ -283,12 +328,11 @@ dump_rum_log() {
         esac
         SEEN_LOGS="$SEEN_LOGS $cand"
         found=1; log "  == $cand =="
-        hits=$(grep -E "$RUM_LOG_SIGNAL" "$cand" 2>/dev/null | tail -15)
+        hits=$(rum_lines_since "$cand" "$RUN_START_KEY" | grep -E "$RUM_LOG_SIGNAL" | condense_rum_lines)
         if [ -n "$hits" ]; then
             echo "$hits" | while IFS= read -r l; do [ -n "$l" ] && log "    $l"; done
         else
-            log "    (no FATAL/ERROR/failure lines matched; tailing last 5 raw lines)"
-            tail -5 "$cand" 2>/dev/null | while IFS= read -r l; do [ -n "$l" ] && log "    $l"; done
+            log "    (no FATAL/ERROR/failure lines from this run)"
         fi
     done
     for udir in /Users/*; do
@@ -299,7 +343,7 @@ dump_rum_log() {
         esac
         SEEN_LOGS="$SEEN_LOGS $cand"
         found=1; log "  == $cand =="
-        hits=$(grep -E "$RUM_LOG_SIGNAL" "$cand" 2>/dev/null | tail -15)
+        hits=$(rum_lines_since "$cand" "$RUN_START_KEY" | grep -E "$RUM_LOG_SIGNAL" | condense_rum_lines)
         if [ -n "$hits" ]; then
             echo "$hits" | while IFS= read -r l; do [ -n "$l" ] && log "    $l"; done
         fi
@@ -592,13 +636,15 @@ report_signature_mismatches() {
                 "$HOME/Library/Logs/RemoteUpdateManager.log" \
                 /Users/*/Library/Logs/RemoteUpdateManager.log; do
         [ -f "$cand" ] || continue
-        hits=$(grep -c "Signature MISMATCH" "$cand" 2>/dev/null)
-        if [ -n "$hits" ] && [ "$hits" -gt 0 ]; then
-            log "  NOTE: $cand contains $hits 'Signature MISMATCH' entries (may include"
-            log "  older ones). A content-hash mismatch on a downloaded segment is"
-            log "  consistent with an SSL-inspecting proxy altering bytes in transit,"
-            log "  not a transient network blip. If this recurs, check whether Adobe's"
-            log "  CDN (cdn-ffc.oobesaas.adobe.com and related) is being SSL-inspected."
+        this_run=$(rum_lines_since "$cand" "$RUN_START_KEY")
+        hits=$(printf '%s\n' "$this_run" | grep -c "Signature MISMATCH")
+        short=$(printf '%s\n' "$this_run" | grep -c "isSegmentSizeValid")
+        if [ "$hits" -gt 0 ] || [ "$short" -gt 0 ]; then
+            log "  NOTE: this run, $cand logged $hits 'Signature MISMATCH' and $short"
+            log "  short-segment errors. Segments that arrive altered or cut short are"
+            log "  consistent with an SSL-inspecting proxy, not a transient network blip."
+            log "  Check whether Adobe's CDN (cdn-ffc.oobesaas.adobe.com and related) is"
+            log "  being SSL-inspected or rate-limited."
         fi
     done
 }
@@ -909,6 +955,7 @@ if [ -n "$SAP_CODES" ]; then
 else
     run_rum "list (all products)" --action=list || true
 fi
+OFFERED=$(rum_offered_updates "$LAST_RUM_OUT")
 
 if [ "$DRY_RUN" = "1" ]; then
     log ""
@@ -941,6 +988,12 @@ report_hdpim_failure
 # -----------------------------------------------------------------------
 log ""
 log "[7] Version diff (RUM's exit code is not evidence)..."
+if [ -n "$OFFERED" ]; then
+    log "  RUM offered in [5]: $(echo $OFFERED)"
+else
+    log "  RUM offered nothing in [5]."
+fi
+log "  An app below that RUM did not offer cannot be updated by this script."
 inventory "$WORK/after"
 MOVED=0
 while IFS='|' read -r app v; do
