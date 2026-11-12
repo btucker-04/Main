@@ -54,7 +54,7 @@ openssl@3" | tr '\n' ' ')" 'postgresql@14 '
 
   t=$(mktemp)
   echo 'sudo: a terminal is required to read the password; either use the -S option' > "$t"
-  u 'pkg cask needs sudo' "$(cask_failure_reason "$t")" 'needs sudo (.pkg installer) -- set CASK_SUDO=1'
+  u 'pkg cask needs sudo' "$(cask_failure_reason "$t")" 'needs sudo (.pkg installer) -- add it to CFG_CASK_SUDO'
   echo 'Error: It seems there is already an App at /Applications/Slack.app' > "$t"
   u 'existing app mismatch' "$(cask_failure_reason "$t")" "app on disk does not match brew's record -- reinstall the cask by hand"
   echo 'Error: Download failed on Cask zoom with message: curl: (22)' > "$t"
@@ -216,6 +216,42 @@ openssl@3" | tr '\n' ' ')" 'postgresql@14 '
   u 'outage narrowing is logged' "$(network_change_line github.com "$hosts" "$hosts")" 'Now no answer from: github.com'
   u 'unchanged outage logs nothing' "$(network_change_line ghcr.io ghcr.io "$hosts")" ''
 
+  # --- v3.2: fleet runs 2026-10-19..11-12 ---
+  # jriegel-mac: "FAILED android-ndk / sage / zulu@11 / zulu@8 -- needs sudo".
+  u 'sudo suggestion from CASK_SUDO=0' "$(cask_sudo_suggestion 0 ' android-ndk sage zulu@11 zulu@8')" 'android-ndk sage zulu@11 zulu@8'
+  u 'sudo suggestion adds to an existing list' "$(cask_sudo_suggestion 'temurin@21' 'temurin@21 docker-desktop')" 'temurin@21 docker-desktop'
+  u 'no suggestion when CASK_SUDO=1' "$(cask_sudo_suggestion 1 'zoom')" ''
+  u 'no suggestion without sudo casks' "$(cask_sudo_suggestion 0 ' ')" ''
+  m=$(mktemp)
+  printf '%s\n' '/opt/homebrew sage 10.7' '/opt/homebrew zulu@8 8.88.0.19' '/usr/local sage 10.6' > "$m"
+  u 'memo hit on same cask and version' "$(sudo_memo_has /opt/homebrew sage 10.7 "$m" && echo y || echo n)" 'y'
+  u 'memo miss on a new installed version' "$(sudo_memo_has /opt/homebrew sage 10.8 "$m" && echo y || echo n)" 'n'
+  u 'memo miss on unknown version' "$(sudo_memo_has /opt/homebrew sage '' "$m" && echo y || echo n)" 'n'
+  u 'memo miss on another prefix' "$(sudo_memo_has /usr/local zulu@8 8.88.0.19 "$m" && echo y || echo n)" 'n'
+  u 'memo carries other prefixes and untried casks' "$(sudo_memo_untried /opt/homebrew 'zulu@8' "$m" | tr '\n' '|')" '/opt/homebrew zulu@8 8.88.0.19|/usr/local sage 10.6|'
+  rm -f "$m"
+  tp=$(mktemp -d)
+  mkdir -p "$tp/Caskroom/temurin/25.0.1,8" "$tp/Caskroom/temurin/.metadata"
+  u 'installed cask version skips .metadata' "$(cask_installed_version "$tp" temurin)" '25.0.1,8'
+  u 'no version for a cask not installed' "$(cask_installed_version "$tp" zoom)" ''
+  # CSPRMB-21-A: ethereum/ethereum + microsoft/git untrusted, no "brew trust
+  # --formula" lines. solidity is installed, but from homebrew/core.
+  mkdir -p "$tp/Library/Taps/ethereum/homebrew-ethereum/Formula" "$tp/Library/Taps/microsoft/homebrew-git/Casks" \
+    "$tp/Library/Taps/nikitabobko/homebrew-tap/Casks" "$tp/Cellar/solidity/0.8.30" "$tp/Caskroom/aerospace/0.19.2/.x" \
+    "$tp/Caskroom/aerospace/.metadata"
+  touch "$tp/Library/Taps/ethereum/homebrew-ethereum/Formula/solidity.rb" "$tp/Library/Taps/ethereum/homebrew-ethereum/Formula/cpp-ethereum.rb" \
+    "$tp/Library/Taps/microsoft/homebrew-git/Casks/git-credential-manager.rb" "$tp/Library/Taps/nikitabobko/homebrew-tap/Casks/aerospace.rb"
+  printf '{"source": {"tap": "homebrew/core", "spec": "stable"}}' > "$tp/Cellar/solidity/0.8.30/INSTALL_RECEIPT.json"
+  printf '{"source": {"tap": "nikitabobko/tap"}}' > "$tp/Caskroom/aerospace/.metadata/INSTALL_RECEIPT.json"
+  u 'core formula of the same name is not from the tap' "$(tap_installed_items "$tp" ethereum/ethereum)" ''
+  u 'uninstalled tap cask is not in use' "$(tap_installed_items "$tp" microsoft/git)" ''
+  # CSMB-017 2026-10-28: nikitabobko/tap untrusted, brew lists no cask.
+  u 'installed tap cask is found' "$(tap_installed_items "$tp" nikitabobko/tap)" 'cask nikitabobko/tap/aerospace'
+  rm "$tp/Cellar/solidity/0.8.30/INSTALL_RECEIPT.json"
+  u 'keg without a receipt counts as in use' "$(tap_installed_items "$tp" ethereum/ethereum)" 'formula ethereum/ethereum/solidity'
+  u 'tap directory missing' "$(tap_installed_items "$tp" jaketrock/tap)" 'unknown'
+  rm -rf "$tp"
+
   OUTPUT_LIMIT=1000; OUT_USED=0; set_output_phase body
   o=$( for i in $(seq 1 60); do to_stdout "body line $i padded to about forty bytes"; done
        set_output_phase summary; for i in $(seq 1 60); do to_stdout "summary $i"; done
@@ -353,6 +389,12 @@ case "\$1 \$2" in
         'Homebrew is currently ignoring formulae, casks and commands' 'Trust installed formulae from these taps with:' \\
         '  brew trust --formula asmvik/formulae/yabai' '  brew trust --formula powershell/tap/powershell' \\
         '  brew trust --cask <user>/<tap>/<cask>'
+    fi
+    if [ -f "\$S/untrusted_unused" ]; then
+      printf '%s\n' 'Warning: The following taps are not trusted:' 'ethereum/ethereum' 'microsoft/git' \\
+        'Homebrew is currently ignoring formulae, casks and commands' 'from these taps because tap trust is required.' \\
+        'Untap them with:' 'brew untap ethereum/ethereum microsoft/git' 'Trust specific formulae, casks and commands with:' \\
+        'brew trust --formula <user>/<tap>/<formula>' 'brew trust --cask <user>/<tap>/<cask>' 'brew trust --command <user>/<tap>/<command>'
     fi
     for n in "\$@"; do grep -vx "\$n" "\$S/formulae_outdated" > "\$S/t"; mv "\$S/t" "\$S/formulae_outdated"; done
     printf '\360\237\215\272  %s/Cellar/git/2.51.0: 1,700 files\n' "\$P"
@@ -953,6 +995,59 @@ check 'other cask had no sudo' "$(grep -c '^firefox sudoers=n$' "$S/sudo_seen")"
 check_grep 'grant names the cask' 'Temporary passwordless sudo granted to testuser for zoom' "$L"
 check 'no grant left behind' "$([ -f "$fix/run/sudoers" ] && echo present || echo gone)" 'gone'
 check 'CASK_SUDO list run exits 0' "$rc" '0'
+
+# --- v3.2: fleet runs 2026-10-19..11-12 ---
+# A sudo cask is not downloaded again at the same installed version
+# (jriegel-mac: android-ndk 438s, sage 496s ... every run, all "needs sudo").
+make_fixture
+printf 'firefox\nzoom\n' > "$S/casks_outdated"; : > "$S/formulae_outdated"; : > "$S/pinned"
+mkdir -p "$P/Caskroom/zoom/6.4.0"
+run_script env CASK_SUDO=0; rc=$?
+L="$fix/run/logs/homebrew_update.log"
+check 'first sudo failure tries the cask' "$(grep -c '^upgrade --cask zoom$' "$S/calls")" '1'
+check_grep 'sudo failure names CFG_CASK_SUDO' 'FAILED   zoom -- needs sudo \(.pkg installer\) -- add it to CFG_CASK_SUDO$' "$L"
+check_grep 'summary gives the CONFIG line' 'set in the CONFIG block: CFG_CASK_SUDO="zoom"' "$L"
+check 'memo records cask and version' "$(cat "$fix/run/logs/casks_needing_sudo")" "$P zoom 6.4.0"
+: > "$S/calls"; printf 'firefox\n' >> "$S/casks_outdated"
+run_script env CASK_SUDO=0; rc=$?
+check 'second run does not download it' "$(grep -c '^upgrade --cask zoom$' "$S/calls")" '0'
+check 'other casks still upgrade' "$(grep -c '^upgrade --cask firefox$' "$S/calls")" '1'
+check_grep 'skipped cask still listed as failed' '  - zoom -- needs sudo .*not downloaded again: 6.4.0 failed the same way last run' "$L"
+check 'skipped sudo cask exits 2' "$rc" '2'
+check 'memo kept for the skipped cask' "$(cat "$fix/run/logs/casks_needing_sudo")" "$P zoom 6.4.0"
+: > "$S/calls"
+run_script env CASK_SUDO=zoom; rc=$?
+check 'granting sudo tries it again' "$(grep -c '^upgrade --cask zoom$' "$S/calls")" '1'
+check 'upgraded cask leaves the memo' "$([ -f "$fix/run/logs/casks_needing_sudo" ] && echo present || echo gone)" 'gone'
+check 'sudo cask upgraded exits 0' "$rc" '0'
+make_fixture
+printf 'zoom\n' > "$S/casks_outdated"; : > "$S/formulae_outdated"; : > "$S/pinned"
+mkdir -p "$P/Caskroom/zoom/6.4.1"
+echo "$P zoom 6.4.0" > "$fix/run/logs/casks_needing_sudo"
+run_script env CASK_SUDO=0; rc=$?
+check 'new installed version is tried again' "$(grep -c '^upgrade --cask zoom$' "$S/calls")" '1'
+run_script env CASK_SUDO=0 SKIP_KNOWN_SUDO_CASKS=0; rc=$?
+check 'SKIP_KNOWN_SUDO_CASKS=0 always tries' "$(grep -c '^upgrade --cask zoom$' "$S/calls")" '2'
+
+# Untrusted taps with nothing installed from them are a Note (CSPRMB-21-A:
+# "untrusted taps (ethereum/ethereum microsoft/git) -- ... what they installed").
+make_fixture
+printf 'git\n' > "$S/formulae_outdated"; : > "$S/casks_outdated"; : > "$S/pinned"
+touch "$S/untrusted_unused"
+mkdir -p "$P/Library/Taps/ethereum/homebrew-ethereum/Formula" "$P/Library/Taps/microsoft/homebrew-git/Casks"
+touch "$P/Library/Taps/ethereum/homebrew-ethereum/Formula/solidity.rb" "$P/Library/Taps/microsoft/homebrew-git/Casks/git-credential-manager.rb"
+run_script env; rc=$?
+L="$fix/run/logs/homebrew_update.log"
+check_nogrep 'unused taps are not a problem' 'untrusted taps \(' "$L"
+check_grep 'unused taps are a note' 'Note: .*: untrusted taps with nothing installed from them \(ethereum/ethereum microsoft/git\) .*brew untap ethereum/ethereum microsoft/git' "$L"
+check 'unused untrusted taps exit 0' "$rc" '0'
+# A cask from an untrusted tap is named even though brew lists only formulae.
+mkdir -p "$P/Caskroom/git-credential-manager/2.6.1"
+printf 'git\n' > "$S/formulae_outdated"
+run_script env; rc=$?
+check_grep 'tap cask named with its trust command' '  - .*: untrusted taps \(microsoft/git\) -- brew neither upgrades nor lists microsoft/git/git-credential-manager. As testuser: brew trust --cask microsoft/git/git-credential-manager; or brew untap <tap>' "$L"
+check_grep 'the unused one is still a note' 'Note: .*\(ethereum/ethereum\)' "$L"
+check 'tap in use exits 2' "$rc" '2'
 
 if [ "$fail" -ne 0 ]; then
   echo "tests failed"

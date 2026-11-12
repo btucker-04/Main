@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# update-homebrew.sh  (v3.1)
+# update-homebrew.sh  (v3.2)
 # Weekly Homebrew maintenance: update brew, upgrade every outdated formula and
 # cask, then remove superseded kegs.
 # Platform : macOS (bash 3.2 compatible) | Deploy: Mosyle (runs as root)
@@ -95,6 +95,17 @@
 #     probe rounds, and logs when the set of hosts that do not answer
 #     changes (ghcr.io alone -> all three on CSMB-036).
 #
+# v3.2, from the fleet runs of 2026-10-19..11-12:
+#   * A cask that failed for want of sudo is not downloaded again while its
+#     installed version is unchanged and sudo is still not granted for it
+#     (android-ndk + sage + zulu@11 + zulu@8 cost jriegel-mac ~20 minutes of
+#     downloads every run, only to fail). It is still listed as failed.
+#   * The sudo failure says CFG_CASK_SUDO (Mosyle passes no CASK_SUDO), and
+#     the SUMMARY prints the CFG_CASK_SUDO line that covers every such cask.
+#   * Untrusted taps with nothing installed from them (ethereum/ethereum,
+#     microsoft/git on CSPRMB-21-A) are a Note, not a Problem: brew ignores
+#     nothing there. Taps in use name the exact brew trust commands.
+#
 # Casks are upgraded ONE AT A TIME so one broken cask cannot stop the rest and
 # the log names exactly which ones failed. Casks that ship a .pkg installer
 # call sudo, which has no password to give in an unattended run. Those fail
@@ -129,6 +140,10 @@ CFG_GREEDY="0"
 # "0" = never, "1" = for every cask, or cask names ("temurin@21 displaylink")
 # = only while those casks upgrade.
 CFG_CASK_SUDO="0"
+# A cask that failed for want of sudo on the last run, still at the same
+# installed version and still not in CASK_SUDO, is listed as failed without
+# downloading it again. "0" = try it every run anyway.
+CFG_SKIP_KNOWN_SUDO_CASKS="1"
 # Uninstall formulae that were only installed as dependencies and are no
 # longer needed by anything (old python@3.x, openssl@1.1 ...).
 CFG_AUTOREMOVE="0"
@@ -177,6 +192,7 @@ CFG_RUBY_GEMS="net-imap:branch rexml:latest"
 DRY_RUN="${DRY_RUN:-$CFG_DRY_RUN}"
 GREEDY="${GREEDY:-$CFG_GREEDY}"
 CASK_SUDO="${CASK_SUDO:-$CFG_CASK_SUDO}"
+SKIP_KNOWN_SUDO_CASKS="${SKIP_KNOWN_SUDO_CASKS:-$CFG_SKIP_KNOWN_SUDO_CASKS}"
 AUTOREMOVE="${AUTOREMOVE:-$CFG_AUTOREMOVE}"
 SKIP_FORMULAE="${SKIP_FORMULAE:-$CFG_SKIP_FORMULAE}"
 SKIP_CASKS="${SKIP_CASKS:-$CFG_SKIP_CASKS}"
@@ -200,6 +216,9 @@ NET_PROBE_HOSTS="github.com formulae.brew.sh ghcr.io"
 LOG_DIR="${LOG_DIR:-/var/log/composecure}"
 LOG_FILE="$LOG_DIR/homebrew_update.log"
 SUDOERS_FILE="${SUDOERS_FILE:-/etc/sudoers.d/zz-composecure-brew}"
+# Lines "<prefix> <cask> <installed version>": casks the last run could not
+# upgrade without sudo. Delete it to make every cask try again.
+SUDO_MEMO="$LOG_DIR/casks_needing_sudo"
 
 # stdout is what Mosyle shows, and it keeps only the first ~9 KB. "body"
 # lines stop at OUTPUT_LIMIT minus the SUMMARY's share; "summary" lines may
@@ -332,7 +351,7 @@ valid_macos_user() {
 # Classify a failed cask's output so the summary says what to do about it.
 cask_failure_reason() {
     if grep -qiE 'a terminal is required|a password is required|no tty present|askpass' "$1" 2>/dev/null; then
-        echo "needs sudo (.pkg installer) -- set CASK_SUDO=1"
+        echo "needs sudo (.pkg installer) -- add it to CFG_CASK_SUDO"
     elif cask_app_missing "$1"; then
         echo "brew's installed copy of the app is missing -- reinstall the cask (REPAIR_CASKS=1)"
     elif grep -qiE 'It seems there is already an App|already exists' "$1" 2>/dev/null; then
@@ -538,6 +557,68 @@ cask_sudo_wanted() {
     esac
     case " $(echo $2) " in *" $1 "*) return 0 ;; esac
     return 1
+}
+
+# The CFG_CASK_SUDO value that covers the current setting ($1) plus the
+# casks ($2) that failed for want of sudo. Nothing when $1 is already "1".
+cask_sudo_suggestion() {
+    [ "$1" = "1" ] && return 0
+    [ -n "$(echo $2)" ] || return 0
+    case "$1" in 0|"") set -- "" "$2" ;; esac
+    printf '%s\n' $1 $2 | awk 'NF && !seen[$0]++' | tr '\n' ' ' | sed 's/ $//'
+}
+
+# Installed version of cask $2 under prefix $1 (its Caskroom version dir).
+cask_installed_version() {
+    for v in "$1/Caskroom/$2"/*; do
+        [ -d "$v" ] && { basename "$v"; return 0; }
+    done
+}
+
+# Is "<prefix> <cask> <version>" ($1 $2 $3) in the sudo memo file $4?
+sudo_memo_has() {
+    [ -n "$3" ] && [ -f "$4" ] || return 1
+    awk -v p="$1" -v c="$2" -v v="$3" '$1 == p && $2 == c && $3 == v { f = 1 } END { exit !f }' "$4"
+}
+
+# Lines of sudo memo $3 to carry over: other prefixes, and casks of prefix
+# $1 that are in $2 (still outdated but not tried this run).
+sudo_memo_untried() {
+    [ -f "$3" ] || return 0
+    awk -v p="$1" -v keep=" $(echo $2) " '$1 != p || index(keep, " " $2 " ")' "$3"
+}
+
+# Does install receipt $1 name tap $2? No receipt counts as yes, so a
+# formula of the same name from homebrew/core does not hide a tap in use.
+receipt_from_tap() {
+    [ -f "$1" ] || return 0
+    tr -d ' \n' < "$1" | grep -iqF "\"tap\":\"$2\""
+}
+
+# What prefix $1 has installed from tap $2, as "formula|cask <tap>/<name>",
+# found from the tap's own files (brew lists only formulae, never casks).
+# Prints "unknown" when the tap's directory is not there to look at.
+tap_installed_items() {
+    td="$1/Library/Taps/${2%%/*}/homebrew-${2#*/}"
+    [ -d "$td" ] || { echo unknown; return 0; }
+    find "$td" -maxdepth 4 -name '*.rb' 2>/dev/null | while IFS= read -r rb; do
+        n=$(basename "$rb" .rb)
+        case "${rb#"$td"/}" in
+            Casks/*) kind=cask ;;
+            Formula/*|HomebrewFormula/*) kind=formula ;;
+            */*) continue ;;
+            *) kind=formula ;;
+        esac
+        if [ "$kind" = "cask" ]; then
+            [ -d "$1/Caskroom/$n" ] || continue
+            receipt_from_tap "$1/Caskroom/$n/.metadata/INSTALL_RECEIPT.json" "$2" && echo "cask $2/$n"
+        else
+            [ -d "$1/Cellar/$n" ] || continue
+            for k in "$1/Cellar/$n"/*; do
+                receipt_from_tap "$k/INSTALL_RECEIPT.json" "$2" && { echo "formula $2/$n"; break; }
+            done
+        fi
+    done | sort -u
 }
 
 # Label already recorded for keg $1 in $2 (lines "keg|label"), or nothing.
@@ -1111,11 +1192,14 @@ grant_sudo() {
 }
 
 FAILED_REASONS=""
+SUDO_CASKS=""
 [ "$OFFLINE" -eq 1 ] && PREFIXES=""
 for PREFIX in $PREFIXES; do
     PREFIX_TAG=$(echo "$PREFIX" | tr '/' '_' | sed 's/^_//')
     UNTRUSTED_TAPS=""
     UNTRUSTED_ITEMS=""
+    MEMO_KEEP=""
+    TRIED_C=""
     log ""
     log "################ $PREFIX ################"
 
@@ -1224,9 +1308,24 @@ for PREFIX in $PREFIXES; do
             if [ "$CASK_SUDO" != "1" ] && cask_sudo_wanted "$c" "$CASK_SUDO"; then
                 grant_sudo "$c"
             fi
+            cv=$(cask_installed_version "$PREFIX" "$c")
+            if [ "$SKIP_KNOWN_SUDO_CASKS" = "1" ] && ! cask_sudo_wanted "$c" "$CASK_SUDO" \
+                && sudo_memo_has "$PREFIX" "$c" "$cv" "$SUDO_MEMO"; then
+                reason="needs sudo (.pkg installer) -- add it to CFG_CASK_SUDO (not downloaded again: $cv failed the same way last run)"
+                log "  FAILED   $c -- $reason"
+                FAILED="$FAILED $c"
+                FAILED_REASONS="${FAILED_REASONS}${FAILED_REASONS:+
+}$c -- $reason"
+                SUDO_CASKS="$SUDO_CASKS $c"
+                MEMO_KEEP="${MEMO_KEEP}$PREFIX $c $cv
+"
+                TRIED_C="$TRIED_C $c"
+                continue
+            fi
             # shellcheck disable=SC2086
             run_brew "cask_$c" "$CASK_TIMEOUT" upgrade --cask $GREEDY_FLAG "$c"
             ca_rc=$?
+            [ "$ca_rc" -ne 125 ] && TRIED_C="$TRIED_C $c"
             if [ "$ca_rc" -eq 0 ]; then
                 log "  OK       $c"
             elif [ "$ca_rc" -eq 125 ]; then
@@ -1241,6 +1340,12 @@ for PREFIX in $PREFIXES; do
                 FAILED="$FAILED $c"
                 FAILED_REASONS="${FAILED_REASONS}${FAILED_REASONS:+
 }$c -- $reason"
+                case "$reason" in
+                    "needs sudo"*)
+                        SUDO_CASKS="$SUDO_CASKS $c"
+                        [ -n "$cv" ] && MEMO_KEEP="${MEMO_KEEP}$PREFIX $c $cv
+" ;;
+                esac
             fi
             [ "$CASK_SUDO" != "1" ] && remove_sudoers
             # One slow cask should not cost the rest of the list.
@@ -1250,6 +1355,9 @@ for PREFIX in $PREFIXES; do
     else
         log "  Nothing to upgrade."
     fi
+    # Casks not tried this run (time limit, budget) keep their old entry.
+    { sudo_memo_untried "$PREFIX" "$(list_minus "$DO_C" "$TRIED_C")" "$SUDO_MEMO"; printf '%s' "$MEMO_KEEP"; } > "$SUDO_MEMO.tmp"
+    if [ -s "$SUDO_MEMO.tmp" ]; then mv -f "$SUDO_MEMO.tmp" "$SUDO_MEMO"; else rm -f "$SUDO_MEMO.tmp" "$SUDO_MEMO"; fi
 
     if [ "$AUTOREMOVE" = "1" ]; then
         log ""
@@ -1309,9 +1417,34 @@ EOF
     fi
     UT=$(printf '%s\n' $UNTRUSTED_TAPS | awk 'NF && !seen[$0]++' | tr '\n' ' ' | sed 's/ $//')
     if [ -n "$UT" ]; then
-        UI=$(printf '%s\n' $UNTRUSTED_ITEMS | awk 'NF && !seen[$0]++' | tr '\n' ' ' | sed 's/ $//')
-        log "  UNTRUSTED taps: $UT -- brew ignores ${UI:-what they installed}"
-        add_issue "$PREFIX: untrusted taps ($UT) -- brew neither upgrades nor lists ${UI:-what they installed}. As $BREW_USER: brew trust --formula <tap>/<name>, or brew untap <tap>"
+        UI=$(printf '%s\n' $UNTRUSTED_ITEMS | awk 'NF && !seen[$0]++')
+        USED_T=""; UNUSED_T=""; TRUST=""; UNKNOWN=0
+        for t in $UT; do
+            found=$(tap_installed_items "$PREFIX" "$t")
+            listed=$(printf '%s\n' "$UI" | awk -v t="$t/" 'index($0, t) == 1 { print "formula " $0 }')
+            items=$(printf '%s\n%s\n' "$listed" "$found" | grep -v '^unknown$' | awk 'NF && !seen[$0]++')
+            if [ -n "$items" ]; then
+                USED_T="$USED_T $t"
+                TRUST="${TRUST}${items}
+"
+            elif [ "$found" = "unknown" ]; then
+                USED_T="$USED_T $t"; UNKNOWN=1
+            else
+                UNUSED_T="$UNUSED_T $t"
+            fi
+        done
+        USED_T=$(echo $USED_T); UNUSED_T=$(echo $UNUSED_T)
+        TRUST_NAMES=$(printf '%s' "$TRUST" | awk 'NF { print $2 }' | tr '\n' ' ' | sed 's/ $//')
+        [ "$UNKNOWN" -eq 1 ] && TRUST_NAMES="${TRUST_NAMES}${TRUST_NAMES:+ and }what else they installed"
+        TRUST_CMDS=$(printf '%s' "$TRUST" | awk 'NF { printf "%sbrew trust --%s %s", (n++ ? "; " : ""), $1, $2 }')
+        if [ -n "$USED_T" ]; then
+            log "  UNTRUSTED taps: $USED_T -- brew ignores $TRUST_NAMES"
+            add_issue "$PREFIX: untrusted taps ($USED_T) -- brew neither upgrades nor lists $TRUST_NAMES. As $BREW_USER: ${TRUST_CMDS:-brew trust --formula <tap>/<name>}${TRUST_CMDS:+;} or brew untap <tap>"
+        fi
+        if [ -n "$UNUSED_T" ]; then
+            log "  UNTRUSTED taps with nothing installed: $UNUSED_T"
+            add_note "$PREFIX: untrusted taps with nothing installed from them ($UNUSED_T) -- nothing is ignored; as $BREW_USER 'brew untap $UNUSED_T' stops brew's warning"
+        fi
     fi
 done
 
@@ -1339,6 +1472,8 @@ if [ -n "$FAILED" ]; then
     while IFS= read -r l; do [ -n "$l" ] && log "  - $l"; done <<EOF
 $FAILED_REASONS
 EOF
+    SUGGEST=$(cask_sudo_suggestion "$CASK_SUDO" "$SUDO_CASKS")
+    [ -n "$SUGGEST" ] && log "  To upgrade the sudo casks unattended, set in the CONFIG block: CFG_CASK_SUDO=\"$SUGGEST\""
 fi
 if [ -n "$REMAINING" ]; then
     log "Still outdated: $REMAINING"
