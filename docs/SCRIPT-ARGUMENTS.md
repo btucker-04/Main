@@ -139,6 +139,16 @@ Updates the Program Files Node.js MSI install to the latest release of its insta
 | `-ForceCloseNode` | switch | off | Kill running `node.exe` before installing. Default aborts (exit 2) if Node is running. |
 | `-DryRun` | switch | off | Report what would happen without changing anything. |
 
+## Update-Python.ps1
+Updates every python.org Python on the machine (Nessus plugin 373609) to the newest Windows build of its own branch, looked up at run time from `https://www.python.org/ftp/python/index-windows.json`. No pinned versions. Machine-wide installs (registered under `HKLM\SOFTWARE\Python\PythonCore`) are upgraded now as SYSTEM. Per-user installs (`%LOCALAPPDATA%\Programs\Python\Python3xx`) get a signature-checked installer staged in `C:\ProgramData\CompoSecure\Python`, plus a RunOnce entry that runs it as that user at their next sign-in. Python install manager runtimes (`%LOCALAPPDATA%\Python\pythoncore-*`) get a RunOnce entry that runs `pymanager install --update --yes`. End-of-life branches (2.7, 3.10) and copies no installer owns are reported and left alone.
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `-ForceClose` | switch | off | Stop python processes running from a machine-wide copy's folder before upgrading it. Default skips that copy (exit 2). |
+| `-DryRun` | switch | off | Report every copy and the planned action without changing anything. |
+
+Exit: `0` = every copy is on the newest Windows build of a supported branch, `3010` = the same plus a reboot request, `2` = a human or a sign-in is needed, `1` = a fetch, download or install failed. Exit 2 covers an update staged for next sign-in, a copy that is in use, an end-of-life or unowned copy, and a branch whose fixed version has no Windows build. For that last case: once a branch is security-only, python.org publishes source only. In November 2026 the Windows builds stopped at 3.11.9, 3.12.10 and 3.13.17, below the plugin's fixed versions, so those copies only clear by moving to 3.14 or later. Keep EC success codes `0,3010`.
+
 ## Update-Chrome.ps1
 Downloads and installs the latest Chrome enterprise MSI.
 
