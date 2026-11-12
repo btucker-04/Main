@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
     Remediation: MS13-002 MSXML5 (Nessus Plugin 63420)
-    Removes the orphaned, EOL Msxml5.dll from the Office11 Common Files path.
+    Removes the orphaned, EOL Msxml5.dll from the Office11 Common Files path. (v2)
 
 .DESCRIPTION
     Msxml5.dll under Common Files\Microsoft Shared\Office11 shipped with
@@ -20,7 +20,8 @@
 
 .NOTES
     Deploy via Endpoint Central (SYSTEM). EC-safe concatenated strings.
-    Exit codes: 0 = success/nothing to do, 2 = blocked by legacy product, 1 = failure
+    Exit codes: 0 = success/nothing to do, 2 = blocked by legacy product,
+                1 = failure (e.g. the DLL is in use: reboot and re-run)
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
@@ -29,8 +30,11 @@ param()
 $ErrorActionPreference = 'Stop'
 
 $LogDir     = 'C:\Logs\CompoSecure'
-$LogFile    = Join-Path $LogDir ('MSXML5_Remediation_' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '.log')
+$RunStamp   = Get-Date -Format 'yyyyMMdd_HHmmss'
+$LogFile    = Join-Path $LogDir ('MSXML5_Remediation_' + $RunStamp + '.log')
 $Quarantine = Join-Path $LogDir 'Quarantine\MSXML5'
+$Regsvr32   = Join-Path $env:WINDIR 'System32\regsvr32.exe'
+$q          = [char]34
 
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
 
@@ -113,17 +117,22 @@ foreach ($f in $found) {
     if ($PSCmdlet.ShouldProcess($f, 'Unregister and quarantine')) {
         # Unregister (only msxml5.dll is registered; msxml5r.dll is a resource DLL)
         if ($f -like '*Msxml5.dll') {
-            $r = Start-Process regsvr32.exe -ArgumentList ('/u /s "' + $f + '"') -Wait -PassThru
+            $r = Start-Process -FilePath $Regsvr32 -ArgumentList ('/u /s ' + $q + $f + $q) -Wait -PassThru -NoNewWindow
             Write-Log ('  regsvr32 /u exit ' + $r.ExitCode + ' for ' + $f)
         }
 
         # Move to quarantine with a name encoding the original path
-        $safeName = ($f -replace '[:\\]', '_')
+        $safeName = ($f -replace '[:\\]', '_') + '.' + $RunStamp
         $dest = Join-Path $Quarantine $safeName
-        Move-Item -Path $f -Destination $dest -Force
-        Write-Log ('  Quarantined: ' + $f)
-        Write-Log ('           -> ' + $dest)
-        $moved++
+        try {
+            Move-Item -Path $f -Destination $dest -Force
+            if (Test-Path $f) { throw 'the file is still at its original path after the move' }
+            Write-Log ('  Quarantined: ' + $f)
+            Write-Log ('           -> ' + $dest)
+            $moved++
+        } catch {
+            Write-Log ('  Could not move ' + $f + ': ' + $_.Exception.Message) -Level ERROR
+        }
     } else {
         Write-Log ('  [WHATIF] Would unregister and quarantine: ' + $f)
     }
@@ -143,13 +152,14 @@ if ($WhatIfPreference) {
 
 if ($remaining.Count -gt 0) {
     foreach ($r in $remaining) { Write-Log ('  STILL PRESENT: ' + $r) -Level ERROR }
-    Write-Log '  Removal incomplete -- file may be locked. Investigate.' -Level ERROR
+    Write-Log '  Removal incomplete -- a running program probably has the DLL loaded.' -Level ERROR
+    Write-Log '  Reboot the machine and re-run this script.' -Level ERROR
     exit 1
 }
 
 Write-Log ('  All MSXML5 files removed (' + $moved + ' quarantined).')
 Write-Log ''
-Write-Log ('  Rollback: move files back from ' + $Quarantine + ' and regsvr32 Msxml5.dll.')
+Write-Log ('  Rollback: move files back from ' + $Quarantine + ' (drop the .<timestamp> suffix) and regsvr32 Msxml5.dll.')
 Write-Log '  If nothing breaks within 30 days, delete the quarantine folder.'
 Write-Log '  Re-run a Nessus scan to confirm plugin 63420 clears.'
 Write-Log '=============================================='
