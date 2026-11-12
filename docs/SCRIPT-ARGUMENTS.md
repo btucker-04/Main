@@ -599,7 +599,8 @@ Weekly Homebrew maintenance: `brew update`, upgrade every outdated formula and c
 - failed steps and their errors;
 - steps that never ran because of the time limit or budget;
 - formulae that are installed but not linked, with the file in the way;
-- untrusted taps, whose formulae brew silently ignores.
+- untrusted taps that something is installed from (brew silently ignores those formulae and casks), with the exact `brew trust` commands. Untrusted taps with nothing installed from them are only a Note;
+- for casks that failed for want of sudo, the `CFG_CASK_SUDO="..."` line that would let them upgrade.
 
 Exit `0` = all current. `2` = something is still outdated (failed, pinned or skipped) or a step failed or timed out. `1` = a prefix could not be maintained, or there was no network (OFFLINE).
 
@@ -608,6 +609,7 @@ Exit `0` = all current. `2` = something is still outdated (failed, pinned or ski
 | `DRY_RUN` | `CFG_DRY_RUN="0"` | Set `1` to list what is outdated and change nothing. |
 | `GREEDY` | `CFG_GREEDY="0"` | Set `1` to also upgrade casks that auto-update themselves (Chrome, Slack, Zoom...). Off by default: those apps keep themselves current and rarely appear in Tenable. |
 | `CASK_SUDO` | `CFG_CASK_SUDO="0"` | Set `1` to give the brew user passwordless sudo for the duration of the cask step (a `/etc/sudoers.d` drop-in, validated with `visudo`, removed on exit and at the start of the next run). Or set a space-separated list of casks (`"temurin@21 docker-desktop"`) to grant it only while those casks upgrade. Without it, casks with a `.pkg` installer fail and are listed as "needs sudo". |
+| `SKIP_KNOWN_SUDO_CASKS` | `CFG_SKIP_KNOWN_SUDO_CASKS="1"` | A cask that failed with "needs sudo" on the last run, is still at the same installed version and is still not covered by `CASK_SUDO` is listed as failed without being downloaded again (`/var/log/composecure/casks_needing_sudo`; delete it to retry every cask). `0` = try it every run. |
 | `AUTOREMOVE` | `CFG_AUTOREMOVE="0"` | Set `1` to run `brew autoremove` (uninstall dependencies nothing needs any more). While `0`, `brew cleanup` is also run with `HOMEBREW_NO_AUTOREMOVE=1`, because cleanup autoremoves by default. |
 | `SKIP_FORMULAE` | `CFG_SKIP_FORMULAE=""` | Space-separated formulae to leave alone. Reported as still outdated. |
 | `SKIP_CASKS` | `CFG_SKIP_CASKS=""` | Space-separated casks to leave alone. Reported as still outdated. |
