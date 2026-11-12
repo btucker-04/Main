@@ -334,7 +334,7 @@ Read-only triage returning a single verdict token. **No arguments.**
 Read-only diagnostic collection for a failed agent install (1603/1612). **No arguments.**
 
 ## Remove-Msxml5.ps1
-Removes the orphaned MSXML5 DLL (quarantines for rollback).
+Removes the orphaned Office 2003 `Msxml5.dll` / `msxml5r.dll` from `Common Files\Microsoft Shared\Office11` (Nessus plugin 63420, MS13-002). Files are unregistered and moved to `C:\Logs\CompoSecure\Quarantine\MSXML5` with a run timestamp suffix, for rollback. Exit: `0` = removed or nothing to do, `2` = an Office 2003-era product (Office 11, Compatibility Pack, Word/Excel Viewer) is still installed and nothing was touched, `1` = a file could not be moved (usually loaded by a running program: reboot and re-run).
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
