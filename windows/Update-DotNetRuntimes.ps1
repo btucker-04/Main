@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Remediation: Microsoft .NET Core security updates (v3.13)
+    Remediation: Microsoft .NET Core security updates (v3.14)
     Nessus Plugin IDs : 302122, 307353 (+ 314679, 320854, 326863 -- same fix)
 
 .DESCRIPTION
@@ -13,6 +13,11 @@
          cleanup removed it (or anything else went sideways), reinstalls
          and re-verifies. Exits 1 if the machine does not end in a
          strictly better state than it started.
+
+    v3.14 (plugin 172179 on the Mimaki hosts, 2026-11-16): $EolSuccessorMajor
+    maps 6 -> 10 and 7 -> 10 as well, so -InstallSuccessorMajor and
+    -RemoveRetiredMajor move a .NET 6 or 7 host to .NET 10. Before, those
+    majors logged no configured successor and Phase 4 had nothing to remove.
 
     v3.13 (SHRBME-08, 2026-10-29): every download failed with Could not
     establish trust relationship for the SSL/TLS secure channel, and the
@@ -57,7 +62,7 @@
     message says to repair the newest one.
 
     v3.9 (2026-10-27): -RemoveRetiredMajor. Phase 4, after Phase 3 has
-    verified the run, removes an EOL or near-EOL major (8 and 9 map to 10)
+    verified the run, removes an EOL or near-EOL major (6 to 9 map to 10)
     once its successor is on disk for every flavor/arch that had it. The
     uninstall is Remove-DotNetEolChannel.ps1 -DotNet<N> -RemoveStaleFolders,
     staged beside this script. It refuses (exit 2) when:
@@ -447,7 +452,7 @@ param(
     # the real, current runtime looks like.
     [switch]$RemoveOrphanedRegistrations,
     # For every EOL major found installed, ALSO install the successor major
-    # (currently only 9 -> 10) for each flavor/arch that has the EOL major --
+    # (6, 7, 8 and 9 -> 10) for each flavor/arch that has the EOL major --
     # PURELY ADDITIVE, never touches or removes the EOL major's files or ARP
     # registrations. This does NOT retarget any app and does NOT clear the
     # SEoL finding by itself: .NET's default roll-forward policy does not
@@ -1334,7 +1339,7 @@ $EolSoonSeen     = @()
 # releases, so the natural migration target is the next LTS. Add an entry
 # here (not a "+1" formula) so a mapping is a deliberate, reviewed decision
 # rather than an assumption baked into the math.
-$EolSuccessorMajor = @{ 8 = 10; 9 = 10 }
+$EolSuccessorMajor = @{ 6 = 10; 7 = 10; 8 = 10; 9 = 10 }
 
 # Unit tests dot-source this file for the helpers above; stop before the run.
 if ($env:UPDATE_DOTNET_DOTSOURCE -eq '1') { return }

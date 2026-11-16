@@ -200,6 +200,19 @@ Assert-Eq $t.Count 0 'major with no mapping yields nothing'
 $t = @(Get-SuccessorTargets -EolSeen @(8) -EolSoonSeen @(8) -Map $map)
 Assert-Eq $t.Count 1 'duplicate major targeted once'
 
+# Plugin 172179, mimaki-ujf19 (2026-11-16): 'Path : C:\Program Files\dotnet\
+# shared\Microsoft.NETCore.App\6.0.36\' -- .NET 6 only, so the script's own
+# map must give 6 a successor or -RemoveRetiredMajor does nothing.
+$s6 = & $st 6 ([datetime]'2026-11-16')
+$t = @(Get-SuccessorTargets -EolSeen @($s6 | Where-Object { $_ -eq 'EOL' } | ForEach-Object { 6 }) -EolSoonSeen @() -Map $EolSuccessorMajor)
+Assert-Eq ('' + $t[0].From + '->' + $t[0].To) '6->10' 'shipped map sends .NET 6 to 10'
+$t = @(Get-SuccessorTargets -EolSeen @(7) -EolSoonSeen @() -Map $EolSuccessorMajor)
+Assert-Eq ('' + $t[0].From + '->' + $t[0].To) '7->10' 'shipped map sends .NET 7 to 10'
+$t = @(Get-SuccessorTargets -EolSeen @(6, 8) -EolSoonSeen @() -Map $EolSuccessorMajor)
+Assert-Eq (($t | ForEach-Object { '' + $_.From + '->' + $_.To }) -join ',') '6->10,8->10' 'a 6 + 8 host retires both to 10'
+$fd6 = '{ "runtimeOptions": { "tfm": "net6.0", "framework": { "name": "Microsoft.NETCore.App", "version": "6.0.0" } } }'
+Assert-True (Test-RuntimeConfigNeedsMajor -Json $fd6 -Major 6) 'framework-dependent net6.0 app blocks removing 6'
+
 # --- -RemoveRetiredMajor: which apps need .NET 8 --------------------------------
 $fd8 = '{ "runtimeOptions": { "tfm": "net8.0", "framework": { "name": "Microsoft.NETCore.App", "version": "8.0.0" } } }'
 Assert-True (Test-RuntimeConfigNeedsMajor -Json $fd8 -Major 8) 'framework-dependent net8.0 app needs 8'
