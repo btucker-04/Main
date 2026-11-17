@@ -364,6 +364,13 @@ Inventory and verification cover ARP, `shared\`/`host\fxr\`/`sdk\` folders, `dot
 | `-RemoveStaleFolders` | switch | off | After uninstall, delete leftover `shared\`/`host\fxr\` folders, SWID tags, versioned `hostfxr.dll` files, and orphan Package Cache installers for this major when no live *foreign* dependent remains. Never deletes `<root>\dotnet.exe`. |
 | `-DryRun` | switch | off | Report what would be removed; change nothing. |
 
+## Remove-TeamsClassic.ps1
+Removes classic Microsoft Teams 1.x (Nessus 175408, 179635 -- "Microsoft Teams < 1.6.x"). Classic Teams reached end of availability on 2025-07-01, so removal is the fix; new Teams (MSTeams MSIX, `ms-teams.exe`) is never touched, and the log says whether it is installed. For every user profile, signed in or not: stops classic `Teams.exe`/`Update.exe`, deletes `%LOCALAPPDATA%\Microsoft\Teams` (the folder Tenable reads) and `ProgramData\<user>\Microsoft\Teams`, deletes Desktop/Start Menu shortcuts that target the classic `Update.exe` or `current\Teams.exe`, and removes the user's `Uninstall\Teams` key and `com.squirrel.Teams.Teams` Run value (loading `NTUSER.DAT` when needed). Also uninstalls the **Teams Machine-Wide Installer** MSI, which would otherwise reinstall classic Teams at each sign-in, plus its `TeamsMachineInstaller` Run value and `Teams Installer` folder. `%APPDATA%\Microsoft\Teams` (settings, custom backgrounds) is left alone. Every removal is re-checked on disk / in the registry. Exit `0` = verified gone, `3010` = gone, reboot to finish the MSI uninstall, `2` = files gone but a profile hive could not be cleaned, `1` = something could not be removed. EC success codes `0,3010`. Log: `C:\Logs\CompoSecure\RemoveTeamsClassic_<timestamp>.log`.
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `-DryRun` | switch | off | Report what would be removed; change nothing. |
+
 ## Remove-3DViewer.ps1
 Removes the Microsoft 3D Viewer Store app.
 
