@@ -269,7 +269,7 @@ $defined = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Langu
              ForEach-Object { $_.Name })
 $called = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) |
             ForEach-Object { $_.GetCommandName() } | Where-Object { $_ -match '^[A-Za-z]+-[A-Za-z]+$' } | Sort-Object -Unique)
-$windowsOnly = @('Get-CimInstance', 'Get-WmiObject')
+$windowsOnly = @('Get-CimInstance', 'Get-WmiObject', 'Get-AuthenticodeSignature')
 $unknown = @($called | Where-Object {
     $defined -notcontains $_ -and $windowsOnly -notcontains $_ -and -not (Get-Command $_ -ErrorAction SilentlyContinue)
 })
@@ -397,6 +397,127 @@ function Invoke-WebRequest { $script:iwrCalls++; if ($script:iwrCalls -lt 2) { t
 Assert-True (Save-Installer -Url 'https://aka.ms/x.exe' -Dest $tmpDl) 'timeout then success: download succeeds'
 Assert-Eq $script:iwrCalls 2 'timeout is retried'
 Remove-Item Function:\Invoke-WebRequest, Function:\Write-TlsFailureHelp, Function:\Start-Sleep
+
+# --- MIMAKI-UJF15 (2026-11-17): aka.ms unreachable, staged installer fallback --
+# Re-sourced: the repair tests above replaced Install-Runtime with a mock. The
+# script resets $Failed, which is this file's $failed counter.
+$keepFailed = $failed
+. $scriptPath
+$failed = $keepFailed
+$ujf15 = 'Unable to connect to the remote server | A connection attempt failed because the connected party did not properly respond after a period of time, or established connection failed because connected host has failed to respond 23.76.43.23:443'
+Assert-True (Test-HostUnreachable -Message $ujf15) 'MIMAKI-UJF15: connect failure is unreachable'
+Assert-True (Test-HostUnreachable -Message 'The remote name could not be resolved: aka.ms') 'DNS failure is unreachable'
+Assert-True (-not (Test-HostUnreachable -Message 'The operation has timed out.')) 'timeout is not unreachable'
+Assert-True (-not (Test-HostUnreachable -Message 'The underlying connection was closed: An unexpected error occurred on a receive.')) 'mid-transfer reset is not unreachable'
+Assert-Eq (Get-DownloadFailureKind -Message $ujf15) '' 'MIMAKI-UJF15: connect failure is not a TLS failure'
+
+$stagedNames = @(
+    'C:\EC\Dependencies\windowsdesktop-runtime-10.0.3-win-x64.exe',
+    'C:\EC\Dependencies\windowsdesktop-runtime-10.0.5-win-x64.exe',
+    'C:\windowsdesktop-runtime-10.0.7-win-x86.exe',
+    'C:\windowsdesktop-runtime-11.0.0-rc.2.25502.107-win-x64.exe',
+    'C:\dotnet-runtime-6.0.36-win-x64.exe',
+    'C:\dotnet-runtime-win-x64.exe',
+    'C:\aspnetcore-runtime-8.0.22-win-x86.exe',
+    'C:\dotnet-hosting-8.0.22-win.exe',
+    'C:\dotnet-sdk-8.0.416-win-x64.exe',
+    'C:\Remove-DotNetEolChannel.ps1'
+)
+$sel = { param($stems, $major, $suffix) Select-StagedInstaller -Paths $stagedNames -Stems $stems -Major $major -Suffix $suffix }
+$r = & $sel @('windowsdesktop-runtime-') 10 '-win-x64.exe'
+Assert-Eq ('' + $r.Version + '|' + $r.Path) '10.0.5|C:\EC\Dependencies\windowsdesktop-runtime-10.0.5-win-x64.exe' 'newest staged x64 Windows Desktop 10 wins'
+$r = & $sel @('windowsdesktop-runtime-') 10 '-win-x86.exe'
+Assert-Eq $r.Version '10.0.7' 'x86 file is only picked for x86'
+Assert-True ($null -eq (& $sel @('windowsdesktop-runtime-') 11 '-win-x64.exe')) 'preview build is never picked'
+$r = & $sel @('dotnet-runtime-', 'windowsdesktop-runtime-') 10 '-win-x64.exe'
+Assert-Eq ('' + $r.Stem + '|' + $r.Version) 'windowsdesktop-runtime-|10.0.5' 'NETCore 10 falls back to the Windows Desktop bundle'
+$r = & $sel @('dotnet-runtime-', 'windowsdesktop-runtime-') 6 '-win-x64.exe'
+Assert-Eq ('' + $r.Stem + '|' + $r.Version) 'dotnet-runtime-|6.0.36' 'NETCore 6 uses its own staged runtime'
+Assert-True ($null -eq (& $sel @('windowsdesktop-runtime-') 6 '-win-x64.exe')) 'nothing staged for Windows Desktop 6'
+Assert-Eq (& $sel @('aspnetcore-runtime-') 8 '-win-x86.exe').Version '8.0.22' 'ASP.NET Core x86 staged name'
+Assert-Eq (& $sel @('dotnet-hosting-') 8 '-win.exe').Version '8.0.22' 'hosting bundle staged name'
+Assert-Eq (& $sel @('dotnet-sdk-') 8 '-win-x64.exe').Version '8.0.416' 'SDK staged name'
+Assert-True ($null -eq (Select-StagedInstaller -Paths @('C:\DOTNET-RUNTIME-6.0.36-WIN-X64.EXE') -Stems @('dotnet-runtime-') -Major 8 -Suffix '-win-x64.exe')) 'major must match'
+Assert-Eq (Select-StagedInstaller -Paths @('C:\DOTNET-RUNTIME-6.0.36-WIN-X64.EXE') -Stems @('dotnet-runtime-') -Major 6 -Suffix '-win-x64.exe').Version '6.0.36' 'file name match is case-insensitive'
+Assert-True ($null -eq (Select-StagedInstaller -Paths @() -Stems @('dotnet-runtime-') -Major 6 -Suffix '-win-x64.exe')) 'no staged files'
+
+$order = Get-RuntimeInstallOrder -Keys @('x64|Microsoft.NETCore.App', 'x64|Microsoft.AspNetCore.App', 'x86|Microsoft.WindowsDesktop.App', 'x64|Microsoft.WindowsDesktop.App')
+Assert-Eq ($order -join ',') 'x64|Microsoft.WindowsDesktop.App,x86|Microsoft.WindowsDesktop.App,x64|Microsoft.NETCore.App,x64|Microsoft.AspNetCore.App' 'Windows Desktop keys install first'
+$ujfMap = @{ 'x64|Microsoft.NETCore.App' = @([version]'6.0.36', [version]'10.0.5'); 'x64|Microsoft.WindowsDesktop.App' = @([version]'6.0.36') }
+Assert-Eq (Get-MaxVersion -Map $ujfMap -Key 'x64|Microsoft.NETCore.App' -Major 10) '10.0.5' 'newest of major 10'
+Assert-True ($null -eq (Get-MaxVersion -Map $ujfMap -Key 'x64|Microsoft.WindowsDesktop.App' -Major 10)) 'no 10 for Windows Desktop'
+Assert-True ($null -eq (Get-MaxVersion -Map $ujfMap -Key 'x86|Microsoft.NETCore.App' -Major 6)) 'missing key'
+
+# Save-Installer: three connect failures, then later downloads skip.
+$script:iwrCalls = 0
+function Invoke-WebRequest { $script:iwrCalls++; throw $ujf15 }
+function Start-Sleep { }
+$script:TlsFailure = ''
+$script:Unreachable = ''
+Assert-True (-not (Save-Installer -Url 'https://aka.ms/dotnet/6.0/dotnet-runtime-win-x64.exe' -Dest $tmpDl)) 'MIMAKI-UJF15: download fails'
+Assert-Eq $script:iwrCalls 3 'MIMAKI-UJF15: connect failure still retried'
+Assert-Eq $script:Unreachable 'https://aka.ms/dotnet/6.0/dotnet-runtime-win-x64.exe' 'MIMAKI-UJF15: unreachable recorded'
+Assert-True (-not (Save-Installer -Url 'https://aka.ms/dotnet/10.0/dotnet-runtime-win-x64.exe' -Dest $tmpDl)) 'next download fails'
+Assert-Eq $script:iwrCalls 3 'next download skipped without a request'
+$script:iwrCalls = 0
+$script:Unreachable = ''
+function Invoke-WebRequest { $script:iwrCalls++; if ($script:iwrCalls -eq 1) { throw $ujf15 }; throw 'The operation has timed out.' }
+Save-Installer -Url 'https://aka.ms/x.exe' -Dest $tmpDl | Out-Null
+Assert-Eq $script:Unreachable '' 'a timeout among the attempts does not mark the server unreachable'
+
+# Install-Runtime end to end with the download down and files staged.
+$tmp5 = Join-Path ([System.IO.Path]::GetTempPath()) ('dnstg_' + [guid]::NewGuid().ToString('N'))
+try {
+    $stageDir = Join-Path $tmp5 'stage'
+    $TempDir = Join-Path $tmp5 'temp'
+    $LogDir = Join-Path $tmp5 'logs'
+    $LogFile = Join-Path $LogDir 'test.log'
+    foreach ($d in @($stageDir, $TempDir, $LogDir)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+    $exe = New-Object byte[] (6MB)
+    $exe[0] = 0x4D; $exe[1] = 0x5A
+    [System.IO.File]::WriteAllBytes((Join-Path $stageDir 'windowsdesktop-runtime-10.0.5-win-x64.exe'), $exe)
+    [System.IO.File]::WriteAllBytes((Join-Path $stageDir 'dotnet-hosting-8.0.22-win.exe'), $exe)
+    $DryRun = $false
+    $script:Reboot = $false
+    function Get-StagedInstallerDirs { return @($stageDir) }
+    $script:signed = $true
+    function Test-MicrosoftSigned { param([string]$Path) return $script:signed }
+    $script:runs = @()
+    function Start-Process { param($FilePath, $ArgumentList, [switch]$Wait, [switch]$PassThru)
+        $script:runs += (Get-InstallerFileName -Path $FilePath)
+        return [pscustomobject]@{ ExitCode = 0 } }
+    $script:Unreachable = ''
+    $script:OfflineUnverified = @()
+
+    Assert-True (Install-Runtime -Flavor 'Microsoft.WindowsDesktop.App' -Major 10 -Arch 'x64') 'MIMAKI-UJF15: Windows Desktop 10 installs from the staged file'
+    Assert-Eq ($script:runs -join ',') 'windowsdesktop-runtime-win-x64-10.exe' 'the staged file runs from a copy in the temp folder'
+    Assert-True (Test-Path -LiteralPath (Join-Path $stageDir 'windowsdesktop-runtime-10.0.5-win-x64.exe')) 'the staged original is kept'
+
+    $script:runs = @()
+    Assert-True (Install-Runtime -Flavor 'Microsoft.NETCore.App' -Major 10 -Arch 'x64' -InstalledMax ([version]'10.0.5')) 'NETCore 10 already brought in by the Windows Desktop bundle'
+    Assert-Eq $script:runs.Count 0 'nothing run when the staged build is already installed'
+
+    Assert-True (-not (Install-Runtime -Flavor 'Microsoft.NETCore.App' -Major 6 -Arch 'x64' -InstalledMax ([version]'6.0.36'))) 'NETCore 6 with nothing staged fails'
+    Assert-True (-not (Install-Runtime -Flavor 'Microsoft.WindowsDesktop.App' -Major 10 -Arch 'x86')) 'x64 file is not used for x86'
+
+    $script:runs = @()
+    Assert-True (Install-Runtime -Flavor 'Microsoft.NETCore.App' -Major 10 -Arch 'x64' -InstalledMax ([version]'10.0.3')) 'older 10 on disk: staged Windows Desktop bundle runs for NETCore'
+    Assert-Eq $script:runs.Count 1 'the bundle ran once'
+
+    $script:runs = @()
+    $script:signed = $false
+    Assert-True (-not (Install-Runtime -Flavor 'Microsoft.WindowsDesktop.App' -Major 10 -Arch 'x64')) 'unsigned staged file is refused'
+    Assert-Eq $script:runs.Count 0 'unsigned staged file never runs'
+    $script:signed = $true
+
+    Assert-True (Install-HostingBundle -Major 8 -InstalledMax ([version]'8.0.11')) 'hosting bundle installs from the staged file'
+    Assert-Eq ($script:OfflineUnverified -join ';') ('x64|Microsoft.WindowsDesktop.App 10.x installed from staged 10.0.5;' +
+        'x64|Microsoft.NETCore.App 10.x left at 10.0.5;x64|Microsoft.NETCore.App 10.x installed from staged 10.0.5;' +
+        'Hosting Bundle 8.x installed from staged 8.0.22') 'every staged use is reported'
+} finally {
+    Remove-Item Function:\Invoke-WebRequest, Function:\Start-Sleep, Function:\Start-Process, Function:\Test-MicrosoftSigned, Function:\Get-StagedInstallerDirs -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $tmp5 -Recurse -Force -ErrorAction SilentlyContinue
+}
 
 if ($failed -gt 0) {
     Write-Host "`n$failed test(s) failed"

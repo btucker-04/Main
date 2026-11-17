@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Remediation: Microsoft .NET Core security updates (v3.14)
+    Remediation: Microsoft .NET Core security updates (v3.15)
     Nessus Plugin IDs : 302122, 307353 (+ 314679, 320854, 326863 -- same fix)
 
 .DESCRIPTION
@@ -13,6 +13,22 @@
          cleanup removed it (or anything else went sideways), reinstalls
          and re-verifies. Exits 1 if the machine does not end in a
          strictly better state than it started.
+
+    v3.15 (MIMAKI-UJF15, 2026-11-17): every aka.ms download failed with
+    Unable to connect to the remote server, so neither the 6.0 patch nor
+    .NET 10 installed and Phase 4 refused to retire .NET 6. Staged installers
+    are now a fallback. Put the installer under the name Microsoft publishes
+    it as (windowsdesktop-runtime-10.0.5-win-x64.exe, dotnet-runtime-...,
+    aspnetcore-runtime-..., dotnet-hosting-8.0.22-win.exe, dotnet-sdk-...)
+    beside this script (an Endpoint Central Dependency File) or in C:\.
+    After a failed download the newest staged build of that major is used,
+    if it is signed by Microsoft. One that is not newer than what is
+    installed is not run, and the key counts as current. A windowsdesktop-
+    runtime file also covers Microsoft.NETCore.App, and Windows Desktop is
+    installed first. Once a download cannot connect at all, later ones skip
+    straight to the staged files. With -RemoveRetiredMajor, a failed patch
+    of the major being retired no longer blocks Phase 4; it fails the run
+    only if that major is still installed afterwards.
 
     v3.14 (plugin 172179 on the Mimaki hosts, 2026-11-16): $EolSuccessorMajor
     maps 6 -> 10 and 7 -> 10 as well, so -InstallSuccessorMajor and
@@ -493,6 +509,12 @@ if (-not (Test-Path $LogDir))  { New-Item -ItemType Directory -Path $LogDir  -Fo
 if (-not (Test-Path $TempDir)) { New-Item -ItemType Directory -Path $TempDir -Force -ErrorAction SilentlyContinue | Out-Null }
 # Set by Save-Installer on the first TLS failure; every later download skips.
 $script:TlsFailure = ''
+# Set by Save-Installer when no attempt could connect; later downloads skip
+# straight to staged installers.
+$script:Unreachable = ''
+# What was installed (or left alone) from staged files without the online
+# check for a newer patch.
+$script:OfflineUnverified = @()
 
 function Write-Log {
     param([string]$Msg, [string]$Level = 'INFO')
@@ -746,6 +768,61 @@ function Get-DownloadFailureKind {
     return ''
 }
 
+function Test-HostUnreachable {
+    # No connection was made at all (firewall, no route, DNS), as opposed to a
+    # timeout or reset mid-transfer.
+    param([string]$Message)
+    return ($Message -match '(?i)Unable to connect to the remote server|could not be resolved|No such host is known|connected party did not properly respond|actively refused')
+}
+
+function Get-InstallerFileName {
+    # Last path segment, split on both separators so a Windows path parses the
+    # same off Windows.
+    param([string]$Path)
+    return ($Path -split '[\\/]')[-1]
+}
+
+function Select-StagedInstaller {
+    # Picks the staged installer for one major from a list of file paths, by
+    # the names Microsoft publishes them under, e.g.
+    #   windowsdesktop-runtime-10.0.5-win-x64.exe   (Stem windowsdesktop-runtime-, Suffix -win-x64.exe)
+    #   dotnet-hosting-8.0.22-win.exe               (Stem dotnet-hosting-,         Suffix -win.exe)
+    # Stems are in order of preference; within the first stem that has a match
+    # the newest version wins. Previews (10.0.0-rc.2...) and unversioned
+    # aka.ms names never match. Returns @{ Path; Version; Stem } or $null.
+    param([string[]]$Paths, [string[]]$Stems, [int]$Major, [string]$Suffix)
+    foreach ($stem in $Stems) {
+        $re = '^' + [regex]::Escape($stem) + '(\d+)\.(\d+)\.(\d+)' + [regex]::Escape($Suffix) + '$'
+        $best = $null
+        foreach ($p in @($Paths)) {
+            if (-not $p) { continue }
+            if ((Get-InstallerFileName -Path $p) -notmatch $re) { continue }
+            if ([int]$matches[1] -ne $Major) { continue }
+            $v = [version]($matches[1] + '.' + $matches[2] + '.' + $matches[3])
+            if (-not $best -or $v -gt $best.Version) { $best = @{ Path = $p; Version = $v; Stem = $stem } }
+        }
+        if ($best) { return $best }
+    }
+    return $null
+}
+
+function Get-MaxVersion {
+    # Newest [version] of one major under one '<arch>|<flavor>' key, or $null.
+    param($Map, [string]$Key, [int]$Major)
+    if (-not $Map -or -not $Map.ContainsKey($Key)) { return $null }
+    $vs = @($Map[$Key] | Where-Object { $_.Major -eq $Major } | Sort-Object -Descending)
+    if ($vs.Count -eq 0) { return $null }
+    return $vs[0]
+}
+
+function Get-RuntimeInstallOrder {
+    # Windows Desktop first: its bundle also installs Microsoft.NETCore.App,
+    # so with only a staged windowsdesktop-runtime file the NETCore key then
+    # finds that build already on disk.
+    param([string[]]$Keys)
+    return @($Keys | Sort-Object { if ($_ -match '\|Microsoft\.WindowsDesktop\.App$') { 0 } elseif ($_ -match '\|Microsoft\.NETCore\.App$') { 1 } else { 2 } }, { $_ })
+}
+
 function Write-TlsFailureHelp {
     param([string]$Kind, [string]$Url)
     Write-Log '    *** TLS FAILURE -- no download can succeed on this machine as it is. ***' -Level ERROR
@@ -777,6 +854,11 @@ function Save-Installer {
         Write-Log ('    Skipped -- an earlier download failed TLS (' + $script:TlsFailure + ').') -Level ERROR
         return $false
     }
+    if ($script:Unreachable) {
+        Write-Log '    Download skipped -- the server was unreachable earlier this run.' -Level WARN
+        return $false
+    }
+    $allUnreachable = $true
     foreach ($attempt in 1..$Attempts) {
         try {
             Invoke-WebRequest -Uri $Url -OutFile $Dest -UseBasicParsing -TimeoutSec $TimeoutSec
@@ -795,31 +877,104 @@ function Save-Installer {
                 return $false
             }
             Write-Log ('    Download attempt ' + $attempt + ' of ' + $Attempts + ' failed: ' + $msg) -Level WARN
+            if (-not (Test-HostUnreachable -Message $msg)) { $allUnreachable = $false }
             if ($attempt -lt $Attempts) { Start-Sleep -Seconds 10 }
         }
     }
-    Write-Log ('    Download failed after ' + $Attempts + ' attempts. If Zscaler is throttling large') -Level ERROR
-    Write-Log '    transfers, stage the installer locally and run it manually.' -Level ERROR
+    Write-Log ('    Download failed after ' + $Attempts + ' attempts.') -Level WARN
+    if ($allUnreachable) {
+        $script:Unreachable = $Url
+        Write-Log '    No connection could be made, so later downloads this run go straight' -Level WARN
+        Write-Log '    to staged installers.' -Level WARN
+    }
     return $false
+}
+
+function Get-StagedInstallerDirs {
+    # Same places Find-RemoverScript looks: beside this script (where Endpoint
+    # Central puts Dependency Files) and C:\.
+    return @(@($PSScriptRoot, 'C:\') | Where-Object { $_ })
+}
+
+function Get-StagedInstallerFiles {
+    $files = @()
+    foreach ($d in (Get-StagedInstallerDirs)) {
+        if (-not (Test-Path -LiteralPath $d)) { continue }
+        $files += @(Get-ChildItem -LiteralPath $d -Filter '*.exe' -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '(?i)^(dotnet-runtime|windowsdesktop-runtime|aspnetcore-runtime|dotnet-hosting|dotnet-sdk)-\d' } |
+            ForEach-Object { $_.FullName })
+    }
+    return $files
+}
+
+function Test-MicrosoftSigned {
+    param([string]$Path)
+    $sig = Get-AuthenticodeSignature -FilePath $Path
+    $subject = $(if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { '' })
+    if (('' + $sig.Status) -eq 'Valid' -and $subject -match 'O=Microsoft Corporation') { return $true }
+    Write-Log ('    Signature: ' + $sig.Status + ' ' + $subject + ' ' + $sig.StatusMessage) -Level ERROR
+    return $false
+}
+
+function Get-Installer {
+    # Downloads $Url to $Dest; if that fails, copies the newest matching staged
+    # installer there instead (see Select-StagedInstaller for the names).
+    # Source: 'download', 'staged', 'current' (the staged build is not newer
+    # than $InstalledMax, so there is nothing to run) or '' (failed).
+    param([string]$Url, [string]$Dest, [string[]]$Stems, [int]$Major, [string]$Suffix, [version]$InstalledMax, [string]$Label)
+    if (Save-Installer -Url $Url -Dest $Dest) {
+        return [pscustomobject]@{ Source = 'download'; Version = $null; Stem = $Stems[0] }
+    }
+    $st = Select-StagedInstaller -Paths (Get-StagedInstallerFiles) -Stems $Stems -Major $Major -Suffix $Suffix
+    if (-not $st) {
+        Write-Log ('    No staged installer either. To install without the download, put ' + $Stems[0] + $Major + '.0.<patch>' + $Suffix) -Level ERROR
+        Write-Log ('    (from dotnet.microsoft.com) in ' + ((Get-StagedInstallerDirs) -join ' or ') + ' and re-run.') -Level ERROR
+        return [pscustomobject]@{ Source = ''; Version = $null; Stem = '' }
+    }
+    Write-Log ('    Falling back to staged installer ' + $st.Path + ' (' + $st.Version + ').') -Level WARN
+    if ($InstalledMax -and $st.Version -le $InstalledMax) {
+        Write-Log ('    ' + $InstalledMax + ' is already installed, which is not older than the staged build.') -Level WARN
+        Write-Log '    Nothing to install; whether a newer patch exists could not be checked.' -Level WARN
+        $script:OfflineUnverified += ($Label + ' left at ' + $InstalledMax)
+        return [pscustomobject]@{ Source = 'current'; Version = $st.Version; Stem = $st.Stem }
+    }
+    if (-not (Test-MicrosoftSigned -Path $st.Path)) {
+        Write-Log '    Not validly signed by Microsoft Corporation -- not running it.' -Level ERROR
+        return [pscustomobject]@{ Source = ''; Version = $null; Stem = '' }
+    }
+    Copy-Item -LiteralPath $st.Path -Destination $Dest -Force
+    $script:OfflineUnverified += ($Label + ' installed from staged ' + $st.Version)
+    return [pscustomobject]@{ Source = 'staged'; Version = $st.Version; Stem = $st.Stem }
 }
 
 function Install-Runtime {
     # Downloads + installs one flavor/major/arch. Returns $true on success.
     # -Mode repair reruns the same bundle with /repair (-RepairBrokenHost).
-    param([string]$Flavor, [string]$Major, [string]$Arch, [ValidateSet('install', 'repair')][string]$Mode = 'install')
+    # $InstalledMax is the newest build of this major already on disk for the
+    # flavor/arch; a staged installer that is not newer is not run.
+    param([string]$Flavor, [string]$Major, [string]$Arch, [ValidateSet('install', 'repair')][string]$Mode = 'install', [version]$InstalledMax)
     $stems = @{
-        'Microsoft.NETCore.App'        = 'dotnet-runtime-win-'
-        'Microsoft.WindowsDesktop.App' = 'windowsdesktop-runtime-win-'
-        'Microsoft.AspNetCore.App'     = 'aspnetcore-runtime-win-'
+        'Microsoft.NETCore.App'        = 'dotnet-runtime-'
+        'Microsoft.WindowsDesktop.App' = 'windowsdesktop-runtime-'
+        'Microsoft.AspNetCore.App'     = 'aspnetcore-runtime-'
     }
     $stem = $stems[$Flavor]
-    $url  = 'https://aka.ms/dotnet/' + $Major + '.0/' + $stem + $Arch + '.exe'
-    $dest = Join-Path $TempDir ($stem + $Arch + '-' + $Major + '.exe')
+    # The Windows Desktop bundle carries Microsoft.NETCore.App as well.
+    $stagedStems = @($stem)
+    if ($Flavor -eq 'Microsoft.NETCore.App') { $stagedStems += 'windowsdesktop-runtime-' }
+    $url  = 'https://aka.ms/dotnet/' + $Major + '.0/' + $stem + 'win-' + $Arch + '.exe'
+    $dest = Join-Path $TempDir ($stem + 'win-' + $Arch + '-' + $Major + '.exe')
     Write-Log ('  [' + $Flavor + ' ' + $Major + '.0 ' + $Arch + '] ' + $url)
     if ($DryRun) { Write-Log '    [DRYRUN] Would download + install.'; return $true }
     # v2.6: retry with an explicit timeout -- a single 5-minute stall used to
     # abandon the whole flavour (CSPC-004, 10.0 x86).
-    if (-not (Save-Installer -Url $url -Dest $dest)) { return $false }
+    $got = Get-Installer -Url $url -Dest $dest -Stems $stagedStems -Major ([int]$Major) -Suffix ('-win-' + $Arch + '.exe') `
+        -InstalledMax $(if ($Mode -eq 'install') { $InstalledMax } else { $null }) -Label ($Arch + '|' + $Flavor + ' ' + $Major + '.x')
+    if (-not $got.Source) { return $false }
+    if ($got.Source -eq 'current') { return $true }
+    if ($got.Source -eq 'staged' -and $got.Stem -ne $stem) {
+        Write-Log ('    That is the Windows Desktop bundle; it installs ' + $Flavor + ' ' + $got.Version + ' too.') -Level WARN
+    }
     $item = Get-Item $dest
     $szMB = [math]::Round($item.Length / 1MB, 1)
     # Sanity: must be a Windows executable (MZ header) and non-trivial size.
@@ -828,7 +983,7 @@ function Install-Runtime {
     $b1 = $fs.ReadByte(); $b2 = $fs.ReadByte()
     $fs.Close(); $fs.Dispose()
     $isMZ = ($b1 -eq 0x4D -and $b2 -eq 0x5A)
-    Write-Log ('    Downloaded ' + $szMB + ' MB, MZ header: ' + $isMZ)
+    Write-Log ('    ' + $(if ($got.Source -eq 'staged') { 'Staged copy' } else { 'Downloaded' }) + ' ' + $szMB + ' MB, MZ header: ' + $isMZ)
     if (-not $isMZ -or $item.Length -lt 5MB) {
         Write-Log '    Not a valid installer (block page?). Skipping.' -Level ERROR
         Remove-Item $dest -Force -ErrorAction SilentlyContinue
@@ -871,12 +1026,15 @@ function Install-Sdk {
     # actually fire. Installing here just adds a second, newer entry to the
     # group; the removal path is unchanged and still respects the global.json
     # pin guard and -RemoveSupersededSdks gating.
-    param([string]$Major, [string]$Arch)
+    param([string]$Major, [string]$Arch, [version]$InstalledMax)
     $url  = 'https://aka.ms/dotnet/' + $Major + '.0/dotnet-sdk-win-' + $Arch + '.exe'
     $dest = Join-Path $TempDir ('dotnet-sdk-win-' + $Arch + '-' + $Major + '.exe')
     Write-Log ('  [SDK ' + $Major + '.0 ' + $Arch + '] ' + $url)
     if ($DryRun) { Write-Log '    [DRYRUN] Would download + install.'; return $true }
-    if (-not (Save-Installer -Url $url -Dest $dest)) { return $false }
+    $got = Get-Installer -Url $url -Dest $dest -Stems @('dotnet-sdk-') -Major ([int]$Major) -Suffix ('-win-' + $Arch + '.exe') `
+        -InstalledMax $InstalledMax -Label ('SDK ' + $Major + '.x ' + $Arch)
+    if (-not $got.Source) { return $false }
+    if ($got.Source -eq 'current') { return $true }
     $item = Get-Item $dest
     $szMB = [math]::Round($item.Length / 1MB, 1)
     $fs = [System.IO.File]::OpenRead($dest)
@@ -1059,12 +1217,15 @@ function Test-VersionHeldByDependency {
 
 function Install-HostingBundle {
     # Architecture-neutral single installer; URL shape differs from the runtimes.
-    param([int]$Major)
+    param([int]$Major, [version]$InstalledMax)
     $url  = 'https://aka.ms/dotnet/' + $Major + '.0/dotnet-hosting-win.exe'
     $dest = Join-Path $TempDir ('dotnet-hosting-' + $Major + '-win.exe')
     Write-Log ('  [Hosting Bundle ' + $Major + '.0] ' + $url)
     if ($DryRun) { Write-Log '    [DRYRUN] Would download + install.'; return $true }
-    if (-not (Save-Installer -Url $url -Dest $dest)) { return $false }
+    $got = Get-Installer -Url $url -Dest $dest -Stems @('dotnet-hosting-') -Major $Major -Suffix '-win.exe' `
+        -InstalledMax $InstalledMax -Label ('Hosting Bundle ' + $Major + '.x')
+    if (-not $got.Source) { return $false }
+    if ($got.Source -eq 'current') { return $true }
     $item = Get-Item $dest
     $fs = [System.IO.File]::OpenRead($dest)
     $b1 = $fs.ReadByte(); $b2 = $fs.ReadByte()
@@ -1351,7 +1512,7 @@ $script:MuxerBrokenRoots = @()
 $script:MuxerFailures    = @()
 
 Write-Log '=============================================='
-Write-Log ' .NET Runtime Update (v3.13) -- 302122/307353/314679/320854/326863/+.NETCore-family'
+Write-Log ' .NET Runtime Update (v3.15) -- 302122/307353/314679/320854/326863/+.NETCore-family'
 Write-Log (' Host   : ' + $env:COMPUTERNAME)
 # Echo EVERY switch, so a log proves which arguments actually arrived. Endpoint
 # Central has a history in this environment of altering argument strings, and a
@@ -1367,6 +1528,13 @@ Write-Log ('   -RemoveRetiredMajor          : ' + $RemoveRetiredMajor)
 Write-Log ('   -RepairBrokenHost            : ' + $RepairBrokenHost)
 if ($MyInvocation.Line) {
     Write-Log (' Invoked as: ' + $MyInvocation.Line.Trim())
+}
+$stagedFiles = @(Get-StagedInstallerFiles)
+if ($stagedFiles.Count -eq 0) {
+    Write-Log (' Staged installers (used if a download fails): none in ' + ((Get-StagedInstallerDirs) -join ', '))
+} else {
+    Write-Log ' Staged installers (used if a download fails):'
+    foreach ($f in $stagedFiles) { Write-Log ('   ' + $f) }
 }
 Write-Log '=============================================='
 
@@ -1591,12 +1759,27 @@ if ($EolSeen.Count -gt 0) {
 # ------------------------------------------------------------------
 Write-Log ''
 Write-Log '=== Phase 1: installing latest patches ==='
-foreach ($key in $before.Keys) {
+# A major that Phase 4 is about to remove does not need its patch, so a failed
+# patch of one only fails the run if Phase 4 then leaves it installed.
+$retireMajors = @()
+if ($RemoveRetiredMajor) {
+    $retireMajors = @(Get-SuccessorTargets -EolSeen $EolSeen -EolSoonSeen $EolSoonSeen -Map $EolSuccessorMajor | ForEach-Object { [int]$_.From })
+}
+$RetirePatchFailed = @()
+foreach ($key in (Get-RuntimeInstallOrder -Keys $before.Keys)) {
     $arch   = ($key -split '\|')[0]
     $flavor = ($key -split '\|')[1]
     $majors = $before[$key] | ForEach-Object { $_.Major } | Sort-Object -Unique
     foreach ($major in $majors) {
-        if (-not (Install-Runtime -Flavor $flavor -Major $major -Arch $arch)) { $Failed = $true }
+        $haveMax = Get-MaxVersion -Map (Get-InstalledMap $roots) -Key $key -Major $major
+        if (Install-Runtime -Flavor $flavor -Major $major -Arch $arch -InstalledMax $haveMax) { continue }
+        if ($retireMajors -contains [int]$major) {
+            Write-Log ('    Not failing the run yet: -RemoveRetiredMajor removes .NET ' + $major + ' in Phase 4,') -Level WARN
+            Write-Log '    which makes this patch unnecessary. If it is not removed, the run fails then.' -Level WARN
+            $RetirePatchFailed += [int]$major
+        } else {
+            $Failed = $true
+        }
     }
 }
 
@@ -1633,14 +1816,15 @@ if ($retiring.Count -eq 0) {
         $eolMajor  = $target.From
         $successor = $target.To
         Write-Log ('  .NET ' + $eolMajor + ' -> staging .NET ' + $successor + ' alongside it (NOT removing .NET ' + $eolMajor + '):')
-        foreach ($key in $before.Keys) {
+        foreach ($key in (Get-RuntimeInstallOrder -Keys $before.Keys)) {
             $arch        = ($key -split '\|')[0]
             $flavor      = ($key -split '\|')[1]
             $hasEolMajor = [bool]($before[$key] | Where-Object { $_.Major -eq $eolMajor })
             if (-not $hasEolMajor) { continue }
             if ($staged -contains ($key + '|' + $successor)) { continue }
             $staged += ($key + '|' + $successor)
-            if (Install-Runtime -Flavor $flavor -Major $successor -Arch $arch) {
+            $haveMax = Get-MaxVersion -Map (Get-InstalledMap $roots) -Key $key -Major $successor
+            if (Install-Runtime -Flavor $flavor -Major $successor -Arch $arch -InstalledMax $haveMax) {
                 # v3.6: recorded so Phase 3 can prove it SURVIVED the run.
                 # Phase 3's own checklist is built from $before, which can
                 # never contain a major Phase 1a just added, so without this
@@ -1692,7 +1876,7 @@ if (-not $hb) {
         }
         Write-Log ('  Bundle ' + $maj + '.x is at ' + $b.Version + ' but runtimes are at ' + $newestForMajor + '.') -Level WARN
         Write-Log '  It PINS the old framework folders, so updating it is what releases them.' -Level WARN
-        if (-not (Install-HostingBundle -Major $maj)) { $Failed = $true; continue }
+        if (-not (Install-HostingBundle -Major $maj -InstalledMax $b.Version)) { $Failed = $true; continue }
         if (-not $DryRun) {
             Start-Sleep -Seconds 3
             $nowBundles = Get-HostingBundles | Where-Object { $_.Major -eq $maj }
@@ -1739,7 +1923,8 @@ if (-not $sdkEntries) {
             $ma = ('' + $s.Major + '|' + $s.Arch)
             if ($doneMA -contains $ma) { continue }
             $doneMA += $ma
-            if (-not (Install-Sdk -Major $s.Major -Arch $s.Arch)) { $Failed = $true }
+            $sdkMax = (@($sdkEntries | Where-Object { $_.Major -eq $s.Major -and $_.Arch -eq $s.Arch } | ForEach-Object { $_.Version }) | Sort-Object -Descending)[0]
+            if (-not (Install-Sdk -Major $s.Major -Arch $s.Arch -InstalledMax $sdkMax)) { $Failed = $true }
         }
         $sdkEntries = Get-DotNetSdkEntries
     }
@@ -2219,6 +2404,11 @@ if (-not $RemoveRetiredMajor) {
         }
     }
 }
+foreach ($m in @($RetirePatchFailed | Sort-Object -Unique)) {
+    if ($RetiredRemoved -contains $m) { continue }
+    Write-Log ('  .NET ' + $m + ' could not be patched in Phase 1 and was not removed either.') -Level ERROR
+    $Failed = $true
+}
 
 # ------------------------------------------------------------------
 Write-Log ''
@@ -2238,6 +2428,14 @@ if ($UninstallNoOp) {
 }
 if ($script:TlsFailure) {
     Write-Log ('NOTHING WAS DOWNLOADED: TLS failure (' + $script:TlsFailure + '). Fix the certificate/TLS cause in the Phase 1 log, then re-run.') -Level ERROR
+}
+if ($script:Unreachable) {
+    Write-Log ('Downloads stopped: no connection could be made to ' + $script:Unreachable + '.') -Level WARN
+}
+if ($script:OfflineUnverified.Count -gt 0) {
+    Write-Log 'Used staged installers in place of a download (newest patch NOT checked online):' -Level WARN
+    foreach ($o in $script:OfflineUnverified) { Write-Log ('  ' + $o) -Level WARN }
+    Write-Log 'If Nessus still flags these, stage the newer build from dotnet.microsoft.com and re-run.' -Level WARN
 }
 if ($Failed) {
     Write-Log 'One or more steps FAILED (install, SDK removal or verification). See the ERROR lines above.' -Level ERROR
