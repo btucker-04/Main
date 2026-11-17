@@ -143,7 +143,8 @@ These rules apply to staged files:
 - The newest staged build of the needed major and arch is used.
 - It must have a valid Microsoft Corporation signature.
 - A staged build that is not newer than what is installed is not run, and the runtime counts as current.
-- Previews and unversioned names (`dotnet-runtime-win-x64.exe`) are ignored.
+- Previews and unversioned names (`dotnet-runtime-win-x64.exe`) are ignored. A duplicate-download suffix before the extension (`… (1).exe`, `… 1.exe`, `Remove-DotNetEolChannel 1.ps1`) is accepted.
+- Each installer covers only its own flavor, except that `windowsdesktop-runtime` also covers the .NET runtime. A host with Windows Desktop needs the `windowsdesktop-runtime` file; `dotnet-runtime` alone does not install it.
 - The start of the log lists the staged files found. The end of the log lists everything that came from them, which was not checked online for a newer patch.
 
 Once a download cannot connect at all (`Unable to connect to the remote server`, DNS failure), the rest of the run goes straight to staged files. With `-RemoveRetiredMajor`, a failed patch of the major being removed does not block Phase 4. It fails the run only if that major is still installed at the end. To move an offline .NET 6 host to 10, stage `windowsdesktop-runtime-10.0.x-win-<arch>.exe`, or `dotnet-runtime-…` if it has no Windows Desktop runtime, plus `Remove-DotNetEolChannel.ps1`.

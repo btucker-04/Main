@@ -441,6 +441,25 @@ Assert-True ($null -eq (Select-StagedInstaller -Paths @('C:\DOTNET-RUNTIME-6.0.3
 Assert-Eq (Select-StagedInstaller -Paths @('C:\DOTNET-RUNTIME-6.0.36-WIN-X64.EXE') -Stems @('dotnet-runtime-') -Major 6 -Suffix '-win-x64.exe').Version '6.0.36' 'file name match is case-insensitive'
 Assert-True ($null -eq (Select-StagedInstaller -Paths @() -Stems @('dotnet-runtime-') -Major 6 -Suffix '-win-x64.exe')) 'no staged files'
 
+# MIMAKI-RND01 (2026-11-17): the EC Dependency Files as uploaded.
+$rnd01 = @(
+    'C:\Program Files (x86)\ManageEngine\UEMS_Agent\Computer\startup\99609\dotnet-runtime-10.0.15-win-x64 (1).exe',
+    'C:\Program Files (x86)\ManageEngine\UEMS_Agent\Computer\startup\99609\Remove-DotNetEolChannel 1.ps1'
+)
+$r = Select-StagedInstaller -Paths $rnd01 -Stems @('dotnet-runtime-', 'windowsdesktop-runtime-') -Major 10 -Suffix '-win-x64.exe'
+Assert-Eq ('' + $r.Version + '|' + $r.Path) ('10.0.15|' + $rnd01[0]) 'MIMAKI-RND01: (1) copy suffix is accepted'
+Assert-True ($null -eq (Select-StagedInstaller -Paths $rnd01 -Stems @('windowsdesktop-runtime-') -Major 10 -Suffix '-win-x64.exe')) 'MIMAKI-RND01: a dotnet-runtime file is not a Windows Desktop installer'
+Assert-Eq (Select-StagedInstaller -Paths @('C:\dotnet-hosting-8.0.22-win(2).exe') -Stems @('dotnet-hosting-') -Major 8 -Suffix '-win.exe').Version '8.0.22' 'copy suffix without a space'
+Assert-Eq (Select-StagedInstaller -Paths @('C:\windowsdesktop-runtime-10.0.5-win-x64 2.exe') -Stems @('windowsdesktop-runtime-') -Major 10 -Suffix '-win-x64.exe').Version '10.0.5' 'numbered copy suffix'
+Assert-True ($null -eq (Select-StagedInstaller -Paths @('C:\windowsdesktop-runtime-10.0.5-win-x64-old.exe') -Stems @('windowsdesktop-runtime-') -Major 10 -Suffix '-win-x64.exe')) 'other trailing text is still rejected'
+Assert-True ($null -eq (Select-StagedInstaller -Paths @('C:\windowsdesktop-runtime-10.0.5-win-x64 (1).exe') -Stems @('windowsdesktop-runtime-') -Major 10 -Suffix '-win-x86.exe')) 'copy suffix does not loosen the arch'
+Assert-Eq (Select-RemoverScript -Paths $rnd01) $rnd01[1] 'MIMAKI-RND01: Remove-DotNetEolChannel 1.ps1 is found'
+Assert-Eq (Select-RemoverScript -Paths @('C:\x\Remove-DotNetEolChannel (1).ps1', 'C:\x\Remove-DotNetEolChannel.ps1')) 'C:\x\Remove-DotNetEolChannel.ps1' 'exact remover name preferred over a copy'
+Assert-True ($null -eq (Select-RemoverScript -Paths @('C:\x\Remove-DotNetEolChannel-old.ps1', 'C:\x\Remove-DotNetEolChannel.ps1.txt'))) 'other remover names are rejected'
+$rnd01Tls = 'The underlying connection was closed: An unexpected error occurred on a send. | Authentication failed because the remote party has closed the transport stream.'
+Assert-True (Test-HostUnreachable -Message $rnd01Tls) 'MIMAKI-RND01: handshake closed by the far end counts as unreachable'
+Assert-Eq (Get-DownloadFailureKind -Message $rnd01Tls) '' 'MIMAKI-RND01: still retried on the first download'
+
 $order = Get-RuntimeInstallOrder -Keys @('x64|Microsoft.NETCore.App', 'x64|Microsoft.AspNetCore.App', 'x86|Microsoft.WindowsDesktop.App', 'x64|Microsoft.WindowsDesktop.App')
 Assert-Eq ($order -join ',') 'x64|Microsoft.WindowsDesktop.App,x86|Microsoft.WindowsDesktop.App,x64|Microsoft.NETCore.App,x64|Microsoft.AspNetCore.App' 'Windows Desktop keys install first'
 $ujfMap = @{ 'x64|Microsoft.NETCore.App' = @([version]'6.0.36', [version]'10.0.5'); 'x64|Microsoft.WindowsDesktop.App' = @([version]'6.0.36') }
@@ -514,6 +533,17 @@ try {
     Assert-Eq ($script:OfflineUnverified -join ';') ('x64|Microsoft.WindowsDesktop.App 10.x installed from staged 10.0.5;' +
         'x64|Microsoft.NETCore.App 10.x left at 10.0.5;x64|Microsoft.NETCore.App 10.x installed from staged 10.0.5;' +
         'Hosting Bundle 8.x installed from staged 8.0.22') 'every staged use is reported'
+
+    # MIMAKI-RND01: only the NETCore installer staged, under its (1) name.
+    $rndDir = Join-Path $tmp5 'rnd01'
+    New-Item -ItemType Directory -Force -Path $rndDir | Out-Null
+    [System.IO.File]::WriteAllBytes((Join-Path $rndDir 'dotnet-runtime-10.0.15-win-x64 (1).exe'), $exe)
+    function Get-StagedInstallerDirs { return @($rndDir) }
+    $script:runs = @()
+    Assert-True (-not (Install-Runtime -Flavor 'Microsoft.WindowsDesktop.App' -Major 10 -Arch 'x64')) 'MIMAKI-RND01: Windows Desktop 10 cannot use the dotnet-runtime file'
+    Assert-True ((Get-Content -LiteralPath $LogFile -Raw) -match 'dotnet-runtime-10\.0\.15-win-x64 \(1\)\.exe is a dotnet-runtime installer') 'MIMAKI-RND01: log names the wrong-flavor file'
+    Assert-True (Install-Runtime -Flavor 'Microsoft.NETCore.App' -Major 10 -Arch 'x64') 'MIMAKI-RND01: NETCore 10 installs from the (1) file'
+    Assert-Eq $script:runs.Count 1 'MIMAKI-RND01: the NETCore installer ran'
 } finally {
     Remove-Item Function:\Invoke-WebRequest, Function:\Start-Sleep, Function:\Start-Process, Function:\Test-MicrosoftSigned, Function:\Get-StagedInstallerDirs -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $tmp5 -Recurse -Force -ErrorAction SilentlyContinue
