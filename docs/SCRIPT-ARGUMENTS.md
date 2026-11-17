@@ -129,6 +129,25 @@ Patches every installed .NET runtime channel to its latest build and prunes supe
 
 Exit for `Update-DotNetRuntimes.ps1`: `0` = done, `3010` = reboot needed, `1` = failed, `2` = updates done but `-RemoveRetiredMajor` refused and a human decides. Keep EC success codes `0,3010`. A broken .NET host (`dotnet --list-runtimes` cannot load `hostfxr.dll`, or the `host\fxr` folder is missing) stops the run with exit `1` before anything changes; the log lists the runtimes found on disk and says to reboot, then repair the newest of them. Pass `-RepairBrokenHost` to have the script do that repair. A TLS failure on a download (certificate chain not trusted, usually the Zscaler root CA missing from `LocalMachine\Root`, or a failed handshake) is not retried. Every later download in the run is skipped, and the run exits `1` with the likely cause in the log.
 
+**Offline fallback (staged installers).** If a download fails, the script uses a staged installer instead. Put it beside the script as an EC Dependency File, or in `C:\`, under the name Microsoft publishes it as on dotnet.microsoft.com:
+
+| Covers | Staged file name |
+|--------|------------------|
+| Windows Desktop runtime, and the .NET runtime inside it | `windowsdesktop-runtime-10.0.5-win-x64.exe` |
+| .NET runtime only | `dotnet-runtime-6.0.36-win-x64.exe` |
+| ASP.NET Core runtime | `aspnetcore-runtime-8.0.22-win-x86.exe` |
+| Hosting Bundle | `dotnet-hosting-8.0.22-win.exe` |
+| SDK (`-RemoveSupersededSdks`) | `dotnet-sdk-8.0.416-win-x64.exe` |
+
+These rules apply to staged files:
+- The newest staged build of the needed major and arch is used.
+- It must have a valid Microsoft Corporation signature.
+- A staged build that is not newer than what is installed is not run, and the runtime counts as current.
+- Previews and unversioned names (`dotnet-runtime-win-x64.exe`) are ignored.
+- The start of the log lists the staged files found. The end of the log lists everything that came from them, which was not checked online for a newer patch.
+
+Once a download cannot connect at all (`Unable to connect to the remote server`, DNS failure), the rest of the run goes straight to staged files. With `-RemoveRetiredMajor`, a failed patch of the major being removed does not block Phase 4. It fails the run only if that major is still installed at the end. To move an offline .NET 6 host to 10, stage `windowsdesktop-runtime-10.0.x-win-<arch>.exe`, or `dotnet-runtime-…` if it has no Windows Desktop runtime, plus `Remove-DotNetEolChannel.ps1`.
+
 ## Update-NodeJS.ps1
 Updates the Program Files Node.js MSI install to the latest release of its installed major line, looked up at run time from `https://nodejs.org/dist/index.json`. No pinned target version; if nodejs.org is unreachable, the newest staged `node-v<major>.x.y-<arch>.msi` is used.
 

@@ -41,6 +41,12 @@ Each entry gives the rule, then the evidence: the host or PR where it bit us. Se
 - **SYSTEM's `%TEMP%` is `C:\Windows\Temp`.** Installers that fail early write their logs there, not under Program Files (CSPRLT-94, #66).
 - **A mutex existing is not a mutex being owned.** `Global\_MSIExecute` exists whenever `msiexec /V` is alive. Probe with `WaitOne(0)` (CSLT-192, #40).
 - **Dependency Files are extracted to `$PSScriptRoot`.** `$MyInvocation.MyCommand.Path` is wrong inside functions (#31).
+- **Every download needs a staged-installer fallback.** Some hosts cannot reach the vendor at all: MIMAKI-UJF15 got `Unable to connect to the remote server` from aka.ms on every attempt. In that case:
+  - Look for the vendor's versioned file name beside the script and in `C:\`.
+  - Check its Authenticode signer.
+  - Skip it when it is not newer than what is installed.
+  - After the first download that never connects, skip the rest of the downloads.
+  - List everything taken from staged files at the end of the log, since its patch level was not checked online (`Update-DotNetRuntimes.ps1` v3.15, `Update-NodeJS.ps1`).
 - **Never pass paths or quoted values as EC arguments.** Use bare switches only.
 - **Newer scripts contain no literal double-quote character.** Build it with `[char]34` and use single-quoted strings, because EC mangles quotes. Check with `rg -c '"' windows/<Script>.ps1`.
 - **Invoke native exes by full path with `-NoNewWindow`.** Bare `msiexec.exe` fails under SYSTEM through ShellExecute.
