@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Remediation: Microsoft .NET Core security updates (v3.15)
+    Remediation: Microsoft .NET Core security updates (v3.16)
     Nessus Plugin IDs : 302122, 307353 (+ 314679, 320854, 326863 -- same fix)
 
 .DESCRIPTION
@@ -13,6 +13,16 @@
          cleanup removed it (or anything else went sideways), reinstalls
          and re-verifies. Exits 1 if the machine does not end in a
          strictly better state than it started.
+
+    v3.16 (MIMAKI-RND01, 2026-11-17): the Dependency Files had been
+    uploaded as dotnet-runtime-10.0.15-win-x64 (1).exe and
+    Remove-DotNetEolChannel 1.ps1, and neither name matched, so Phase 4 said
+    the remover was not staged. A copy suffix before the extension
+    ((1), (2), 1) is now accepted for both. When the staged runtime is
+    the wrong flavor (a dotnet-runtime file where Windows Desktop is
+    needed), the log says so. Authentication failed because the remote
+    party has closed the transport stream, which this host got on every
+    attempt, now counts as unreachable, so later downloads stop retrying.
 
     v3.15 (MIMAKI-UJF15, 2026-11-17): every aka.ms download failed with
     Unable to connect to the remote server, so neither the 6.0 patch nor
@@ -769,10 +779,31 @@ function Get-DownloadFailureKind {
 }
 
 function Test-HostUnreachable {
-    # No connection was made at all (firewall, no route, DNS), as opposed to a
-    # timeout or reset mid-transfer.
+    # No download can start: no connection (firewall, no route, DNS), or the
+    # TLS handshake closed by the far end before any data (MIMAKI-RND01), as
+    # opposed to a timeout or reset mid-transfer.
     param([string]$Message)
-    return ($Message -match '(?i)Unable to connect to the remote server|could not be resolved|No such host is known|connected party did not properly respond|actively refused')
+    return ($Message -match '(?i)Unable to connect to the remote server|could not be resolved|No such host is known|connected party did not properly respond|actively refused|remote party has closed the transport stream')
+}
+
+# What a browser, Finder or the EC upload adds to a second copy of a file:
+# 'name (1).exe', 'name(2).exe', 'name 1.ps1'.
+$script:CopySuffixPattern = '(?: ?\(\d+\)| \d+)?'
+$script:RuntimeStems = @('windowsdesktop-runtime-', 'dotnet-runtime-', 'aspnetcore-runtime-')
+
+function Get-StagedCoverageHint {
+    return 'windowsdesktop-runtime covers Windows Desktop and .NET; dotnet-runtime covers .NET only; aspnetcore-runtime covers ASP.NET Core only.'
+}
+
+function Select-RemoverScript {
+    # Remove-DotNetEolChannel.ps1, preferring the exact name over a copy.
+    param([string[]]$Paths)
+    $re = '^Remove-DotNetEolChannel' + $script:CopySuffixPattern + '\.ps1$'
+    $hits = @(@($Paths) | Where-Object { $_ -and (Get-InstallerFileName -Path $_) -match $re })
+    $exact = @($hits | Where-Object { (Get-InstallerFileName -Path $_) -eq 'Remove-DotNetEolChannel.ps1' })
+    if ($exact.Count -gt 0) { return $exact[0] }
+    if ($hits.Count -gt 0) { return $hits[0] }
+    return $null
 }
 
 function Get-InstallerFileName {
@@ -789,10 +820,14 @@ function Select-StagedInstaller {
     #   dotnet-hosting-8.0.22-win.exe               (Stem dotnet-hosting-,         Suffix -win.exe)
     # Stems are in order of preference; within the first stem that has a match
     # the newest version wins. Previews (10.0.0-rc.2...) and unversioned
-    # aka.ms names never match. Returns @{ Path; Version; Stem } or $null.
+    # aka.ms names never match. A duplicate-download suffix before the
+    # extension is allowed (... (1).exe, ... 1.exe; MIMAKI-RND01). Returns
+    # @{ Path; Version; Stem } or $null.
     param([string[]]$Paths, [string[]]$Stems, [int]$Major, [string]$Suffix)
+    $ext = [System.IO.Path]::GetExtension($Suffix)
+    $body = $Suffix.Substring(0, $Suffix.Length - $ext.Length)
     foreach ($stem in $Stems) {
-        $re = '^' + [regex]::Escape($stem) + '(\d+)\.(\d+)\.(\d+)' + [regex]::Escape($Suffix) + '$'
+        $re = '^' + [regex]::Escape($stem) + '(\d+)\.(\d+)\.(\d+)' + [regex]::Escape($body) + $script:CopySuffixPattern + [regex]::Escape($ext) + '$'
         $best = $null
         foreach ($p in @($Paths)) {
             if (-not $p) { continue }
@@ -927,6 +962,11 @@ function Get-Installer {
     }
     $st = Select-StagedInstaller -Paths (Get-StagedInstallerFiles) -Stems $Stems -Major $Major -Suffix $Suffix
     if (-not $st) {
+        $other = Select-StagedInstaller -Paths (Get-StagedInstallerFiles) -Stems $script:RuntimeStems -Major $Major -Suffix $Suffix
+        if ($other) {
+            Write-Log ('    Staged ' + (Get-InstallerFileName -Path $other.Path) + ' is a ' + $other.Stem.TrimEnd('-') + ' installer,') -Level ERROR
+            Write-Log ('    which does not contain this one. ' + (Get-StagedCoverageHint)) -Level ERROR
+        }
         Write-Log ('    No staged installer either. To install without the download, put ' + $Stems[0] + $Major + '.0.<patch>' + $Suffix) -Level ERROR
         Write-Log ('    (from dotnet.microsoft.com) in ' + ((Get-StagedInstallerDirs) -join ' or ') + ' and re-run.') -Level ERROR
         return [pscustomobject]@{ Source = ''; Version = $null; Stem = '' }
@@ -1465,9 +1505,10 @@ function Find-RuntimeConfigPins {
 
 function Find-RemoverScript {
     foreach ($d in @($PSScriptRoot, 'C:\')) {
-        if (-not $d) { continue }
-        $p = $d.TrimEnd('\') + '\Remove-DotNetEolChannel.ps1'
-        if (Test-Path -LiteralPath $p) { return $p }
+        if (-not $d -or -not (Test-Path -LiteralPath $d)) { continue }
+        $names = @(Get-ChildItem -LiteralPath $d -Filter 'Remove-DotNetEolChannel*.ps1' -File -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+        $p = Select-RemoverScript -Paths $names
+        if ($p) { return $p }
     }
     return $null
 }
@@ -1512,7 +1553,7 @@ $script:MuxerBrokenRoots = @()
 $script:MuxerFailures    = @()
 
 Write-Log '=============================================='
-Write-Log ' .NET Runtime Update (v3.15) -- 302122/307353/314679/320854/326863/+.NETCore-family'
+Write-Log ' .NET Runtime Update (v3.16) -- 302122/307353/314679/320854/326863/+.NETCore-family'
 Write-Log (' Host   : ' + $env:COMPUTERNAME)
 # Echo EVERY switch, so a log proves which arguments actually arrived. Endpoint
 # Central has a history in this environment of altering argument strings, and a
