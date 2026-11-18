@@ -391,6 +391,20 @@ Removes classic Microsoft Teams 1.x (Nessus 175408, 179635 -- "Microsoft Teams <
 |----------|------|---------|-------------|
 | `-DryRun` | switch | off | Report what would be removed; change nothing. |
 
+## Update-WebpImageExtension.ps1
+Updates the Microsoft WebP Image Extension Store app past 1.2.31.0 (Nessus 346896, CVE-2026-70351). Tenable reads the version in the `C:\Program Files\WindowsApps\Microsoft.WebpImageExtension_<version>_…` folder name, so success means no folder below 1.2.31.0 is left. The 32-bit EC agent is relaunched into 64-bit PowerShell.
+
+The script gets the fixed build from one of two sources:
+1. A staged package beside the script (EC Dependency File) or in `C:\`. Get it with `winget download --id 9PG2DK419DRG --source msstore` on an admin workstation, and stage the `Microsoft.WebpImageExtension…` package plus the `Microsoft.VCLibs…` x64 dependency it saves. The version, architecture and Microsoft publisher are read from the manifest inside the package, so file names don't matter. A package below 1.2.31.0 is refused. The script provisions it, then removes the old registration for every user, and each user gets the new build at their next sign-in.
+2. Otherwise, a Microsoft Store update scan through the MDM bridge, which works as SYSTEM, waiting up to 8 minutes. The old provisioned entry is then removed.
+
+If neither source works, nothing is removed. Exit `0` = no vulnerable build left (or not installed), `3010` = fixed build in place but an old folder still held (reboot, re-run), `1` = no fixed build could be installed. EC success codes `0,3010`. Log: `C:\Logs\CompoSecure\WebpImageExtension_<timestamp>.log`.
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `-Remove` | switch | off | Remove the extension for every user and deprovision it instead of updating. Explorer and Photos stop showing `.webp` files; browsers are unaffected. Exit `3010` when only a SYSTEM-staged remnant is left for the restart to finish. |
+| `-DryRun` | switch | off | Inventory and report what would be done; change nothing. |
+
 ## Remove-3DViewer.ps1
 Removes the Microsoft 3D Viewer Store app.
 
