@@ -8,14 +8,19 @@
     Fixes the Trust Center > Macro Settings values Tenable flags, for every
     Office app and version that has them, in every place they can be set:
 
-      Value        App       Flagged when           Set to
-      AccessVBOM   any       nonzero                0   (123461: VBA project access off)
-      VBAWarnings  any       1 (enable all macros)  2   (123459: disable with notification,
-                                                         the Office default)
-      Level        Outlook   1 (no security check)  2   (123459: Outlook's equivalent)
+      Value        App       Flagged when             Set to
+      AccessVBOM   any       nonzero                  0   (123461: VBA project access off)
+      VBAWarnings  any       1 (enable all macros)    3   (123459: disable all except
+                             2 (disable with notify)       digitally signed macros)
+      Level        Outlook   1 (no security check)    3   (123459: Outlook's equivalent)
+                             2 (notify for all)
 
-    VBAWarnings 3 (signed macros only) and 4 (disable all) are stricter than
-    the default and are left alone.
+    123459 is about UNTRUSTED (unsigned) macros. With 2, the user can still
+    run one from the Enable Content bar, and Tenable flags it: CSXPS-001
+    (2026-11-23) stayed flagged at HKU\<bprazeres>\...\16.0\Excel\Security\
+    VBAWarnings = 2. 3 is the least strict value that blocks unsigned macros;
+    4 (disable all) is stricter and left alone. An absent value is not
+    reported by Tenable and is not written.
 
     The values live under
         <hive>\SOFTWARE\Microsoft\Office\<ver>\<App>\Security            (user/app setting)
@@ -58,11 +63,13 @@
 
     Something usually turned these on deliberately -- an add-in that needs VBA
     project access, or a user told to enable all macros for a workbook. Fixing
-    them can break that workflow; confirm with the user first.
+    them can break that workflow; confirm with the user first. Raising
+    VBAWarnings 2 to 3 removes the Enable Content bar for unsigned macros;
+    workbooks that need them must be signed or opened from a Trusted Location.
 
 .PARAMETER EnforcePolicy
-    Also write per-user policy values (AccessVBOM 0, VBAWarnings 2, Outlook
-    Level 2) for Office 16.0, overwriting any local policy value.
+    Also write per-user policy values (AccessVBOM 0, VBAWarnings 3, Outlook
+    Level 3) for Office 16.0, overwriting any local policy value.
 
 .PARAMETER DryRun
     Report what would change without writing anything.
@@ -98,8 +105,8 @@ function Get-MacroSettingFixValue {
     param([string]$Name)
     switch ($Name) {
         'AccessVBOM'  { return 0 }
-        'VBAWarnings' { return 2 }
-        'Level'       { return 2 }
+        'VBAWarnings' { return 3 }
+        'Level'       { return 3 }
         default       { throw ('Unknown macro setting ' + $Name) }
     }
 }
@@ -113,8 +120,8 @@ function Get-MacroSettingAction {
     $flagged = $false
     switch ($Name) {
         'AccessVBOM'  { $flagged = (-not $parsed) -or ($n -ne 0) }
-        'VBAWarnings' { $flagged = $parsed -and ($n -eq 1) }
-        'Level'       { $flagged = $parsed -and ($n -eq 1) }
+        'VBAWarnings' { $flagged = $parsed -and ($n -eq 1 -or $n -eq 2) }
+        'Level'       { $flagged = $parsed -and ($n -eq 1 -or $n -eq 2) }
         default       { throw ('Unknown macro setting ' + $Name) }
     }
     if (-not $flagged) { return 'OK' }
@@ -220,8 +227,8 @@ foreach ($ver in @(Get-ChildItem $base | Where-Object { $_.PSChildName -match '^
         if (-not (Test-Path $sec)) { continue }
         $p = Get-ItemProperty $sec
         if ($null -ne $p.AccessVBOM -and ('' + $p.AccessVBOM) -ne '0') { Set-ItemProperty $sec -Name AccessVBOM -Value 0 -Type DWord }
-        if (('' + $p.VBAWarnings) -eq '1') { Set-ItemProperty $sec -Name VBAWarnings -Value 2 -Type DWord }
-        if ($app.PSChildName -eq 'Outlook' -and ('' + $p.Level) -eq '1') { Set-ItemProperty $sec -Name Level -Value 2 -Type DWord }
+        if (@('1', '2') -contains ('' + $p.VBAWarnings)) { Set-ItemProperty $sec -Name VBAWarnings -Value 3 -Type DWord }
+        if ($app.PSChildName -eq 'Outlook' -and @('1', '2') -contains ('' + $p.Level)) { Set-ItemProperty $sec -Name Level -Value 3 -Type DWord }
     }
 }
 '@

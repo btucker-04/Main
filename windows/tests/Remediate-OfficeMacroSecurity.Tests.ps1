@@ -1,7 +1,7 @@
 # Unit tests for Remediate-OfficeMacroSecurity.ps1 decision helpers.
 # Run: pwsh -NoProfile -File windows/tests/Remediate-OfficeMacroSecurity.Tests.ps1
 #
-# Plugin 123461 (AccessVBOM on) and plugin 123459 (VBAWarnings = 1, enable all
+# Plugin 123461 (AccessVBOM on) and plugin 123459 (VBAWarnings 1 or 2, untrusted
 # macros) on CSLT-201 / CSPRLT-68, 2026-10-12. User and machine settings are
 # fixed; Group Policy / Intune values are only reported unless -EnforcePolicy.
 $ErrorActionPreference = 'Stop'
@@ -29,18 +29,24 @@ Assert-Eq (& $act 'AccessVBOM' 2 $false $false) 'FIX' 'AccessVBOM nonzero counts
 Assert-Eq (& $act 'AccessVBOM' 'junk' $false $false) 'FIX' 'unparseable AccessVBOM is treated as on'
 Assert-Eq (Get-MacroSettingFixValue -Name 'AccessVBOM') 0 'AccessVBOM fixed to 0'
 
-# --- VBAWarnings (123459): only 1 = enable all macros is flagged --------------
+# --- VBAWarnings (123459): anything that lets an unsigned macro run -----------
 Assert-Eq (& $act 'VBAWarnings' 1 $false $false) 'FIX' 'VBAWarnings 1 (enable all) is fixed'
-Assert-Eq (& $act 'VBAWarnings' 2 $false $false) 'OK' 'VBAWarnings 2 (disable with notification) is left'
+# CSXPS-001 (2026-11-23): the run logged
+#   OK SOFTWARE\Microsoft\Office\16.0\Excel\Security\VBAWarnings = 2
+# for bprazeres, and Tenable still flagged HKEY_USERS\<sid>\...\VBAWarnings.
+Assert-Eq (& $act 'VBAWarnings' 2 $false $false) 'FIX' 'VBAWarnings 2 (Enable Content bar) is fixed (CSXPS-001)'
 Assert-Eq (& $act 'VBAWarnings' 3 $false $false) 'OK' 'VBAWarnings 3 (signed only) is left'
 Assert-Eq (& $act 'VBAWarnings' 4 $false $false) 'OK' 'VBAWarnings 4 (disable all) is left'
+Assert-Eq (& $act 'VBAWarnings' $null $false $false) 'OK' 'absent VBAWarnings is not written'
 Assert-Eq (& $act 'VBAWarnings' 'junk' $false $false) 'OK' 'unparseable VBAWarnings is not guessed at'
-Assert-Eq (Get-MacroSettingFixValue -Name 'VBAWarnings') 2 'VBAWarnings fixed to 2, the Office default'
+Assert-Eq (Get-MacroSettingFixValue -Name 'VBAWarnings') 3 'VBAWarnings fixed to 3, signed macros only'
+Assert-Eq (& $act 'VBAWarnings' (Get-MacroSettingFixValue -Name 'VBAWarnings') $false $false) 'OK' 'fixed VBAWarnings value is not flagged again'
 
 # --- Outlook Level (123459) ---------------------------------------------------
 Assert-Eq (& $act 'Level' 1 $false $false) 'FIX' 'Outlook Level 1 (no security check) is fixed'
-Assert-Eq (& $act 'Level' 2 $false $false) 'OK' 'Outlook Level 2 is left'
-Assert-Eq (Get-MacroSettingFixValue -Name 'Level') 2 'Outlook Level fixed to 2'
+Assert-Eq (& $act 'Level' 2 $false $false) 'FIX' 'Outlook Level 2 (notify for all) is fixed'
+Assert-Eq (& $act 'Level' 3 $false $false) 'OK' 'Outlook Level 3 is left'
+Assert-Eq (Get-MacroSettingFixValue -Name 'Level') 3 'Outlook Level fixed to 3'
 Assert-Eq ((Get-MacroSettingNames -App 'Outlook') -join ',') 'AccessVBOM,VBAWarnings,Level' 'Outlook also checks Level'
 Assert-Eq ((Get-MacroSettingNames -App 'Excel') -join ',') 'AccessVBOM,VBAWarnings' 'Excel checks AccessVBOM and VBAWarnings only'
 
@@ -48,7 +54,8 @@ Assert-Eq ((Get-MacroSettingNames -App 'Excel') -join ',') 'AccessVBOM,VBAWarnin
 Assert-Eq (& $act 'VBAWarnings' 1 $true $false) 'REPORT' 'policy VBAWarnings 1 is reported, not changed'
 Assert-Eq (& $act 'AccessVBOM' 1 $true $false) 'REPORT' 'policy AccessVBOM 1 is reported, not changed'
 Assert-Eq (& $act 'VBAWarnings' 1 $true $true) 'FIX' 'policy value overwritten with -EnforcePolicy'
-Assert-Eq (& $act 'VBAWarnings' 2 $true $false) 'OK' 'policy VBAWarnings 2 is OK'
+Assert-Eq (& $act 'VBAWarnings' 2 $true $false) 'REPORT' 'policy VBAWarnings 2 is reported'
+Assert-Eq (& $act 'VBAWarnings' 3 $true $false) 'OK' 'policy VBAWarnings 3 is OK'
 
 # --- Get-OfficeBaseKeys -------------------------------------------------------
 $user = @(Get-OfficeBaseKeys -IsMachine $false)
@@ -132,6 +139,7 @@ $null = [System.Management.Automation.Language.Parser]::ParseInput($logon, [ref]
 Assert-Eq @($parseErrors).Count 0 'sign-in fix script parses'
 Assert-Eq ($logon -match 'HKCU:\\Software\\Microsoft\\Office') 'True' 'sign-in fix targets the user''s own hive'
 Assert-Eq ($logon -match 'Policies') 'False' 'sign-in fix never touches policy keys'
+Assert-Eq ($logon -match "@\('1', '2'\) -contains \(''\s*\+\s*\`$p\.VBAWarnings\)\) \{ Set-ItemProperty \`$sec -Name VBAWarnings -Value 3") 'True' 'sign-in fix raises VBAWarnings 1/2 to 3'
 $stub = Get-ActiveSetupStubPath -Script $logon
 Assert-Eq ($stub -match '^powershell\.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand [A-Za-z0-9+/=]+$') 'True' 'StubPath is a single encoded PowerShell command'
 $b64 = ($stub -split ' ')[-1]
