@@ -257,6 +257,9 @@ case "\$1" in
     { echo "CFBundleShortVersionString=\$(cat "$S/dmg_version")"; echo "CFBundleVersion=\$(cat "$S/dmg_build")"
       echo "LSMinimumSystemVersion=\$(cat "$S/dmg_minos")"; } > "\$app/Contents/Info.plist"
     echo bin > "\$app/Contents/MacOS/prl_client_app"
+    # The real DMG hides the app (UF_HIDDEN + com.apple.FinderInfo on the root).
+    touch "\$app/.finderinfo"
+    [ -e "$S/nested_detritus" ] && mkdir -p "\$app/Contents/MacOS/Parallels VM.app" && touch "\$app/Contents/MacOS/Parallels VM.app/.finderinfo"
     cp "$S/inittool" "\$app/Contents/MacOS/inittool"; chmod +x "\$app/Contents/MacOS/inittool"
     printf '#!/bin/bash\necho "prlsrvctl-new \$*" >> "$S/calls"\ncat "$S/license"\n' > "\$app/Contents/MacOS/prlsrvctl"
     chmod +x "\$app/Contents/MacOS/prlsrvctl"
@@ -272,6 +275,12 @@ sig=\$(cat "$S/signature")
 case "\$1" in
   --verify)
     [ "\$sig" = broken ] && { echo 'a sealed resource is missing or invalid' >&2; exit 1; }
+    p="\${@: -1}"; depth="-maxdepth 1"
+    case " \$* " in *" --deep "*) depth="" ;; esac
+    # shellcheck disable=SC2086
+    if find "\$p" \$depth -name .finderinfo | grep -q .; then
+      echo "\$p: resource fork, Finder information, or similar detritus not allowed" >&2; exit 1
+    fi
     case " \$* " in *" --deep "*)
       [ "\$sig" = deepfail ] && { echo "\${@: -1}: code object is not signed at all" >&2
         echo "In subcomponent: \${@: -1}/Contents/MacOS/Parallels Mac VM.app" >&2; exit 1; } ;;
@@ -291,7 +300,7 @@ EOF
   cat > "$fix/run/shims/spctl" <<EOF
 #!/bin/bash
 echo "spctl \$*" >> "$S/calls"
-if [ "\$(cat "$S/spctl")" = notarized ]; then
+if [ "\$(cat "$S/spctl")" = notarized ] && ! find "\${@: -1}" -name .finderinfo | grep -q .; then
   printf '%s\n' "\${@: -1}: accepted" 'source=Notarized Developer ID' 'origin=Developer ID Application: Parallels International GmbH (4C6364ACXT)' >&2
   exit 0
 fi
@@ -301,7 +310,18 @@ EOF
   cat > "$fix/run/shims/ditto" <<EOF
 #!/bin/bash
 echo "ditto \$*" >> "$S/calls"
+while [ "\${1#-}" != "\$1" ]; do shift; done
 cp -R "\$1" "\$2"
+EOF
+  cat > "$fix/run/shims/xattr" <<EOF
+#!/bin/bash
+echo "xattr \$*" >> "$S/calls"
+[ "\$1 \$2" = "-d com.apple.FinderInfo" ] && [ -e "\$3/.finderinfo" ] && { rm -f "\$3/.finderinfo"; exit 0; }
+echo "xattr: \$3: No such xattr: \$2" >&2; exit 1
+EOF
+  cat > "$fix/run/shims/chflags" <<EOF
+#!/bin/bash
+echo "chflags \$*" >> "$S/calls"
 EOF
   cat > "$fix/run/shims/ps" <<EOF
 #!/bin/bash
@@ -374,9 +394,15 @@ check_grep 'missing majors skipped quietly' '  feed v26: 26.5.0 build 57613' "$L
 check_grep "v21's stale v20 feed skipped, not a failure" '  feed v21: serves 20.2.1 \(another major.s feed\); skipped' "$L"
 check_grep 'DMG from the feed url' 'curl .*https://download.parallels.com/desktop/v27/27.1.0-58756/ParallelsDesktop-27.1.0-58756.dmg' "$S/calls"
 check_grep 'mounted read-only, hidden' '^hdiutil attach -nobrowse -readonly -noautoopen -mountpoint ' "$S/calls"
-check_grep 'deep strict verify' '^codesign --verify --deep --strict .*/mnt/Parallels Desktop.app$' "$S/calls"
+check_grep 'staged off the DMG without quarantine' '^ditto --noqtn .*/mnt/Parallels Desktop.app .*/stage/Parallels Desktop.app$' "$S/calls"
+check_grep 'staged root unhidden' '^chflags nohidden .*/stage/Parallels Desktop.app$' "$S/calls"
+check_grep 'staged root FinderInfo cleared' '^xattr -d com.apple.FinderInfo .*/stage/Parallels Desktop.app$' "$S/calls"
+check_nogrep 'nothing cleared on the DMG' '^(xattr|chflags) .*/mnt/' "$S/calls"
+check_grep 'deep strict verify on the staged copy' '^codesign --verify --deep --strict .*/stage/Parallels Desktop.app$' "$S/calls"
+check_grep 'deep verify passes after staging' 'codesign --verify --deep --strict: ok' "$L"
+check_nogrep 'no Gatekeeper fallback needed' '^spctl' "$S/calls"
 check_grep 'signer logged' 'Signature: Developer ID Application: Parallels International GmbH \(4C6364ACXT\)' "$L"
-check_grep "Parallels' inittool from the DMG" "^inittool install -t $P -b .*/mnt/Parallels Desktop.app -s$" "$S/calls"
+check_grep "Parallels' inittool on the verified copy" "^inittool install -t $P -b .*/stage/Parallels Desktop.app -s$" "$S/calls"
 check_grep 'license read before' '^prlsrvctl-old info --license' "$S/calls"
 check_grep 'license read after' '^prlsrvctl-new info --license' "$S/calls"
 check_grep 'license key masked' 'License \(before\): License: state="valid" key="<masked>"' "$L"
@@ -508,14 +534,28 @@ check 'signature does not verify -> 1' "$rc" '1'
 check_nogrep 'broken signature: no inittool' '^inittool' "$S/calls"
 check_grep 'broken signature: codesign error in the main log' '\| .*a sealed resource is missing or invalid' "$L"
 
+# armb-09 v2 (2026-11-23 10:48): the app on the DMG itself fails --strict with
+# "resource fork, Finder information, or similar detritus not allowed".
+make_fixture; pd_app 19.3.0 54924
+codesign_dmg_root() { PATH="$fix/run/shims:$PATH" codesign --verify --deep --strict "$1" 2>&1; }
+mkdir -p "$fix/run/m"; PATH="$fix/run/shims:$PATH" hdiutil attach -mountpoint "$fix/run/m" x >/dev/null
+check 'fixture: the DMG app as shipped fails --strict like armb-09' "$(codesign_dmg_root "$fix/run/m/Parallels Desktop.app")" \
+  "$fix/run/m/Parallels Desktop.app: resource fork, Finder information, or similar detritus not allowed"
+
+make_fixture; pd_app 19.3.0 54924; touch "$S/nested_detritus"
+run_script env; rc=$?
+check 'detritus below the bundle root is not cleared -> 1' "$rc" '1'
+check_nogrep 'nested detritus: no inittool' '^inittool' "$S/calls"
+check 'nested detritus: only the root was cleared' "$(grep -c '^xattr -d' "$S/calls")" '1'
+
 # armb-09 (2026-11-23, macOS 27.2): 27.1.0's DMG failed --deep --strict in 6 s.
 make_fixture; pd_app 19.3.0 54924; echo deepfail > "$S/signature"
 run_script env; rc=$?
 check 'only --deep fails, notarized -> installed 0' "$rc" '0'
 check 'deep fails, notarized: app reads 27.1.0' "$(ver_of)" '27.1.0'
 check_grep 'deep error shown in the main log' '\| In subcomponent: .*Parallels Mac VM.app' "$L"
-check_grep 'top-level strict verify run' '^codesign --verify --strict .*/mnt/Parallels Desktop.app$' "$S/calls"
-check_grep 'Gatekeeper asked' '^spctl --assess --type execute -vv .*/mnt/Parallels Desktop.app$' "$S/calls"
+check_grep 'top-level strict verify run' '^codesign --verify --strict .*/stage/Parallels Desktop.app$' "$S/calls"
+check_grep 'Gatekeeper asked' '^spctl --assess --type execute -vv .*/stage/Parallels Desktop.app$' "$S/calls"
 check_grep 'fallback noted in the summary' 'installed on the top-level strict verify plus Gatekeeper' "$L"
 
 make_fixture; pd_app 19.3.0 54924; echo deepfail > "$S/signature"; echo rejected > "$S/spctl"

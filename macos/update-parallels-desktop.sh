@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# update-parallels-desktop.sh  (v2)
+# update-parallels-desktop.sh  (v3)
 # Remediates : Parallels Desktop below a fixed release (plugin 347968
 #              "Parallels Desktop < 27.0.0 Local Privilege Escalation (macOS)",
 #              CVE-2026-90894, armb-09 2026-11-23 with 19.3.0), and later
@@ -31,13 +31,16 @@
 #   4. Download the DMG, mount it read-only, check the app's version and build,
 #      codesign --verify --deep --strict, the Developer ID team 4C6364ACXT,
 #      the CPU (27.x is Apple silicon only) and the minimum macOS.
-#      27.1.0's DMG fails the --deep check on armb-09 (macOS 27.2) in 6 s.
-#      When only --deep fails, the app is accepted if the top-level strict
+#      The app is hidden on the DMG (UF_HIDDEN + com.apple.FinderInfo on the
+#      bundle root), which codesign --strict rejects as "detritus" (armb-09,
+#      macOS 27.2). It is copied to a staging folder and those two are cleared
+#      on the bundle root only, as inittool does after its copy; the checks run
+#      on that copy, and that copy is what gets installed.
+#      If only --deep fails, the app is accepted when the top-level strict
 #      verify passes and Gatekeeper (spctl) calls it a notarized Developer ID
-#      app from team 4C6364ACXT -- the check macOS applies at launch. The
-#      --deep errors are copied into this log either way.
-#   5. Install with Parallels' own tool from the DMG, as its installer does:
-#        inittool install -t "/Applications/Parallels Desktop.app" -b <dmg app> -s
+#      app from team 4C6364ACXT. codesign's errors are copied into this log.
+#   5. Install with Parallels' own tool, as its installer does:
+#        inittool install -t "/Applications/Parallels Desktop.app" -b <staged app> -s
 #      It stops the Parallels services and Mac VMs, deletes the old app, copies
 #      the new one, sets owners and permissions, and starts the services. A
 #      clone of the old app is kept until the new one reads the target, and is
@@ -574,6 +577,22 @@ if [ "$SRC_VER" != "$TARGET" ] || [ "$SRC_BUILD" != "$T_BUILD" ]; then
     add_issue "the DMG's Parallels Desktop.app is ${SRC_VER:-missing}${SRC_BUILD:+-$SRC_BUILD}, not $TARGET-$T_BUILD"
     finish 1 "refused to install: the DMG does not hold $TARGET-$T_BUILD."
 fi
+# Parallels hides the app on its DMG so only Install.app shows: UF_HIDDEN and
+# com.apple.FinderInfo on the bundle root. codesign --strict rejects that as
+# "resource fork, Finder information, or similar detritus not allowed"
+# (armb-09, 27.1.0). inittool clears exactly these two after its own copy, so
+# do the same on a staged copy, verify the copy, and install from it.
+STAGE_APP="$WORK_DIR/stage/Parallels Desktop.app"
+mkdir -p "$WORK_DIR/stage"
+STEP_LOG="$LOG_DIR/parallels_update_stage.log"; : > "$STEP_LOG"
+if ! run_limited 900 ditto --noqtn "$SRC_APP" "$STAGE_APP"; then
+    add_issue "could not copy the DMG's app to $STAGE_APP -- $STEP_LOG"
+    finish 1 "could not stage Parallels Desktop $TARGET."
+fi
+chflags nohidden "$STAGE_APP" >>"$STEP_LOG" 2>&1
+xattr -d com.apple.FinderInfo "$STAGE_APP" >>"$STEP_LOG" 2>&1
+SRC_APP="$STAGE_APP"
+log "  Staged the app at $STAGE_APP (bundle root unhidden, as inittool does)."
 STEP_LOG="$LOG_DIR/parallels_update_signature.log"; : > "$STEP_LOG"
 if run_limited 900 codesign --verify --deep --strict "$SRC_APP"; then
     log "  codesign --verify --deep --strict: ok"
@@ -634,7 +653,7 @@ else
     log "  Could not keep a copy of the old app -- $STEP_LOG (continuing; inittool replaces it in place)."
 fi
 STEP_LOG="$LOG_DIR/parallels_update_install.log"; : > "$STEP_LOG"
-log "  inittool install -t \"$PD_APP\" -b <dmg>/Parallels Desktop.app -s"
+log "  inittool install -t \"$PD_APP\" -b \"$SRC_APP\" -s"
 run_limited "$INSTALL_TIMEOUT" "$SRC_APP/Contents/MacOS/inittool" install -t "$PD_APP" -b "$SRC_APP" -s
 IRC=$?
 log "  inittool: $(inittool_rc_text "$IRC") (exit $IRC) -- $STEP_LOG"
