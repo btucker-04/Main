@@ -165,6 +165,14 @@ FILE_ARM='Mach-O 64-bit arm64 executable, flags:<NOUNDEFS|DYLDLINK|TWOLEVEL|BIND
   u 'team ID only on the Authority line refused' "$(echo "$SIG_GOOD" | sed 's/^TeamIdentifier=.*/TeamIdentifier=ABCDE12345/' | y signature_is_parallels)" 'n'
   u 'ad-hoc signature refused' "$(printf 'Identifier=com.parallels.desktop.console\nSignature=adhoc\nTeamIdentifier=not set\n' | y signature_is_parallels)" 'n'
 
+  GK='/Volumes/Parallels Desktop 27/Parallels Desktop.app: accepted
+source=Notarized Developer ID
+origin=Developer ID Application: Parallels International GmbH (4C6364ACXT)'
+  u 'notarized Parallels app accepted' "$(echo "$GK" | y gatekeeper_accepts)" 'y'
+  u 'rejected refused' "$(echo "$GK" | sed 's/: accepted$/: rejected/' | y gatekeeper_accepts)" 'n'
+  u 'not notarized refused' "$(echo "$GK" | sed 's/^source=.*/source=Developer ID/' | y gatekeeper_accepts)" 'n'
+  u 'other team refused' "$(echo "$GK" | sed 's/4C6364ACXT/ABCDE12345/' | y gatekeeper_accepts)" 'n'
+
   u 'arm64-only (Linux file)' "$(echo "$FILE_ARM" | macho_archs)" 'arm64'
   u 'arm64-only (macOS file)' "$(echo 'Mach-O 64-bit executable arm64' | macho_archs)" 'arm64'
   u 'universal' "$(echo 'Mach-O universal binary with 2 architectures: [x86_64:Mach-O 64-bit executable x86_64] [arm64e:Mach-O 64-bit executable arm64e]' | macho_archs)" 'arm64 x86_64'
@@ -262,7 +270,13 @@ EOF
 echo "codesign \$*" >> "$S/calls"
 sig=\$(cat "$S/signature")
 case "\$1" in
-  --verify) [ "\$sig" = broken ] && { echo 'a sealed resource is missing or invalid' >&2; exit 1; }; exit 0 ;;
+  --verify)
+    [ "\$sig" = broken ] && { echo 'a sealed resource is missing or invalid' >&2; exit 1; }
+    case " \$* " in *" --deep "*)
+      [ "\$sig" = deepfail ] && { echo "\${@: -1}: code object is not signed at all" >&2
+        echo "In subcomponent: \${@: -1}/Contents/MacOS/Parallels Mac VM.app" >&2; exit 1; } ;;
+    esac
+    exit 0 ;;
   -dv)
     if [ "\$sig" = other ]; then
       printf '%s\n' 'Identifier=com.parallels.desktop.console' 'Authority=Developer ID Application: Evil LLC (ABCDE12345)' 'TeamIdentifier=ABCDE12345' >&2
@@ -273,6 +287,17 @@ esac
 exit 0
 EOF
   printf '#!/bin/bash\ncat "%s/file_out"\n' "$S" > "$fix/run/shims/file"
+  echo notarized > "$S/spctl"
+  cat > "$fix/run/shims/spctl" <<EOF
+#!/bin/bash
+echo "spctl \$*" >> "$S/calls"
+if [ "\$(cat "$S/spctl")" = notarized ]; then
+  printf '%s\n' "\${@: -1}: accepted" 'source=Notarized Developer ID' 'origin=Developer ID Application: Parallels International GmbH (4C6364ACXT)' >&2
+  exit 0
+fi
+printf '%s\n' "\${@: -1}: rejected" 'source=Unnotarized Developer ID' 'origin=Developer ID Application: Parallels International GmbH (4C6364ACXT)' >&2
+exit 3
+EOF
   cat > "$fix/run/shims/ditto" <<EOF
 #!/bin/bash
 echo "ditto \$*" >> "$S/calls"
@@ -481,6 +506,27 @@ make_fixture; pd_app 19.3.0 54924; echo broken > "$S/signature"
 run_script env; rc=$?
 check 'signature does not verify -> 1' "$rc" '1'
 check_nogrep 'broken signature: no inittool' '^inittool' "$S/calls"
+check_grep 'broken signature: codesign error in the main log' '\| .*a sealed resource is missing or invalid' "$L"
+
+# armb-09 (2026-11-23, macOS 27.2): 27.1.0's DMG failed --deep --strict in 6 s.
+make_fixture; pd_app 19.3.0 54924; echo deepfail > "$S/signature"
+run_script env; rc=$?
+check 'only --deep fails, notarized -> installed 0' "$rc" '0'
+check 'deep fails, notarized: app reads 27.1.0' "$(ver_of)" '27.1.0'
+check_grep 'deep error shown in the main log' '\| In subcomponent: .*Parallels Mac VM.app' "$L"
+check_grep 'top-level strict verify run' '^codesign --verify --strict .*/mnt/Parallels Desktop.app$' "$S/calls"
+check_grep 'Gatekeeper asked' '^spctl --assess --type execute -vv .*/mnt/Parallels Desktop.app$' "$S/calls"
+check_grep 'fallback noted in the summary' 'installed on the top-level strict verify plus Gatekeeper' "$L"
+
+make_fixture; pd_app 19.3.0 54924; echo deepfail > "$S/signature"; echo rejected > "$S/spctl"
+run_script env; rc=$?
+check 'deep fails, Gatekeeper rejects -> 1' "$rc" '1'
+check_nogrep 'Gatekeeper rejects: no inittool' '^inittool' "$S/calls"
+check_grep 'Gatekeeper verdict in the main log' '\| .*: rejected' "$L"
+
+make_fixture; pd_app 19.3.0 54924; echo broken > "$S/signature"
+run_script env; rc=$?
+check 'top-level verify fails: Gatekeeper not asked' "$(grep -c '^spctl' "$S/calls")" '0'
 
 make_fixture; pd_app 19.3.0 54924; echo reboot > "$S/inittool_mode"
 run_script env; rc=$?

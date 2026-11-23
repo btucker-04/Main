@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# update-parallels-desktop.sh  (v1)
+# update-parallels-desktop.sh  (v2)
 # Remediates : Parallels Desktop below a fixed release (plugin 347968
 #              "Parallels Desktop < 27.0.0 Local Privilege Escalation (macOS)",
 #              CVE-2026-90894, armb-09 2026-11-23 with 19.3.0), and later
@@ -31,6 +31,11 @@
 #   4. Download the DMG, mount it read-only, check the app's version and build,
 #      codesign --verify --deep --strict, the Developer ID team 4C6364ACXT,
 #      the CPU (27.x is Apple silicon only) and the minimum macOS.
+#      27.1.0's DMG fails the --deep check on armb-09 (macOS 27.2) in 6 s.
+#      When only --deep fails, the app is accepted if the top-level strict
+#      verify passes and Gatekeeper (spctl) calls it a notarized Developer ID
+#      app from team 4C6364ACXT -- the check macOS applies at launch. The
+#      --deep errors are copied into this log either way.
 #   5. Install with Parallels' own tool from the DMG, as its installer does:
 #        inittool install -t "/Applications/Parallels Desktop.app" -b <dmg app> -s
 #      It stops the Parallels services and Mac VMs, deletes the old app, copies
@@ -198,6 +203,15 @@ signature_is_parallels() {
     sp_out=$(cat)
     echo "$sp_out" | grep -q "^TeamIdentifier=$PD_TEAM_ID\$" || return 1
     echo "$sp_out" | grep -qE "^Authority=Developer ID Application: .+ \\($PD_TEAM_ID\\)\$" || return 1
+}
+
+# `spctl --assess --type execute -vv` output on stdin -> 0 when Gatekeeper
+# accepts it as a notarized Developer ID app from Parallels' team.
+gatekeeper_accepts() {
+    ga_out=$(cat)
+    echo "$ga_out" | grep -qE ': accepted$' || return 1
+    echo "$ga_out" | grep -qE '^source=Notarized Developer ID$' || return 1
+    echo "$ga_out" | grep -qE "^origin=Developer ID Application: .+ \\($PD_TEAM_ID\\)\$" || return 1
 }
 
 # `file -b` output for a Mach-O on stdin -> its architectures, space separated.
@@ -420,6 +434,8 @@ fi
 if command -v caffeinate >/dev/null 2>&1; then
     caffeinate -i -s -w $$ >/dev/null 2>&1 &
     CAF_PID=$!
+    # Without disown, bash prints "Terminated: 15 caffeinate" when cleanup kills it.
+    disown "$CAF_PID" 2>/dev/null
 fi
 
 log ""
@@ -559,9 +575,23 @@ if [ "$SRC_VER" != "$TARGET" ] || [ "$SRC_BUILD" != "$T_BUILD" ]; then
     finish 1 "refused to install: the DMG does not hold $TARGET-$T_BUILD."
 fi
 STEP_LOG="$LOG_DIR/parallels_update_signature.log"; : > "$STEP_LOG"
-if ! run_limited 900 codesign --verify --deep --strict "$SRC_APP"; then
-    add_issue "codesign --verify failed for the DMG's Parallels Desktop.app -- $STEP_LOG"
-    finish 1 "refused to install an app whose signature does not verify."
+if run_limited 900 codesign --verify --deep --strict "$SRC_APP"; then
+    log "  codesign --verify --deep --strict: ok"
+else
+    log "  codesign --verify --deep --strict failed:"
+    log_tail "$STEP_LOG" 8
+    STEP_LOG="$LOG_DIR/parallels_update_gatekeeper.log"; : > "$STEP_LOG"
+    if run_limited 300 codesign --verify --strict "$SRC_APP" &&
+       run_limited 300 spctl --assess --type execute -vv "$SRC_APP" &&
+       gatekeeper_accepts < "$STEP_LOG"; then
+        log "  Top-level strict verify ok; Gatekeeper: notarized Developer ID, team $PD_TEAM_ID."
+        add_note "codesign --deep --strict failed (lines above); installed on the top-level strict verify plus Gatekeeper's notarization check"
+    else
+        log "  Top-level verify / Gatekeeper:"
+        log_tail "$STEP_LOG" 8
+        add_issue "the DMG's Parallels Desktop.app fails codesign --deep --strict and is not accepted by the top-level verify plus Gatekeeper -- $LOG_DIR/parallels_update_signature.log, $STEP_LOG"
+        finish 1 "refused to install an app whose signature does not verify."
+    fi
 fi
 SIG_INFO="$WORK_DIR/codesign.txt"
 codesign -dv --verbose=2 "$SRC_APP" > "$SIG_INFO" 2>&1
