@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Remediation: Microsoft .NET Core security updates (v3.16)
+    Remediation: Microsoft .NET Core security updates (v3.17)
     Nessus Plugin IDs : 302122, 307353 (+ 314679, 320854, 326863 -- same fix)
 
 .DESCRIPTION
@@ -13,6 +13,18 @@
          cleanup removed it (or anything else went sideways), reinstalls
          and re-verifies. Exits 1 if the machine does not end in a
          strictly better state than it started.
+
+    v3.17 (CSLT-217, 2026-11-24): plugins 320854 through 380356 all flagged
+    Path C:\Program Files\dotnet\ (and the x86 root) at 8.0.27.36030, the
+    file version of <root>\dotnet.exe, while shared\ held only 8.0.34 and
+    10.0.15. --list-runtimes does not show the muxer, so the run never
+    mentioned 8.0.27. The starting state and the end of the run now log each
+    dotnet.exe beside the newest Microsoft.NETCore.App on disk. An older one
+    is a reboot (3010) when its replacement is queued in
+    PendingFileRenameOperations; otherwise the run exits 2. With
+    -RepairBrokenHost the script repairs the newest registered .NET Host MSI
+    (msiexec /fomus), then installs and if needed /repairs the newest major's
+    runtime, and exits 1 if dotnet.exe is still older.
 
     v3.16 (MIMAKI-RND01, 2026-11-17): the Dependency Files had been
     uploaded as dotnet-runtime-10.0.15-win-x64 (1).exe and
@@ -431,7 +443,8 @@
                             those as failed in EC is the correct signal.
       Run As              : System (MSI install/uninstall requires it)
     -DryRun to preview. Exit: 0 ok / 3010 reboot recommended / 1 failure /
-    2 updates done but -RemoveRetiredMajor refused (a human decides).
+    2 updates done but -RemoveRetiredMajor refused (a human decides), or
+    dotnet.exe is older than the runtimes and -RepairBrokenHost was not set.
     -RemoveRetiredMajor: also stage Remove-DotNetEolChannel.ps1 as a
     Dependency File.
 
@@ -505,6 +518,7 @@ param(
     # disk, then /repair it if the host is still broken, and continue only
     # once dotnet --list-runtimes works. Skipped when a host\fxr rename is
     # already queued for the next boot -- that host needs a reboot instead.
+    # v3.17: also repairs a dotnet.exe older than the newest runtime on disk.
     [switch]$RepairBrokenHost
 )
 if ($RemoveRetiredMajor) { $InstallSuccessorMajor = [switch]$true }
@@ -674,6 +688,59 @@ function Get-HostRepairPlan {
     return [pscustomobject]@{ Action = 'Install'; Major = [int]$majors[0]; Reason = ('newest major on disk is ' + $majors[0]) }
 }
 
+function ConvertTo-HostFileVersion {
+    # '8.0.27.36030' (dotnet.exe FileVersion) -> [version]'8.0.27'; $null if unreadable.
+    param([string]$FileVersion)
+    if ($FileVersion -match '^\s*(\d+)\.(\d+)\.(\d+)') {
+        return [version]($matches[1] + '.' + $matches[2] + '.' + $matches[3])
+    }
+    return $null
+}
+
+function Get-MuxerCheck {
+    # CSLT-217 (2026-11-24): every .NET Core plugin flagged Path
+    # C:\Program Files\dotnet\ at 8.0.27.36030 -- the FILE version of
+    # <root>\dotnet.exe -- while shared\ held only 8.0.34 and 10.0.15.
+    # --list-runtimes never shows the muxer, so the run looked clean.
+    # Every runtime installer carries the host at its own version, so a
+    # muxer older than the newest Microsoft.NETCore.App on disk was not
+    # replaced. A replacement queued in PendingFileRenameOperations only
+    # completes at boot.
+    param([version]$MuxerVersion, [version[]]$Runtimes, [string[]]$PendingRenames, [string]$Root)
+    $newest = $null
+    if ($Runtimes) { $newest = @($Runtimes | Sort-Object -Descending)[0] }
+    if ($null -eq $MuxerVersion -or $null -eq $newest) {
+        return [pscustomobject]@{ State = 'Unknown'; Newest = $newest; Reason = '' }
+    }
+    if ($MuxerVersion -ge $newest) {
+        return [pscustomobject]@{ State = 'Current'; Newest = $newest; Reason = '' }
+    }
+    $exePattern = '(?i)' + [regex]::Escape($Root.TrimEnd('\') + '\dotnet.exe') + '$'
+    $queued = @($PendingRenames | Where-Object { $_ -and ($_ -match $exePattern) })
+    if ($queued.Count -gt 0) {
+        return [pscustomobject]@{ State = 'RebootQueued'; Newest = $newest; Reason = ($queued[0] -replace '^\\\?\?\\', '') }
+    }
+    return [pscustomobject]@{ State = 'Stale'; Newest = $newest; Reason = '' }
+}
+
+function Select-HostMsiForRepair {
+    # The newest 'Microsoft .NET Host - <ver> (<arch>)' MSI registration at or
+    # above $Minimum. Repairing it (msiexec /fomus) rewrites an older
+    # dotnet.exe in place. $null when no registered host is new enough.
+    param($Entries, [string]$Arch, [version]$Minimum)
+    $best = $null; $bestVer = $null
+    foreach ($e in @($Entries)) {
+        if (-not $e) { continue }
+        $name = '' + $e.DisplayName
+        if ($name -notmatch ('^Microsoft \.NET Host - (\d+\.\d+\.\d+) \(' + $Arch + '\)$')) { continue }
+        $v = [version]$matches[1]
+        if ($v -lt $Minimum) { continue }
+        if (('' + $e.PSChildName) -notmatch '^\{[0-9A-Fa-f-]{36}\}$') { continue }
+        if ($null -eq $bestVer -or $v -gt $bestVer) { $best = $e; $bestVer = $v }
+    }
+    return $best
+}
+
 function Test-DotNetHostWorks {
     param([string]$Exe)
     return (@(Invoke-DotNetListRuntimes -Exe $Exe | Where-Object { $_ -match '^Microsoft\.(?:NETCore|WindowsDesktop|AspNetCore)\.App\s+\d' }).Count -gt 0)
@@ -697,6 +764,69 @@ function Repair-BrokenHostRoots {
         Write-Log ('  ' + $root.Arch + ': host still broken after install -- running the installer with /repair.') -Level WARN
         Install-Runtime -Flavor 'Microsoft.NETCore.App' -Major $plan.Major -Arch $root.Arch -Mode repair | Out-Null
     }
+}
+
+function Get-MuxerChecks {
+    param($Roots)
+    $pending = @(Get-PendingFileRenames)
+    $out = @()
+    foreach ($root in $Roots) {
+        if (-not (Test-Path -LiteralPath $root.Exe)) { continue }
+        $vi = (Get-Item -LiteralPath $root.Exe).VersionInfo
+        $fileVer = '' + $vi.FileMajorPart + '.' + $vi.FileMinorPart + '.' + $vi.FileBuildPart + '.' + $vi.FilePrivatePart
+        $dir = Split-Path -Parent $root.Exe
+        $rt = @(Get-RuntimeVersionsFromDisk -Root $dir | Where-Object { $_.Flavor -eq 'Microsoft.NETCore.App' } | ForEach-Object { $_.Version })
+        $check = Get-MuxerCheck -MuxerVersion (ConvertTo-HostFileVersion -FileVersion $fileVer) -Runtimes $rt -PendingRenames $pending -Root $dir
+        $out += [pscustomobject]@{ Arch = $root.Arch; Exe = $root.Exe; FileVersion = $fileVer; Check = $check }
+    }
+    return $out
+}
+
+function Write-MuxerChecks {
+    param($Checks)
+    foreach ($m in @($Checks)) {
+        $line = '  ' + $m.Arch + ' ' + $m.Exe + ' : ' + $m.FileVersion
+        switch ($m.Check.State) {
+            'Current'      { Write-Log ($line + '  (newest Microsoft.NETCore.App on disk: ' + $m.Check.Newest + ')') }
+            'Unknown'      { Write-Log ($line + '  (no Microsoft.NETCore.App under shared\ to compare)') }
+            'RebootQueued' {
+                Write-Log ($line + '  OLDER than ' + $m.Check.Newest + ' on disk; the replacement is queued for the next boot:') -Level WARN
+                Write-Log ('    ' + $m.Check.Reason) -Level WARN
+            }
+            'Stale'        { Write-Log ($line + '  OLDER than ' + $m.Check.Newest + ' on disk. Nessus reports this file version as the install at ' + (Split-Path -Parent $m.Exe) + '\') -Level WARN }
+            default        { throw ('Unhandled muxer state ' + $m.Check.State) }
+        }
+    }
+}
+
+function Repair-StaleMuxer {
+    # -RepairBrokenHost, stale dotnet.exe: repair the newest registered .NET
+    # Host MSI first (rewrites only older files), then install the newest
+    # major's runtime, then /repair that bundle -- stopping once the muxer
+    # catches up.
+    param($Muxer, $Roots)
+    $root = @($Roots | Where-Object { $_.Arch -eq $Muxer.Arch })
+    $newest = $Muxer.Check.Newest
+    $current = { @(Get-MuxerChecks -Roots $root)[0].Check.State -eq 'Current' }
+    $entries = @(Get-ItemProperty -Path $arpPaths -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match '^Microsoft \.NET Host - ' })
+    $msi = Select-HostMsiForRepair -Entries $entries -Arch $Muxer.Arch -Minimum $newest
+    if ($msi) {
+        Write-Log ('  ' + $Muxer.Arch + ': repairing ' + $msi.DisplayName + ' ' + $msi.PSChildName)
+        if ($DryRun) { Write-Log '    [DRYRUN] Would run msiexec /fomus.'; return }
+        $msiLog = $LogDir + '\dotnet_host_repair_' + $Muxer.Arch + '.log'
+        $rc = Invoke-Msi -Arguments ('/fomus ' + $msi.PSChildName + ' /qn /norestart /l*v ' + [char]34 + $msiLog + [char]34)
+        Write-Log ('    msiexec exit: ' + $rc + ' (log: ' + $msiLog + ')')
+        if ($rc -eq 3010) { $script:Reboot = $true }
+        if (& $current) { return }
+    } else {
+        Write-Log ('  ' + $Muxer.Arch + ': no Microsoft .NET Host ' + $newest + ' or newer is registered.')
+    }
+    Write-Log ('  ' + $Muxer.Arch + ': installing the .NET ' + $newest.Major + ' runtime to bring its host.')
+    $ok = Install-Runtime -Flavor 'Microsoft.NETCore.App' -Major $newest.Major -Arch $Muxer.Arch
+    if ($DryRun) { return }
+    if ($ok -and (& $current)) { return }
+    Write-Log ('  ' + $Muxer.Arch + ': dotnet.exe still old -- running the installer with /repair.') -Level WARN
+    Install-Runtime -Flavor 'Microsoft.NETCore.App' -Major $newest.Major -Arch $Muxer.Arch -Mode repair | Out-Null
 }
 
 function Get-PendingFileRenames {
@@ -1553,7 +1683,7 @@ $script:MuxerBrokenRoots = @()
 $script:MuxerFailures    = @()
 
 Write-Log '=============================================='
-Write-Log ' .NET Runtime Update (v3.16) -- 302122/307353/314679/320854/326863/+.NETCore-family'
+Write-Log ' .NET Runtime Update (v3.17) -- 302122/307353/314679/320854/326863/+.NETCore-family'
 Write-Log (' Host   : ' + $env:COMPUTERNAME)
 # Echo EVERY switch, so a log proves which arguments actually arrived. Endpoint
 # Central has a history in this environment of altering argument strings, and a
@@ -1688,6 +1818,8 @@ foreach ($key in ($before.Keys | Sort-Object)) {
         if ($status -eq 'SOON' -and $script:EolSoonSeen -notcontains $m) { $script:EolSoonSeen += $m }
     }
 }
+Write-Log '  dotnet.exe (shared host; --list-runtimes does not show it):'
+Write-MuxerChecks -Checks (Get-MuxerChecks -Roots $roots)
 $sdks = Get-DotNetSdks
 if ($sdks.Count -gt 0) {
     Write-Log ''
@@ -2461,6 +2593,34 @@ foreach ($root in $roots) {
     }
 }
 Write-Log ''
+Write-Log '=== dotnet.exe (shared host) ==='
+$muxers = @(Get-MuxerChecks -Roots $roots)
+$staleMuxers = @($muxers | Where-Object { $_.Check.State -eq 'Stale' })
+if ($staleMuxers.Count -gt 0 -and $RepairBrokenHost) {
+    Write-MuxerChecks -Checks $staleMuxers
+    foreach ($m in $staleMuxers) { Repair-StaleMuxer -Muxer $m -Roots $roots }
+    $muxers = @(Get-MuxerChecks -Roots $roots)
+}
+Write-MuxerChecks -Checks $muxers
+$MuxerStale = $false
+foreach ($m in $muxers) {
+    switch ($m.Check.State) {
+        'Current'      { }
+        'Unknown'      { }
+        'RebootQueued' { $Reboot = $true; Write-Log ('  ' + $m.Arch + ': reboot, then re-scan. Nessus reads the old dotnet.exe until then.') -Level WARN }
+        'Stale'        { $MuxerStale = $true }
+        default        { throw ('Unhandled muxer state ' + $m.Check.State) }
+    }
+}
+if ($MuxerStale) {
+    if ($RepairBrokenHost -and -not $DryRun) {
+        Write-Log '  -RepairBrokenHost did not move dotnet.exe forward. See the repair lines above and dotnet_host_repair_*.log.' -Level ERROR
+    } else {
+        Write-Log '  Nessus keeps flagging the root folder until dotnet.exe moves forward. Re-run with' -Level WARN
+        Write-Log '  -RepairBrokenHost to repair the newest .NET Host, or reboot first if a file is in use.' -Level WARN
+    }
+}
+Write-Log ''
 if ($UninstallNoOp) {
     Write-Log ''
     Write-Log 'AT LEAST ONE UNINSTALL WAS A NO-OP (exit 0, entry survived).' -Level ERROR
@@ -2478,13 +2638,19 @@ if ($script:OfflineUnverified.Count -gt 0) {
     foreach ($o in $script:OfflineUnverified) { Write-Log ('  ' + $o) -Level WARN }
     Write-Log 'If Nessus still flags these, stage the newer build from dotnet.microsoft.com and re-run.' -Level WARN
 }
+if ($MuxerStale -and $RepairBrokenHost -and -not $DryRun) { $Failed = $true }
 if ($Failed) {
-    Write-Log 'One or more steps FAILED (install, SDK removal or verification). See the ERROR lines above.' -Level ERROR
+    Write-Log 'One or more steps FAILED (install, SDK removal, host repair or verification). See the ERROR lines above.' -Level ERROR
     Write-Log '=============================================='
     exit 1
 }
 if ($NeedsHuman) {
     Write-Log 'Updates done, but -RemoveRetiredMajor needs a human decision (see Phase 4).' -Level WARN
+    Write-Log '=============================================='
+    exit 2
+}
+if ($MuxerStale) {
+    Write-Log 'Runtimes advanced, but dotnet.exe is still older than them (see the dotnet.exe section). Re-run with -RepairBrokenHost.' -Level WARN
     Write-Log '=============================================='
     exit 2
 }
