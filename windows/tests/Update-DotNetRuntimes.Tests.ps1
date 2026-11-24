@@ -549,6 +549,62 @@ try {
     Remove-Item -LiteralPath $tmp5 -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+# --- CSLT-217 (2026-11-24): stale dotnet.exe --------------------------------
+# Nessus 104668 on CSLT-217, verbatim:
+#   Path    : C:\Program Files\dotnet\shared\Microsoft.NETCore.App\8.0.34\
+#   Path    : C:\Program Files\dotnet\shared\Microsoft.NETCore.App\10.0.15\
+#   Path    : C:\Program Files\dotnet\
+#   Version : 8.0.27.36030
+# and every .NET Core plugin (320854 ... 380356) flagged that root path.
+Assert-Eq (ConvertTo-HostFileVersion -FileVersion '8.0.27.36030') '8.0.27' 'CSLT-217: muxer file version parses to 8.0.27'
+Assert-Eq (ConvertTo-HostFileVersion -FileVersion '') '' 'unreadable file version is null'
+$cslt217 = @([version]'8.0.34', [version]'10.0.15')
+$c = Get-MuxerCheck -MuxerVersion ([version]'8.0.27') -Runtimes $cslt217 -PendingRenames @() -Root 'C:\Program Files\dotnet'
+Assert-Eq $c.State 'Stale' 'CSLT-217: dotnet.exe 8.0.27 beside 10.0.15 is stale'
+Assert-Eq $c.Newest '10.0.15' 'CSLT-217: compared against the newest runtime of any major'
+$c = Get-MuxerCheck -MuxerVersion ([version]'10.0.15') -Runtimes $cslt217 -PendingRenames @() -Root 'C:\Program Files\dotnet'
+Assert-Eq $c.State 'Current' 'muxer at the newest runtime is current'
+$c = Get-MuxerCheck -MuxerVersion ([version]'10.0.20') -Runtimes $cslt217 -PendingRenames @() -Root 'C:\Program Files\dotnet'
+Assert-Eq $c.State 'Current' 'muxer newer than every runtime (an SDK brought it) is current'
+$c = Get-MuxerCheck -MuxerVersion ([version]'8.0.27') -Runtimes @() -PendingRenames @() -Root 'C:\Program Files\dotnet'
+Assert-Eq $c.State 'Unknown' 'no NETCore runtime on disk: nothing to compare'
+$pfro = @('\??\C:\Program Files\dotnet\dotnet.exe.tmp1', '\??\C:\Program Files\dotnet\dotnet.exe')
+$c = Get-MuxerCheck -MuxerVersion ([version]'8.0.27') -Runtimes $cslt217 -PendingRenames $pfro -Root 'C:\Program Files\dotnet'
+Assert-Eq $c.State 'RebootQueued' 'queued dotnet.exe replacement means reboot'
+Assert-Eq $c.Reason 'C:\Program Files\dotnet\dotnet.exe' 'queued rename shown without the \??\ prefix'
+$c = Get-MuxerCheck -MuxerVersion ([version]'8.0.27') -Runtimes $cslt217 -PendingRenames $pfro -Root 'C:\Program Files (x86)\dotnet'
+Assert-Eq $c.State 'Stale' 'x64 rename does not count for the x86 root'
+
+$hostArp = @(
+    [pscustomobject]@{ DisplayName = 'Microsoft .NET Host - 8.0.27 (x64)';  PSChildName = '{11111111-1111-1111-1111-111111111111}' },
+    [pscustomobject]@{ DisplayName = 'Microsoft .NET Host - 10.0.15 (x64)'; PSChildName = '{22222222-2222-2222-2222-222222222222}' },
+    [pscustomobject]@{ DisplayName = 'Microsoft .NET Host FX Resolver - 10.0.15 (x64)'; PSChildName = '{33333333-3333-3333-3333-333333333333}' },
+    [pscustomobject]@{ DisplayName = 'Microsoft .NET Host - 10.0.15 (x86)'; PSChildName = '{44444444-4444-4444-4444-444444444444}' }
+)
+Assert-Eq (Select-HostMsiForRepair -Entries $hostArp -Arch 'x64' -Minimum ([version]'10.0.15')).PSChildName '{22222222-2222-2222-2222-222222222222}' 'repair picks the x64 host at the newest runtime, not FX Resolver'
+Assert-Eq (Select-HostMsiForRepair -Entries $hostArp -Arch 'x86' -Minimum ([version]'10.0.15')).PSChildName '{44444444-4444-4444-4444-444444444444}' 'repair picks the x86 host for the x86 root'
+Assert-Eq (Select-HostMsiForRepair -Entries $hostArp[0] -Arch 'x64' -Minimum ([version]'10.0.15')) '' 'only 8.0.27 registered: no MSI repair (it would restore 8.0.27)'
+
+# Repair-StaleMuxer order: MSI repair first, stop as soon as dotnet.exe is current.
+$script:calls = @()
+$script:muxerNow = 'Stale'
+function global:Get-ItemProperty { $hostArp }
+function global:Invoke-Msi { param([string]$Arguments) $script:calls += ('msi ' + $Arguments.Split(' ')[1]); $script:muxerNow = $script:afterMsi; return 0 }
+function global:Get-MuxerChecks { param($Roots) @([pscustomobject]@{ Arch = 'x64'; Check = [pscustomobject]@{ State = $script:muxerNow } }) }
+function global:Install-Runtime { param($Flavor, $Major, $Arch, $Mode = 'install') $script:calls += ($Mode + ' ' + $Major); $script:muxerNow = $script:afterInstall; return $true }
+try {
+    $stale = [pscustomobject]@{ Arch = 'x64'; Check = [pscustomobject]@{ State = 'Stale'; Newest = [version]'10.0.15' } }
+    $rootsT = @(@{ Arch = 'x64'; Exe = 'C:\Program Files\dotnet\dotnet.exe' })
+    $script:afterMsi = 'Current'; $script:afterInstall = 'Current'
+    Repair-StaleMuxer -Muxer $stale -Roots $rootsT
+    Assert-Eq ($script:calls -join ',') 'msi {22222222-2222-2222-2222-222222222222}' 'CSLT-217: host MSI repair alone fixes it'
+    $script:calls = @(); $script:muxerNow = 'Stale'; $script:afterMsi = 'Stale'; $script:afterInstall = 'Stale'
+    Repair-StaleMuxer -Muxer $stale -Roots $rootsT
+    Assert-Eq ($script:calls -join ',') 'msi {22222222-2222-2222-2222-222222222222},install 10,repair 10' 'still old: install, then /repair, the newest major'
+} finally {
+    Remove-Item Function:\Get-ItemProperty, Function:\Invoke-Msi, Function:\Get-MuxerChecks, Function:\Install-Runtime -ErrorAction SilentlyContinue
+}
+
 if ($failed -gt 0) {
     Write-Host "`n$failed test(s) failed"
     exit 1
