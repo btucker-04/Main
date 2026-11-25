@@ -396,7 +396,12 @@ Updates the Microsoft WebP Image Extension Store app past 1.2.31.0 (Nessus 34689
 
 The script gets the fixed build from one of two sources:
 1. A staged package beside the script (EC Dependency File) or in `C:\`. Get it with `winget download --id 9PG2DK419DRG --source msstore` on an admin workstation, and stage the `Microsoft.WebpImageExtension…` package plus the `Microsoft.VCLibs…` x64 dependency it saves. The version, architecture and Microsoft publisher are read from the manifest inside the package, so file names don't matter. A package below 1.2.31.0 is refused. The script provisions it, then removes the old registration for every user, and each user gets the new build at their next sign-in.
-2. Otherwise, a Microsoft Store update scan through the MDM bridge, which works as SYSTEM, waiting up to 8 minutes. The old provisioned entry is then removed.
+2. Otherwise, a Microsoft Store update scan through the MDM bridge, which works as SYSTEM. The old provisioned entry is then removed. `UpdateScanMethod` returns only when the Store finishes its whole update pass, which took 2 h 51 min on CSLT-171 and 7.5 min on CSLT-090. The scan therefore runs in its own process while the script checks for the fixed build every 30 s, for up to 15 minutes in all. At the deadline, the scan process is left running so the Store can still deliver; re-run later to verify and clean up. Before the scan, the log shows what decides whether the Store can deliver at all:
+   - Store policy (`RemoveWindowsStore`, `DisableStoreApps`, `AutoDownload` = 2, `RequirePrivateStoreOnly`);
+   - the `InstallService`, `wuauserv` and `DoSvc` services;
+   - port 443 to the Store hosts.
+
+   The scan result is written to `WebpStoreScan_<timestamp>.txt` in the log folder.
 
 If neither source works, nothing is removed. Exit `0` = no vulnerable build left (or not installed), `3010` = fixed build in place but an old folder still held (reboot, re-run), `1` = no fixed build could be installed. EC success codes `0,3010`. Log: `C:\Logs\CompoSecure\WebpImageExtension_<timestamp>.log`.
 
