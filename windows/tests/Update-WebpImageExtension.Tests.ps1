@@ -151,11 +151,12 @@ try {
 $e2e = Join-Path ([System.IO.Path]::GetTempPath()) ('webpe2e_' + [guid]::NewGuid().ToString('N'))
 $newDir = 'Microsoft.WebpImageExtension_1.2.31.0_x64__8wekyb3d8bbwe'
 function Reset-Sim {
-    param([bool]$StageFixed, [bool]$StoreDelivers)
+    param([bool]$StageFixed, [string]$StoreDelivers, [int]$StoreBudget = 900)
     Remove-Item -LiteralPath $e2e -Recurse -Force -ErrorAction SilentlyContinue
     New-Item -ItemType Directory -Force -Path $e2e | Out-Null
     $copy = Join-Path $e2e 'Update-WebpImageExtension.ps1'
     (Get-Content -LiteralPath $scriptPath -Raw).Replace(([char]39 + 'C:\Logs\CompoSecure' + [char]39), ([char]39 + $e2e + '/logs' + [char]39)) |
+        ForEach-Object { $_.Replace('$StoreWaitSeconds = 900', ('$StoreWaitSeconds = ' + $StoreBudget)) } |
         Set-Content -LiteralPath $copy
     $env:ProgramFiles = $e2e + '/pf'
     $global:webpApps = $env:ProgramFiles + '\WindowsApps'
@@ -196,16 +197,27 @@ function Remove-AppxProvisionedPackage { param([switch]$Online, $PackageName)
     $global:webpSim.Calls += ('deprovision:' + $PackageName)
     $global:webpSim.Prov = @($global:webpSim.Prov | Where-Object { $_ -ne $PackageName }); Sync-SimDirs
 }
-function Get-CimInstance { param($Namespace, $ClassName)
-    if (-not $global:webpSim.StoreDelivers) { throw 'Invalid namespace' }
-    [pscustomobject]@{ Class = $ClassName }
+# The Store scan runs in its own powershell.exe; the shim decodes the command
+# it was given and plays the Store: deliver (exit 0), refuse (exit 99), or
+# still running at the deadline.
+function Start-Process { param($FilePath, $ArgumentList, $WindowStyle, [switch]$PassThru)
+    $cmd = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($ArgumentList[-1]))
+    switch ($global:webpSim.StoreDelivers) {
+        'yes'   {
+            if ($cmd -match 'UpdateScanMethod') { $global:webpSim.Calls += 'store:UpdateScanMethod' }
+            foreach ($p in $global:webpSim.Pkgs) { $p.Full = $newDir; $p.Ver = '1.2.31.0' }
+            Sync-SimDirs
+            return [pscustomobject]@{ HasExited = $true; ExitCode = 0; Handle = 1 }
+        }
+        'no'    { return [pscustomobject]@{ HasExited = $true; ExitCode = 99; Handle = 1 } }
+        'never' { $global:webpSim.Calls += 'store:running'; return [pscustomobject]@{ HasExited = $false; ExitCode = $null; Handle = 1 } }
+        default { throw ('Unhandled StoreDelivers ' + $global:webpSim.StoreDelivers) }
+    }
 }
-function Invoke-CimMethod { param($InputObject, $MethodName)
-    $global:webpSim.Calls += ('store:' + $MethodName)
-    foreach ($p in $global:webpSim.Pkgs) { $p.Full = $newDir; $p.Ver = '1.2.31.0' }
-    Sync-SimDirs
-    [pscustomobject]@{ ReturnValue = 0 }
+function Get-Service { param($Name)
+    foreach ($n in $Name) { [pscustomobject]@{ Name = $n; StartType = 'Manual'; Status = 'Stopped' } }
 }
+function Test-StoreHostReachable { param($HostName) '' }
 function Start-Sleep { }
 function Get-InstallerLeaf { param([string]$Path) ($Path -split '[\\/]')[-1] }
 function Invoke-WebpScript { param([hashtable]$ScriptArgs)
@@ -217,40 +229,88 @@ function Invoke-WebpScript { param([hashtable]$ScriptArgs)
 }
 $savedPF = $env:ProgramFiles
 try {
-    Reset-Sim -StageFixed $true -StoreDelivers $false
+    Reset-Sim -StageFixed $true -StoreDelivers 'no'
     $rc = Invoke-WebpScript @{}
     Assert-Eq $rc 0 'e2e staged: exit 0'
     Assert-Eq ($global:webpSim.Calls -join ',') ('provision:' + $newDir + '.Appx,remove:' + $tenableDir) 'e2e staged: provision the fixed build, then remove the old registration'
     Assert-True (-not (Test-Path -LiteralPath ($global:webpApps + '/' + $tenableDir))) 'e2e staged: the Tenable folder is gone'
 
-    Reset-Sim -StageFixed $false -StoreDelivers $true
+    Reset-Sim -StageFixed $false -StoreDelivers 'yes'
     $rc = Invoke-WebpScript @{}
     Assert-Eq $rc 0 'e2e Store: exit 0'
     Assert-Eq ($global:webpSim.Calls -join ',') ('store:UpdateScanMethod,deprovision:' + $tenableDir) 'e2e Store: scan, then drop the old provisioned entry'
 
-    Reset-Sim -StageFixed $false -StoreDelivers $false
+    Reset-Sim -StageFixed $false -StoreDelivers 'no'
     $rc = Invoke-WebpScript @{}
     Assert-Eq $rc 1 'e2e nothing available: exit 1'
     Assert-Eq $global:webpSim.Calls.Count 0 'e2e nothing available: the old build is left in place'
     Assert-True ((Get-Content -LiteralPath (Join-Path $e2e 'run.log') -Raw) -match 'Stage the package, allow the Microsoft Store, or re-run with -Remove') 'e2e nothing available: log says what to do'
 
-    Reset-Sim -StageFixed $false -StoreDelivers $false
+    Reset-Sim -StageFixed $false -StoreDelivers 'never' -StoreBudget 0
+    $rc = Invoke-WebpScript @{}
+    $log = Get-Content -LiteralPath (Join-Path $e2e 'run.log') -Raw
+    Assert-Eq $rc 1 'e2e Store still running at the deadline: exit 1'
+    Assert-Eq ($global:webpSim.Calls -join ',') 'store:running' 'e2e Store still running: the old build is left in place'
+    Assert-True ($log -match 'still working through its update pass') 'e2e Store still running: log says the Store may deliver later'
+    Assert-True ($log -match 'Store policy : nothing blocking') 'e2e: Store policy is logged before the scan'
+    Assert-True ($log -match 'Reach 443    : storeedgefd\.dsx\.mp\.microsoft\.com ok') 'e2e: Store host reachability is logged'
+
+    Reset-Sim -StageFixed $false -StoreDelivers 'no'
     $rc = Invoke-WebpScript @{ Remove = $true }
     Assert-Eq $rc 0 'e2e -Remove: exit 0'
     Assert-Eq ($global:webpSim.Calls -join ',') ('remove:' + $tenableDir + ',deprovision:' + $tenableDir) 'e2e -Remove: registration, then provisioning'
 
-    Reset-Sim -StageFixed $true -StoreDelivers $true
+    Reset-Sim -StageFixed $true -StoreDelivers 'yes'
     $rc = Invoke-WebpScript @{ DryRun = $true }
     Assert-Eq $rc 0 'e2e -DryRun: exit 0'
     Assert-Eq $global:webpSim.Calls.Count 0 'e2e -DryRun: nothing changed'
 } finally {
     $env:ProgramFiles = $savedPF
-    foreach ($f in @('Get-AppxPackage', 'Get-AppxProvisionedPackage', 'Add-AppxProvisionedPackage', 'Remove-AppxPackage', 'Remove-AppxProvisionedPackage', 'Get-CimInstance', 'Invoke-CimMethod', 'Start-Sleep')) {
+    foreach ($f in @('Get-AppxPackage', 'Get-AppxProvisionedPackage', 'Add-AppxProvisionedPackage', 'Remove-AppxPackage', 'Remove-AppxProvisionedPackage', 'Start-Process', 'Get-Service', 'Test-StoreHostReachable', 'Start-Sleep')) {
         Remove-Item -LiteralPath ('Function:\' + $f) -ErrorAction SilentlyContinue
     }
     Remove-Item -LiteralPath $e2e -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Variable -Name webpSim, webpApps -Scope Global -ErrorAction SilentlyContinue
 }
+
+# --- Store path (CSLT-171 2026-11-23, CSLT-090 2026-11-24) ---------------------
+# Both logged 'No usable staged package' and then, only after UpdateScanMethod
+# returned, 'Store update scan started (ReturnValue 0).':
+#   CSLT-171  10:05:20 -> 12:56:41 (blocked 2h51m), fixed build 208s later
+#   CSLT-090  07:11:34 -> 07:19:10 (blocked 7.5 min), nothing in the next 480s
+Assert-Eq (Get-ScanProcessState -HasExited $false -ExitCode $null) 'Running' 'scan process still in UpdateScanMethod is Running'
+Assert-Eq (Get-ScanProcessState -HasExited $true -ExitCode 0) 'Completed' 'ReturnValue 0 is Completed'
+Assert-Eq (Get-ScanProcessState -HasExited $true -ExitCode 99) 'Failed' 'exception in the scan process is Failed'
+Assert-Eq (Get-ScanProcessState -HasExited $true -ExitCode 2147549183) 'Failed' 'nonzero ReturnValue is Failed'
+Assert-Eq (Get-StoreWaitStep -FixedPresent $true -ScanState 'Running' -Elapsed 120 -Budget 900) 'Arrived' 'CSLT-171: fixed build seen while the scan is still running'
+Assert-Eq (Get-StoreWaitStep -FixedPresent $false -ScanState 'Running' -Elapsed 10260 -Budget 900) 'TimedOut' 'CSLT-171: a 2h51m scan no longer holds the run past its budget'
+Assert-Eq (Get-StoreWaitStep -FixedPresent $false -ScanState 'Completed' -Elapsed 456 -Budget 900) 'Wait' 'CSLT-090: scan done at 7.5 min, keep polling inside the budget'
+Assert-Eq (Get-StoreWaitStep -FixedPresent $false -ScanState 'Failed' -Elapsed 30 -Budget 900) 'ScanFailed' 'failed scan stops the wait'
+Assert-Eq (Get-StoreWaitStep -FixedPresent $true -ScanState 'Failed' -Elapsed 30 -Budget 900) 'Arrived' 'fixed build wins over a failed scan'
+Assert-Eq $StoreWaitSeconds 900 'whole Store path budget is 15 minutes'
+
+$cmd = Get-StoreScanCommand -ResultFile ('C:\Logs\CompoSecure\WebpStoreScan_20261124_071134.txt')
+$cmdErrors = $null
+$null = [System.Management.Automation.Language.Parser]::ParseInput($cmd, [ref]$null, [ref]$cmdErrors)
+Assert-Eq @($cmdErrors).Count 0 'scan command parses'
+Assert-True ($cmd -match 'UpdateScanMethod') 'scan command calls UpdateScanMethod'
+Assert-True ($cmd -match 'exit 99') 'scan command exits 99 when the call throws'
+Assert-True ($cmd -notmatch [char]34) 'scan command has no double quote'
+$odd = Get-StoreScanCommand -ResultFile ('C:\Logs\O' + [char]39 + 'Neil\scan.txt')
+$oddErrors = $null
+$null = [System.Management.Automation.Language.Parser]::ParseInput($odd, [ref]$null, [ref]$oddErrors)
+Assert-Eq @($oddErrors).Count 0 'single quote in the result path is escaped'
+
+Assert-Eq (@(Get-StorePolicyFindings -Values @{}).Count) 0 'no Store policy, nothing blocking'
+Assert-Eq (@(Get-StorePolicyFindings -Values @{ AutoDownload = 4 }).Count) 0 'AutoDownload 4 (always on) is fine'
+Assert-Eq ((Get-StorePolicyFindings -Values @{ AutoDownload = 2 }) -join ';') 'AutoDownload = 2 (automatic Store app updates turned off by policy)' 'AutoDownload 2 is reported'
+Assert-Eq (@(Get-StorePolicyFindings -Values @{ RemoveWindowsStore = 1; DisableStoreApps = 1; RequirePrivateStoreOnly = 1 }).Count) 3 'Store-off policies are each reported'
+$svc = @(
+    [pscustomobject]@{ Name = 'InstallService'; StartType = 'Manual' },
+    [pscustomobject]@{ Name = 'wuauserv'; StartType = 'Disabled' }
+)
+Assert-Eq ((Get-StoreServiceFindings -Services $svc -Required @('InstallService', 'wuauserv', 'DoSvc')) -join ';') 'wuauserv is Disabled;DoSvc is not present' 'disabled or missing Store services are reported'
+
 
 # --- Every Verb-Noun the script calls exists (or is Windows-only) --------------
 $tokens = $null; $parseErrors = $null
@@ -259,7 +319,7 @@ Assert-Eq $parseErrors.Count 0 'script parses'
 $defined = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) | ForEach-Object { $_.Name })
 $called = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) |
     ForEach-Object { $_.GetCommandName() } | Where-Object { $_ -match '^[A-Za-z]+-[A-Za-z]+$' } | Sort-Object -Unique)
-$windowsOnly = @('Get-AppxPackage', 'Remove-AppxPackage', 'Get-AppxProvisionedPackage', 'Add-AppxProvisionedPackage', 'Remove-AppxProvisionedPackage', 'Get-CimInstance', 'Invoke-CimMethod')
+$windowsOnly = @('Get-AppxPackage', 'Remove-AppxPackage', 'Get-AppxProvisionedPackage', 'Add-AppxProvisionedPackage', 'Remove-AppxProvisionedPackage', 'Get-CimInstance', 'Invoke-CimMethod', 'Get-Service')
 $unknown = @($called | Where-Object { $defined -notcontains $_ -and $windowsOnly -notcontains $_ -and -not (Get-Command $_ -ErrorAction SilentlyContinue) })
 Assert-Eq ($unknown -join ',') '' 'every Verb-Noun command the script calls exists'
 Assert-Eq (@($tokens | Where-Object { $_.Text -match [char]34 }).Count) 0 'no literal double quote in the script'

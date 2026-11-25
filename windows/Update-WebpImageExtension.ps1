@@ -23,8 +23,15 @@
             name. It is provisioned with Add-AppxProvisionedPackage.
          b. Otherwise a Microsoft Store update scan through the MDM bridge
             (MDM_EnterpriseModernAppManagement_AppManagement01
-            UpdateScanMethod), which works as SYSTEM, waiting up to 8 minutes
-            for the fixed build to appear.
+            UpdateScanMethod), which works as SYSTEM. The method returns only
+            when the Store finishes its whole update pass (2h51m on CSLT-171,
+            7.5 min on CSLT-090), so it runs in its own process and the
+            fixed build is polled for meanwhile, up to 15 minutes in all.
+            That process is left running at the deadline so the Store can
+            still deliver; a later run verifies and cleans up. Before the
+            scan the log shows Store policy, the InstallService / wuauserv /
+            DoSvc services and port 443 to the Store hosts, which is where
+            a host that never gets the update (CSLT-090) differs.
       3. Clean up what still holds the old build. When the fixed build is
          provisioned, older registrations are removed for all users; each
          user gets the provisioned build at their next sign-in. When it
@@ -63,7 +70,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $PkgName = 'Microsoft.WebpImageExtension'
 $FixedVersion = [version]'1.2.31.0'
-$StoreWaitSeconds = 480
+$StoreWaitSeconds = 900
 
 function Test-Needs64BitRelaunch {
     param([bool]$Is64BitOS, [bool]$Is64BitProcess)
@@ -207,6 +214,63 @@ function Get-WebpOutcome {
     return [pscustomobject]@{ Exit = 1; Summary = 'No fixed build could be installed. Stage the package, allow the Microsoft Store, or re-run with -Remove.' }
 }
 
+function Get-StoreWaitStep {
+    # One poll of the Store path. UpdateScanMethod blocks until the Store
+    # finishes its whole update pass: 2h51m on CSLT-171 (2026-11-23), 7.5 min
+    # on CSLT-090 (2026-11-24). It runs in its own process so the fixed build
+    # is seen the moment it lands and the run keeps to its budget.
+    param([bool]$FixedPresent, [string]$ScanState, [double]$Elapsed, [int]$Budget)
+    if ($FixedPresent) { return 'Arrived' }
+    if ($ScanState -eq 'Failed') { return 'ScanFailed' }
+    if ($Elapsed -ge $Budget) { return 'TimedOut' }
+    return 'Wait'
+}
+
+function Get-ScanProcessState {
+    # The scan runs in its own powershell.exe so it outlives this script; it
+    # exits with UpdateScanMethod's ReturnValue, or 99 when the call threw.
+    param([bool]$HasExited, $ExitCode)
+    if (-not $HasExited) { return 'Running' }
+    if (('' + $ExitCode) -eq '0') { return 'Completed' }
+    return 'Failed'
+}
+
+function Get-StoreScanCommand {
+    param([string]$ResultFile)
+    $q = [char]39
+    $rf = $q + ($ResultFile -replace $q, ($q + $q)) + $q
+    return ('try { $i = Get-CimInstance -Namespace ' + $q + 'root\cimv2\mdm\dmmap' + $q + ' -ClassName ' + $q + 'MDM_EnterpriseModernAppManagement_AppManagement01' + $q + ' -ErrorAction Stop; ' +
+        '$r = Invoke-CimMethod -InputObject $i -MethodName UpdateScanMethod -ErrorAction Stop; ' +
+        'Set-Content -Path ' + $rf + ' -Value (' + $q + 'ReturnValue ' + $q + ' + $r.ReturnValue); exit ([int]$r.ReturnValue) } ' +
+        'catch { Set-Content -Path ' + $rf + ' -Value $_.Exception.Message; exit 99 }')
+}
+
+function Get-StorePolicyFindings {
+    # HKLM\SOFTWARE\Policies\Microsoft\WindowsStore values that stop the
+    # Store from delivering an app update.
+    param([hashtable]$Values)
+    $out = @()
+    if (-not $Values) { return $out }
+    if (('' + $Values['RemoveWindowsStore']) -eq '1') { $out += 'RemoveWindowsStore = 1 (Store turned off by policy)' }
+    if (('' + $Values['DisableStoreApps']) -eq '1') { $out += 'DisableStoreApps = 1 (all Store apps disabled by policy)' }
+    if (('' + $Values['AutoDownload']) -eq '2') { $out += 'AutoDownload = 2 (automatic Store app updates turned off by policy)' }
+    if (('' + $Values['RequirePrivateStoreOnly']) -eq '1') { $out += 'RequirePrivateStoreOnly = 1 (only the private store is allowed)' }
+    return $out
+}
+
+function Get-StoreServiceFindings {
+    # Store app updates download through Windows Update and Delivery
+    # Optimization and install through InstallService.
+    param($Services, [string[]]$Required)
+    $out = @()
+    foreach ($n in $Required) {
+        $s = @($Services | Where-Object { $_.Name -eq $n })[0]
+        if (-not $s) { $out += ($n + ' is not present'); continue }
+        if (('' + $s.StartType) -eq 'Disabled') { $out += ($n + ' is Disabled') }
+    }
+    return $out
+}
+
 if ($env:WEBP_UPDATE_DOTSOURCE -eq '1') { return }
 
 if (Test-Needs64BitRelaunch -Is64BitOS ([Environment]::Is64BitOperatingSystem) -Is64BitProcess ([Environment]::Is64BitProcess)) {
@@ -317,17 +381,97 @@ function Find-StagedPackageInfos {
     return $infos
 }
 
-function Invoke-StoreUpdateScan {
-    # Returns $true when the scan was started.
+function Write-StoreDiagnostics {
+    # What decides whether the Store can deliver at all, logged before the
+    # scan so a failed run (CSLT-090) says why.
+    $vals = @{}
+    $pol = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\WindowsStore' -ErrorAction SilentlyContinue
+    foreach ($n in @('RemoveWindowsStore', 'DisableStoreApps', 'AutoDownload', 'RequirePrivateStoreOnly')) {
+        if ($pol -and $null -ne $pol.$n) { $vals[$n] = $pol.$n }
+    }
+    $policy = @(Get-StorePolicyFindings -Values $vals)
+    if ($policy.Count -eq 0) { Write-Log '  Store policy : nothing blocking' }
+    foreach ($f in $policy) { Write-Log ('  Store policy : ' + $f) -Level WARN }
+
+    $required = @('InstallService', 'wuauserv', 'DoSvc')
+    $svcs = @(Get-Service -Name $required -ErrorAction SilentlyContinue | ForEach-Object {
+        [pscustomobject]@{ Name = $_.Name; StartType = ('' + $_.StartType); Status = ('' + $_.Status) }
+    })
+    Write-Log ('  Services     : ' + (($svcs | ForEach-Object { $_.Name + ' ' + $_.StartType + '/' + $_.Status }) -join ', '))
+    foreach ($f in @(Get-StoreServiceFindings -Services $svcs -Required $required)) { Write-Log ('  Service      : ' + $f) -Level WARN }
+
+    foreach ($h in @('storeedgefd.dsx.mp.microsoft.com', 'displaycatalog.mp.microsoft.com', 'fe3cr.delivery.mp.microsoft.com', 'tlu.dl.delivery.mp.microsoft.com')) {
+        $r = Test-StoreHostReachable -HostName $h
+        if ($r) { Write-Log ('  Reach 443    : ' + $h + ' NO (' + $r + ')') -Level WARN } else { Write-Log ('  Reach 443    : ' + $h + ' ok') }
+    }
+}
+
+function Test-StoreHostReachable {
+    # '' when TCP 443 connects within 5 s, else why not.
+    param([string]$HostName)
+    $c = New-Object System.Net.Sockets.TcpClient
     try {
-        $inst = Get-CimInstance -Namespace 'root\cimv2\mdm\dmmap' -ClassName 'MDM_EnterpriseModernAppManagement_AppManagement01' -ErrorAction Stop
-        $r = Invoke-CimMethod -InputObject $inst -MethodName UpdateScanMethod -ErrorAction Stop
-        Write-Log ('  Store update scan started (ReturnValue ' + $r.ReturnValue + ').')
-        return $true
+        if ($c.ConnectAsync($HostName, 443).Wait(5000) -and $c.Connected) { return '' }
+        return 'timed out'
     } catch {
-        Write-Log ('  Could not start a Store update scan: ' + $_.Exception.Message) -Level ERROR
-        Write-Log '  The MDM bridge is missing, or the Store is blocked by policy on this host.' -Level ERROR
+        $e = $_.Exception
+        while ($e.InnerException) { $e = $e.InnerException }
+        return $e.Message
+    } finally { $c.Dispose() }
+}
+
+function Wait-StoreDelivery {
+    # Returns $true when a fixed build arrived. The scan process is left
+    # running at the deadline: the Store finishes its pass on its own.
+    $resultFile = $LogDir + '\WebpStoreScan_' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '.txt'
+    $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes((Get-StoreScanCommand -ResultFile $resultFile)))
+    Write-Log '  Requesting a Store update scan. The call returns only when the Store has'
+    Write-Log ('  finished its whole pass, so the fixed build is polled for meanwhile (up to ' + $StoreWaitSeconds + 's).')
+    try {
+        $p = Start-Process -FilePath ($PSHOME + '\powershell.exe') -ArgumentList @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $enc) -WindowStyle Hidden -PassThru
+        # Without the handle, Windows PowerShell 5.1 reports no ExitCode once it exits.
+        $null = $p.Handle
+    } catch {
+        Write-Log ('  Could not start the Store scan process: ' + $_.Exception.Message) -Level ERROR
         return $false
+    }
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $scanLogged = $false
+    while ($true) {
+        Start-Sleep -Seconds 30
+        $state = Get-ScanProcessState -HasExited $p.HasExited -ExitCode $(if ($p.HasExited) { $p.ExitCode } else { $null })
+        $result = ''
+        if ($state -ne 'Running') { $result = (Get-Content -LiteralPath $resultFile -ErrorAction SilentlyContinue) -join ' ' }
+        if (-not $scanLogged -and $state -eq 'Completed') {
+            Write-Log ('  Store update scan finished after ' + [int]$sw.Elapsed.TotalSeconds + 's (' + $result + ').')
+            $scanLogged = $true
+        }
+        $now = Read-WebpState
+        $step = Get-StoreWaitStep -FixedPresent ($now.FixedInstalled -or $now.FixedProvisioned) -ScanState $state -Elapsed $sw.Elapsed.TotalSeconds -Budget $StoreWaitSeconds
+        switch ($step) {
+            'Wait'       { }
+            'Arrived'    {
+                Write-Log ('  Fixed build arrived from the Store after ' + [int]$sw.Elapsed.TotalSeconds + 's' + $(if ($state -eq 'Running') { ' (scan still running)' } else { '' }) + '.')
+                return $true
+            }
+            'ScanFailed' {
+                Write-Log ('  Store update scan failed (exit ' + $p.ExitCode + '): ' + $result) -Level ERROR
+                Write-Log '  The MDM bridge is missing, or the Store is blocked by policy on this host.' -Level ERROR
+                return $false
+            }
+            'TimedOut'   {
+                Write-Log ('  The Store did not deliver ' + $FixedVersion + ' or later within ' + $StoreWaitSeconds + 's.') -Level ERROR
+                if ($state -eq 'Running') {
+                    Write-Log '  The Store was still working through its update pass. It may deliver later' -Level WARN
+                    Write-Log '  (CSLT-171 took almost 3 hours); re-run then to verify and clean up.' -Level WARN
+                } else {
+                    Write-Log '  The scan finished without the fixed build. See the Store policy, Services' -Level WARN
+                    Write-Log '  and Reach 443 lines above, or stage the package.' -Level WARN
+                }
+                return $false
+            }
+            default      { throw ('Unhandled Store wait step ' + $step) }
+        }
     }
 }
 
@@ -409,26 +553,13 @@ if ($state.FixedProvisioned -or $state.FixedInstalled) {
         }
     } else {
         Write-Log ('  No usable staged package: ' + $set.Reason + '.')
+        Write-StoreDiagnostics
         if ($DryRun) {
             Write-Log '  [DRYRUN] Would start a Microsoft Store update scan and wait for the fixed build.'
             Write-Log '=============================================='
             exit 0
         }
-        if (Invoke-StoreUpdateScan) {
-            $sw = [Diagnostics.Stopwatch]::StartNew()
-            while ($sw.Elapsed.TotalSeconds -lt $StoreWaitSeconds) {
-                Start-Sleep -Seconds 30
-                $now = Read-WebpState
-                if ($now.FixedInstalled -or $now.FixedProvisioned) {
-                    Write-Log ('  Fixed build arrived from the Store after ' + [int]$sw.Elapsed.TotalSeconds + 's.')
-                    $source = 'store'
-                    break
-                }
-            }
-            if (-not $source) {
-                Write-Log ('  The Store did not deliver ' + $FixedVersion + ' or later within ' + $StoreWaitSeconds + 's.') -Level ERROR
-            }
-        }
+        if (Wait-StoreDelivery) { $source = 'store' }
     }
 }
 
